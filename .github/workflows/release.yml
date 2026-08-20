@@ -2,6 +2,11 @@ name: Build desktop installers
 
 on:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Release tag to create (for example, v0.1.0)
+        required: true
+        type: string
   push:
     tags: ['v*']
 
@@ -10,6 +15,8 @@ permissions:
 
 jobs:
   build:
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
     strategy:
       fail-fast: false
       matrix:
@@ -24,26 +31,33 @@ jobs:
             tor_platform: windows
             tor_url: https://archive.torproject.org/tor-package-archive/torbrowser/15.0.20/tor-expert-bundle-windows-x86_64-15.0.20.tar.gz
             tor_sha256: d59bff934e3ad876e1623e24ae60c19aeea56f50178093b9f86fba230639f949
-          - platform: macos-13
+          - platform: macos-15-intel
             args: --bundles dmg
             tor_platform: macos
             tor_url: https://archive.torproject.org/tor-package-archive/torbrowser/15.0.20/tor-expert-bundle-macos-x86_64-15.0.20.tar.gz
             tor_sha256: 6ec3048b3a5d55e297f35d84830d0e338884d702aac3db49056633c1223841df
-          - platform: macos-14
+          - platform: macos-15
             args: --target aarch64-apple-darwin --bundles dmg
             tor_platform: macos
             tor_url: https://archive.torproject.org/tor-package-archive/torbrowser/15.0.20/tor-expert-bundle-macos-aarch64-15.0.20.tar.gz
             tor_sha256: 73fdccde8136678e41a625160993e6a9dc4f4ff8cd376318b5e41e5627d55682
     runs-on: ${{ matrix.platform }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v6
+      - name: Validate release tag
+        shell: bash
+        run: |
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Release tag must look like v0.1.0 or v0.1.0-beta.1" >&2
+            exit 1
+          fi
+      - uses: actions/setup-node@v6
         with:
-          node-version: 22
+          node-version: 24
           cache: npm
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.platform == 'macos-14' && 'aarch64-apple-darwin' || '' }}
+          targets: ${{ matrix.platform == 'macos-15' && 'aarch64-apple-darwin' || '' }}
       - name: Install Linux system dependencies
         if: matrix.platform == 'ubuntu-22.04'
         run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
@@ -55,12 +69,12 @@ jobs:
       - name: Add pinned Tor Expert Bundle
         shell: bash
         run: bash scripts/prepare-tor.sh '${{ matrix.tor_platform }}' '${{ matrix.tor_url }}' '${{ matrix.tor_sha256 }}'
-      - uses: tauri-apps/tauri-action@v0
+      - uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tagName: ${{ github.ref_name }}
-          releaseName: Napstr ${{ github.ref_name }}
+          tagName: ${{ env.RELEASE_TAG }}
+          releaseName: Napstr ${{ env.RELEASE_TAG }}
           releaseBody: Cross-platform Napstr desktop installers.
           releaseDraft: false
           prerelease: false

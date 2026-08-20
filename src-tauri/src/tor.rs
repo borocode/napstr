@@ -323,22 +323,24 @@ fn free_port() -> Result<u16, String> {
         .map_err(|error| error.to_string())
 }
 
+#[cfg(target_os = "linux")]
 fn prepend_library_path(command: &mut Command, directory: &Path) {
-    #[cfg(target_os = "linux")]
-    {
-        let value = std::env::var_os("LD_LIBRARY_PATH")
-            .map(|existing| format!("{}:{}", directory.display(), existing.to_string_lossy()))
-            .unwrap_or_else(|| directory.display().to_string());
-        command.env("LD_LIBRARY_PATH", value);
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let value = std::env::var_os("DYLD_LIBRARY_PATH")
-            .map(|existing| format!("{}:{}", directory.display(), existing.to_string_lossy()))
-            .unwrap_or_else(|| directory.display().to_string());
-        command.env("DYLD_LIBRARY_PATH", value);
-    }
+    let value = std::env::var_os("LD_LIBRARY_PATH")
+        .map(|existing| format!("{}:{}", directory.display(), existing.to_string_lossy()))
+        .unwrap_or_else(|| directory.display().to_string());
+    command.env("LD_LIBRARY_PATH", value);
 }
+
+#[cfg(target_os = "macos")]
+fn prepend_library_path(command: &mut Command, directory: &Path) {
+    let value = std::env::var_os("DYLD_LIBRARY_PATH")
+        .map(|existing| format!("{}:{}", directory.display(), existing.to_string_lossy()))
+        .unwrap_or_else(|| directory.display().to_string());
+    command.env("DYLD_LIBRARY_PATH", value);
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn prepend_library_path(_command: &mut Command, _directory: &Path) {}
 
 #[cfg(test)]
 mod tests {

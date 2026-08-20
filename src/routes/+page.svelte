@@ -1,9 +1,11 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
+  import { getCurrentWindow } from '@tauri-apps/api/window';
   import { open } from '@tauri-apps/plugin-dialog';
 
   type View = 'Search' | 'Downloads' | 'Shared' | 'Profile' | 'Settings';
+  type WindowResizeDirection = 'East' | 'North' | 'NorthEast' | 'NorthWest' | 'South' | 'SouthEast' | 'SouthWest' | 'West';
   type Result = {
     id: number;
     name: string;
@@ -351,6 +353,13 @@
     if (nativeReady) await invoke(command);
   };
 
+  function beginWindowResize(event: PointerEvent, direction: WindowResizeDirection) {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+    getCurrentWindow().startResizeDragging(direction).catch(() => {});
+  }
+
   function transferPaneMaximum() {
     return typeof window === 'undefined' ? 300 : Math.max(80, window.innerHeight - 340);
   }
@@ -441,6 +450,15 @@
 
 <main class="desktop">
   <section class="app-window" style={`--transfer-height: ${transferPaneHeight}px`} aria-label="Napstr application window">
+    <button class="window-resize-handle resize-n" aria-label="Resize window from top" onpointerdown={(event) => beginWindowResize(event, 'North')}></button>
+    <button class="window-resize-handle resize-e" aria-label="Resize window from right" onpointerdown={(event) => beginWindowResize(event, 'East')}></button>
+    <button class="window-resize-handle resize-s" aria-label="Resize window from bottom" onpointerdown={(event) => beginWindowResize(event, 'South')}></button>
+    <button class="window-resize-handle resize-w" aria-label="Resize window from left" onpointerdown={(event) => beginWindowResize(event, 'West')}></button>
+    <button class="window-resize-handle resize-ne" aria-label="Resize window from top right" onpointerdown={(event) => beginWindowResize(event, 'NorthEast')}></button>
+    <button class="window-resize-handle resize-se" aria-label="Resize window from bottom right" onpointerdown={(event) => beginWindowResize(event, 'SouthEast')}></button>
+    <button class="window-resize-handle resize-sw" aria-label="Resize window from bottom left" onpointerdown={(event) => beginWindowResize(event, 'SouthWest')}></button>
+    <button class="window-resize-handle resize-nw" aria-label="Resize window from top left" onpointerdown={(event) => beginWindowResize(event, 'NorthWest')}></button>
+
     <header class="titlebar" data-tauri-drag-region>
       <div class="title-left"><span class="app-icon"><img src="/napstr-logo.png" alt="" /></span><span>Napstr</span></div>
       <div class="window-controls" aria-hidden="true">

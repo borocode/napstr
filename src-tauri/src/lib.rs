@@ -945,6 +945,7 @@ mod tests {
         assert_eq!(report.file_count, 1);
         assert!(report.errors.len() >= 2);
         assert_eq!(load_files(&connection, None).unwrap().len(), 1);
+        drop(connection);
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -962,6 +963,7 @@ mod tests {
         );
         assert!(Path::new(&settings.shared_folder).is_dir());
         assert_eq!(settings.nostr_relays, DEFAULT_NOSTR_RELAYS);
+        drop(connection);
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -997,6 +999,7 @@ mod tests {
             get_setting(&connection, "nostr_relays").unwrap(),
             "wss://my-relay.example"
         );
+        drop(connection);
         fs::remove_dir_all(directory).unwrap();
     }
 }
