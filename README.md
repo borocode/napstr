@@ -1,4 +1,4 @@
-<img width="2172" height="724" alt="napstr-logo" src="https://github.com/user-attachments/assets/58f087b4-aa0d-44b0-af70-93a621b283c7" />
+<img width="300" height="100" alt="napstr-logo-small" src="https://github.com/user-attachments/assets/83c9ccea-3241-4fce-a7cf-16c83629484b" />
 
 > Showcasing the power of nostr as a discovery layer for apps
 
