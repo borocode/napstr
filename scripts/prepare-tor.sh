@@ -10,9 +10,11 @@ destination="src-tauri/resources/tor/${platform}"
 
 curl --fail --location --silent --show-error "$archive_url" --output "$archive"
 if command -v sha256sum >/dev/null 2>&1; then
-  actual_sha256="$(sha256sum "$archive" | cut -d ' ' -f 1)"
+  # Reading from stdin avoids the leading `\` that GNU sha256sum emits when
+  # escaping Windows paths containing backslashes.
+  actual_sha256="$(sha256sum < "$archive" | cut -d ' ' -f 1)"
 else
-  actual_sha256="$(shasum -a 256 "$archive" | cut -d ' ' -f 1)"
+  actual_sha256="$(shasum -a 256 < "$archive" | cut -d ' ' -f 1)"
 fi
 if [[ "$actual_sha256" != "$expected_sha256" ]]; then
   echo "Tor Expert Bundle SHA-256 mismatch" >&2
