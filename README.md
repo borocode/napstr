@@ -1,4 +1,8 @@
-# Napstr
+<img width="2172" height="724" alt="napstr-logo" src="https://github.com/user-attachments/assets/58f087b4-aa0d-44b0-af70-93a621b283c7" />
+
+> Showcasing the power of nostr as a discovery layer for apps
+
+<img width="600" alt="image" src="https://github.com/user-attachments/assets/ce3e6404-98ad-4368-be4a-0543835f1cd2" />
 
 Napstr is a decentralised desktop audio-sharing client with a classic Napster/Windows 98 interface. It uses Nostr for public discovery and encrypted private signalling, and temporary Tor v3 onion services for every audio transfer. Only copyleft music should be shared.
 
