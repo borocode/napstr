@@ -1,8 +1,6 @@
 <img width="300" height="100" alt="napstr-logo-small" src="https://github.com/user-attachments/assets/83c9ccea-3241-4fce-a7cf-16c83629484b" />
 
-> Showcasing the power of Nostr as a discovery layer for apps. Uses Tor, file chunking and hashing for file sharing 
-
-<img width="600" alt="image" src="https://github.com/user-attachments/assets/ce3e6404-98ad-4368-be4a-0543835f1cd2" />
+> Showcasing the power of Nostr as a discovery layer for apps. Uses Tor for private file sharing. Files are hashed chunked and pulled for different peers.
 
 Napstr is a decentralised desktop audio-sharing client with a classic Napster/Windows 98 interface. It uses Nostr for public discovery and encrypted private signalling, and temporary Tor v3 onion services for every audio transfer. Only copyleft music should be shared.
 
