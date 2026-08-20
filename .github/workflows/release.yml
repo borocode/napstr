@@ -89,6 +89,9 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Do not let linuxdeploy strip the bundled, already-built Tor runtime.
           NO_STRIP: ${{ matrix.no_strip }}
+          # Tor's Expert Bundle libraries are intentionally adjacent to the Tor
+          # executable and are not installed into Ubuntu's global library path.
+          LD_LIBRARY_PATH: ${{ matrix.tor_platform == 'linux' && format('{0}/src-tauri/resources/tor/linux/tor', github.workspace) || '' }}
         with:
           tagName: ${{ env.RELEASE_TAG }}
           releaseName: Napstr ${{ env.RELEASE_TAG }}

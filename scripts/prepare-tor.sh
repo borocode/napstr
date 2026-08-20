@@ -13,7 +13,13 @@ case "$platform" in
     ;;
 esac
 
-archive="${RUNNER_TEMP:-/tmp}/napstr-tor-expert.tar.gz"
+archive_root="${RUNNER_TEMP:-/tmp}"
+if command -v cygpath >/dev/null 2>&1; then
+  # GNU tar treats a Windows drive-letter path such as D:\\a\\_temp as a
+  # remote host specification. Git Bash tools expect the /d/a/_temp form.
+  archive_root="$(cygpath -u "$archive_root")"
+fi
+archive="$archive_root/napstr-tor-expert.tar.gz"
 destination="src-tauri/resources/tor/${platform}"
 
 curl --fail --location --silent --show-error "$archive_url" --output "$archive"
