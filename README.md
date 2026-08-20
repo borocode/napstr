@@ -6,7 +6,7 @@ There is no Napstr server, tracker, file store, TURN service, WebRTC transport, 
 
 Napstr uses Nostr for discovery and Tor for private file sharing. Files are hashed chunked and pulled for different peers.
 
-napstr.net
+https://napstr.net
 
 ## Develop
 
