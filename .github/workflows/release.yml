@@ -22,8 +22,9 @@ jobs:
       matrix:
         include:
           - platform: ubuntu-22.04
-            args: --bundles appimage,deb
+            args: --verbose --bundles appimage,deb
             tor_platform: linux
+            no_strip: '1'
             tor_url: https://archive.torproject.org/tor-package-archive/torbrowser/15.0.20/tor-expert-bundle-linux-x86_64-15.0.20.tar.gz
             tor_sha256: 3b39a2a7fbf43ef28b9ae0a6afca02a12935232f81769e4fef7472d6b5676eaf
           - platform: windows-latest
@@ -60,7 +61,21 @@ jobs:
           targets: ${{ matrix.platform == 'macos-15' && 'aarch64-apple-darwin' || '' }}
       - name: Install Linux system dependencies
         if: matrix.platform == 'ubuntu-22.04'
-        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            curl \
+            file \
+            libayatana-appindicator3-dev \
+            libgirepository1.0-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            patchelf \
+            pkg-config \
+            wget
       - run: npm ci
       - name: Verify interface
         run: npm run check
@@ -72,6 +87,8 @@ jobs:
       - uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Do not let linuxdeploy strip the bundled, already-built Tor runtime.
+          NO_STRIP: ${{ matrix.no_strip }}
         with:
           tagName: ${{ env.RELEASE_TAG }}
           releaseName: Napstr ${{ env.RELEASE_TAG }}
