@@ -6,7 +6,7 @@ Napstr is back!
 
 There is no Napstr server, tracker, file store, TURN service, WebRTC transport, or direct-IP transfer fallback.
 
-Napstr uses nostr for discovery and Tor for private file sharing. Files are hashed chunked and pulled for different peers.
+Napstr uses Nostr for discovery and Tor for private file sharing. Files are hashed chunked and pulled for different peers.
 
 ## Develop
 
