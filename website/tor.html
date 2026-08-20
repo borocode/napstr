@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="How Napstr uses temporary Tor onion services for private audio transfers." />
+    <title>Napstr — Tor</title>
+    <link rel="icon" href="assets/napstr-logo.png" />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="site-shell">
+      <header class="masthead download-masthead">
+        <a class="brand" href="index.html" aria-label="Napstr home">
+          <img src="assets/napstr-logo.png" alt="Napstr" />
+        </a>
+        <div class="equalizer" aria-hidden="true">
+          <i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i>
+        </div>
+      </header>
+
+      <div class="page-grid">
+        <aside class="sidebar">
+          <nav aria-label="Main navigation">
+            <a href="index.html">Home</a>
+            <a href="download.html">Download</a>
+            <a href="nostr.html">Nostr</a>
+            <a class="active" href="tor.html">Tor</a>
+          </nav>
+          <div class="sidebar-meta">
+            <span>Temporary Onions</span>
+            <span>Verified Chunks</span>
+            <span>No Direct-IP Mode</span>
+          </div>
+        </aside>
+
+        <main class="content-panel protocol-page">
+          <section class="content-body">
+            <h1>How Napstr Uses Tor</h1>
+            <p class="protocol-lead">
+              Tor carries every Napstr audio transfer. There is no direct-IP fallback: if a
+              valid Tor v3 onion connection cannot be made, the download fails closed.
+            </p>
+
+            <section>
+              <h2>Tor Is Included</h2>
+              <p>
+                Official Windows, macOS and Linux releases package a pinned Tor Expert Bundle.
+                Napstr starts and manages it automatically when the first transfer needs it.
+                Users do not need to install the Tor Browser or configure a separate Tor daemon.
+              </p>
+              <p class="small-print">
+                Source-development builds can instead use <code>NAPSTR_TOR_PATH</code> or a
+                <code>tor</code> executable on the developer’s PATH.
+              </p>
+            </section>
+
+            <section>
+              <h2>A Temporary Transfer</h2>
+              <ol class="flow-list">
+                <li>The downloader requests an exact SHA-256 file ID through encrypted NIP-17.</li>
+                <li>The seeder validates the audio and opens a server on loopback only: <code>127.0.0.1</code>.</li>
+                <li>Napstr asks Tor to create a new v3 onion that maps to that loopback server. The onion private key is discarded.</li>
+                <li>Napstr creates a random 256-bit capability and sends it with the onion address inside NIP-17.</li>
+                <li>The downloader rejects non-onion destinations and connects through Napstr’s local Tor SOCKS port.</li>
+                <li>The seeder requires the capability and negotiated file ID before revealing the chunk manifest.</li>
+                <li>Each chunk and the reconstructed audio file are verified with SHA-256.</li>
+              </ol>
+              <div class="privacy-box">
+                A capability expires after fifteen minutes, can authorize only its negotiated
+                file ID, and disappears with the temporary onion service.
+              </div>
+            </section>
+
+            <section>
+              <h2>Who Can See What?</h2>
+              <table class="protocol-table">
+                <thead><tr><th>Party</th><th>Network visibility</th></tr></thead>
+                <tbody>
+                  <tr><td>Downloader</td><td>Receives a temporary onion, not the seeder’s direct IP address</td></tr>
+                  <tr><td>Seeder</td><td>Receives a Tor stream on loopback, not the downloader’s direct IP address</td></tr>
+                  <tr><td>Nostr relay</td><td>Carries the encrypted onion offer but cannot read its plaintext</td></tr>
+                  <tr><td>ISP / network</td><td>May observe that the computer is using Tor, but not the transferred filename or audio contents</td></tr>
+                  <tr><td>Tor network</td><td>Individual relays see only their part of a multi-hop circuit; no single relay is intended to know both peers</td></tr>
+                </tbody>
+              </table>
+            </section>
+
+            <section>
+              <h2>What Tor Does Not Promise</h2>
+              <p>
+                Tor greatly reduces direct peer-to-peer IP exposure, but it does not promise
+                perfect anonymity against a global traffic-correlation adversary, a compromised
+                computer, malicious software, or identifying information published in a Nostr profile.
+              </p>
+              <p>
+                Tor also does not decide whether a file is safe or lawful. Only copyleft music
+                should be shared.
+              </p>
+            </section>
+          </section>
+
+          <footer>
+            <div><a href="index.html">home</a> | <a href="download.html">download</a> | <a href="nostr.html">nostr</a> | <a href="tor.html">tor</a></div>
+            <em><a href="https://github.com/lnbits/napstr/blob/main/LICENSE">Napstr is FLOSS — MIT License</a></em>
+          </footer>
+        </main>
+      </div>
+    </div>
+  </body>
+</html>

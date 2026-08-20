@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="Napstr — public music discovery and private audio transfers." />
+    <title>Napstr — Home</title>
+    <link rel="icon" href="assets/napstr-logo.png" />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="site-shell">
+      <header class="masthead">
+        <a class="brand" href="index.html" aria-label="Napstr home">
+          <img src="assets/napstr-logo.png" alt="Napstr" />
+        </a>
+        <blockquote>
+          “The old internet let people share. Napstr brings that spirit back —<br />
+          public discovery, private transfers, no central file server.”
+          <small>&lt;&lt; <a href="#about">more</a> &gt;&gt;</small>
+        </blockquote>
+      </header>
+
+      <div class="page-grid">
+        <aside class="sidebar">
+          <nav aria-label="Main navigation">
+            <a class="active" href="index.html">Home</a>
+            <a href="download.html">Download</a>
+            <a href="nostr.html">Nostr</a>
+            <a href="tor.html">Tor</a>
+          </nav>
+          <div class="sidebar-meta">
+            <span>Service Status</span>
+            <span>Community Build</span>
+            <span>Privacy First</span>
+          </div>
+        </aside>
+
+        <main class="content-panel">
+          <section class="content-body">
+            <h1>Welcome to Napstr</h1>
+            <div class="intro-row">
+              <p>
+                Join a new community of people sharing copyleft music directly with each other.
+                Napstr is simple, free, and available for Windows, Linux, and the Mac.
+              </p>
+              <a class="retro-download" href="download.html">
+                <span class="grid-icon" aria-hidden="true">▦</span>
+                <b>DOWNLOAD<br />NAPSTR</b>
+              </a>
+            </div>
+
+            <section id="about">
+              <h2>Guess Who’s Back!</h2>
+              <p>
+                Napstr is bringing music sharing back with modern privacy.
+                Searchable catalogues are published through <a href="nostr.html">Nostr</a> while audio transfers
+                travel through authenticated, temporary <a href="tor.html">Tor onion services</a>. There is no central
+                Napstr tracker and no central file store. Read about the
+                <a href="#how-it-works">Napstr privacy model</a>.
+              </p>
+            </section>
+
+            <section id="how-it-works">
+              <h2>How Napstr Works</h2>
+              <div class="feature-row">
+                <div class="mini-mark" aria-hidden="true">
+                  <img src="assets/napstr-logo.png" alt="" />
+                </div>
+                <p>
+                  Pick a folder to share and Napstr recursively indexes supported audio files
+                  with SHA-256. Other
+                  people find the public catalogue, request a file privately, and verify every
+                  chunk they receive. Your files stay on your computer until you choose to
+                  share them. Discovery uses Nostr; downloads travel through temporary Tor
+                  onion services, so file-transfer peers do not receive your direct IP address.
+                  Only copyleft music should be shared.
+                </p>
+              </div>
+            </section>
+
+            <section>
+              <h2>Recent News</h2>
+              <article>
+                <h3>Napstr desktop is here!</h3>
+                <p>
+                  Napstr includes the classic interface, live Nostr catalogue search,
+                  encrypted NIP-17 negotiation, multi-source temporary onion transfers, resumable chunks,
+                  and verified file reconstruction.
+                  <a href="download.html">Choose your version and download it now.</a>
+                </p>
+              </article>
+            </section>
+          </section>
+
+          <footer>
+            <div><a href="index.html">home</a> | <a href="download.html">download</a> | <a href="nostr.html">nostr</a> | <a href="tor.html">tor</a></div>
+            <em><a href="https://github.com/lnbits/napstr/blob/main/LICENSE">Napstr is FLOSS — MIT License</a></em>
+          </footer>
+        </main>
+      </div>
+    </div>
+  </body>
+</html>

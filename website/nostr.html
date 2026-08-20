@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="How Napstr uses Nostr for its public audio catalogue and private transfer negotiation." />
+    <title>Napstr — Nostr</title>
+    <link rel="icon" href="assets/napstr-logo.png" />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="site-shell">
+      <header class="masthead download-masthead">
+        <a class="brand" href="index.html" aria-label="Napstr home">
+          <img src="assets/napstr-logo.png" alt="Napstr" />
+        </a>
+        <div class="equalizer" aria-hidden="true">
+          <i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i>
+        </div>
+      </header>
+
+      <div class="page-grid">
+        <aside class="sidebar">
+          <nav aria-label="Main navigation">
+            <a href="index.html">Home</a>
+            <a href="download.html">Download</a>
+            <a class="active" href="nostr.html">Nostr</a>
+            <a href="tor.html">Tor</a>
+          </nav>
+          <div class="sidebar-meta">
+            <span>Signed Catalogue</span>
+            <span>Encrypted Requests</span>
+            <span>No Central Index</span>
+          </div>
+        </aside>
+
+        <main class="content-panel protocol-page">
+          <section class="content-body">
+            <h1>How Napstr Uses Nostr</h1>
+            <p class="protocol-lead">
+              Nostr is Napstr’s public discovery layer and encrypted negotiation channel.
+              Audio bytes are never uploaded to Nostr relays.
+            </p>
+
+            <section>
+              <h2>What Type Is a Track?</h2>
+              <p>
+                A shared track is a custom <strong>parameterized-replaceable event</strong> of
+                kind <strong>30421</strong>. The event is signed by the seeder’s Napstr identity.
+              </p>
+              <div class="event-card">
+                <div><b>Kind:</b> <code>30421</code></div>
+                <div><b>Identity:</b> the <code>d</code> and <code>x</code> tags contain the full-file SHA-256</div>
+                <div><b>Tags:</b> <code>t=napstr</code>, filename, byte size, MIME type and alt text</div>
+                <div><b>JSON:</b> title, artist, album, format, license, description and search tags</div>
+                <div><b>Not included:</b> audio bytes, local file path, Tor address or transfer capability</div>
+              </div>
+              <p class="small-print">
+                Republishing the same <code>30421</code> + <code>d</code> pair replaces that
+                seeder’s previous record. Removing a share publishes a replacement marked deleted.
+              </p>
+            </section>
+
+            <section>
+              <h2>Napstr Event Map</h2>
+              <table class="protocol-table">
+                <thead><tr><th>Kind</th><th>Purpose</th><th>Visibility</th></tr></thead>
+                <tbody>
+                  <tr><td>0</td><td>Napstr profile name, description and picture</td><td>Public</td></tr>
+                  <tr><td>10050</td><td>NIP-17 inbox relay list</td><td>Public</td></tr>
+                  <tr><td>30421</td><td>Signed track catalogue record</td><td>Public</td></tr>
+                  <tr><td>30422</td><td>Expiring batches of file IDs currently being seeded</td><td>Public</td></tr>
+                  <tr><td>NIP-17</td><td>Download request, refusal, onion address and capability</td><td>Encrypted gift wrap</td></tr>
+                  <tr><td>1984</td><td>NIP-56 catalogue reports</td><td>Public and signed</td></tr>
+                </tbody>
+              </table>
+              <p>
+                Seeder heartbeats expire after ten minutes and are refreshed every four minutes.
+                Search groups identical SHA-256 IDs and ranks tracks by active seeders.
+              </p>
+            </section>
+
+            <section>
+              <h2>From Search to Download</h2>
+              <ol class="flow-list">
+                <li>Napstr fetches public <code>30421</code> catalogue events and live <code>30422</code> heartbeats.</li>
+                <li>The downloader sends selected seeders an encrypted NIP-17 request containing only a request ID and file ID.</li>
+                <li>A seeder creates a temporary Tor onion and replies with its address and a random, short-lived capability inside NIP-17.</li>
+                <li>The audio transfer then leaves Nostr entirely and continues over Tor.</li>
+              </ol>
+            </section>
+
+            <section>
+              <h2>What Is Public?</h2>
+              <div class="privacy-box">
+                <strong>Public:</strong> profile metadata, filenames, descriptive metadata,
+                SHA-256 file IDs, reports, and which profiles advertise each file ID.<br />
+                <strong>Encrypted:</strong> download requests, onion addresses and capabilities.<br />
+                <strong>Local:</strong> the Nostr secret key, filesystem paths and audio contents.
+              </div>
+              <p class="small-print">
+                A Nostr relay can normally see the IP address connecting to that relay, along
+                with public catalogue activity and encrypted-message timing. NIP-17 hides the
+                message plaintext; it does not make the relay connection itself anonymous.
+                Napstr stores its dedicated Nostr key in the operating-system keyring.
+              </p>
+            </section>
+          </section>
+
+          <footer>
+            <div><a href="index.html">home</a> | <a href="download.html">download</a> | <a href="nostr.html">nostr</a> | <a href="tor.html">tor</a></div>
+            <em><a href="https://github.com/lnbits/napstr/blob/main/LICENSE">Napstr is FLOSS — MIT License</a></em>
+          </footer>
+        </main>
+      </div>
+    </div>
+  </body>
+</html>

@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="Download Napstr for Windows, macOS, or Linux." />
+    <meta name="github-repository" content="lnbits/napstr" />
+    <title>Napstr — Download</title>
+    <link rel="icon" href="assets/napstr-logo.png" />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="site-shell">
+      <header class="masthead download-masthead">
+        <a class="brand" href="index.html" aria-label="Napstr home">
+          <img src="assets/napstr-logo.png" alt="Napstr" />
+        </a>
+        <div class="equalizer" aria-hidden="true">
+          <i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i>
+        </div>
+      </header>
+
+      <div class="page-grid">
+        <aside class="sidebar">
+          <nav aria-label="Main navigation">
+            <a href="index.html">Home</a>
+            <a class="active" href="download.html">Download</a>
+            <a href="nostr.html">Nostr</a>
+            <a href="tor.html">Tor</a>
+          </nav>
+          <div class="sidebar-meta">
+            <span>Service Status</span>
+            <span>Community Build</span>
+            <span>Privacy First</span>
+          </div>
+        </aside>
+
+        <main class="content-panel download-panel">
+          <section class="content-body">
+            <h1>Download Napstr Now</h1>
+            <p class="download-lead">
+              Find out why Napstr is the newest way to share copyleft music on the Net — download it today.
+              We are constantly working to improve the quality of our software. Check back
+              here from time-to-time to download a new version.
+            </p>
+            <p><strong>Only copyleft music should be shared with Napstr.</strong></p>
+
+            <p class="flavor"><strong><em>Choose your Flavor:</em></strong></p>
+
+            <div class="download-grid">
+              <article class="download-option windows">
+                <h2><a class="release-link" data-release-platform="windows" aria-disabled="true">Napstr For Windows</a></h2>
+                <p class="version"><b>Latest Version:</b> <span data-release-version>checking…</span></p>
+                <p>
+                  <a class="release-link" data-release-platform="windows" aria-disabled="true">Download the installer</a>
+                  for Windows 10 and 11. Launch the setup program and Napstr will guide you
+                  through the rest.
+                </p>
+                <a class="download-link release-link" data-release-platform="windows" aria-disabled="true">download .exe</a>
+              </article>
+
+              <article class="download-option mac">
+                <h2><a class="release-link" data-release-page aria-disabled="true">Napstr for the Mac</a></h2>
+                <p class="version"><b>Latest Version:</b> <span data-release-version>checking…</span></p>
+                <p>
+                  <a class="release-link" data-release-page aria-disabled="true">Mac fans rejoice!</a>
+                  Napstr is available as a disk image. Open it, drag Napstr into Applications,
+                  and you are ready to start.
+                </p>
+                <a class="download-link release-link" data-release-platform="mac-arm" aria-disabled="true">Apple silicon .dmg</a>
+                <span class="asset-separator"> | </span>
+                <a class="download-link release-link" data-release-platform="mac-intel" aria-disabled="true">Intel .dmg</a>
+              </article>
+
+              <article class="download-option linux">
+                <h2><a class="release-link" data-release-platform="linux" aria-disabled="true">Napstr For Linux</a></h2>
+                <p class="version"><b>Latest Version:</b> <span data-release-version>checking…</span></p>
+                <p>
+                  Download the portable AppImage, make it executable, and run it. No system
+                  installation is required.
+                </p>
+                <a class="download-link release-link" data-release-platform="linux" aria-disabled="true">download AppImage</a>
+              </article>
+            </div>
+
+            <div class="download-note" role="status" aria-live="polite">
+              <b>Release status:</b> <span id="release-status">Checking GitHub for the latest published release…</span>
+              <a id="release-page" hidden>View release</a>
+            </div>
+          </section>
+
+          <footer>
+            <div><a href="index.html">home</a> | <a href="download.html">download</a> | <a href="nostr.html">nostr</a> | <a href="tor.html">tor</a></div>
+            <em><a href="https://github.com/lnbits/napstr/blob/main/LICENSE">Napstr is FLOSS — MIT License</a></em>
+          </footer>
+        </main>
+      </div>
+    </div>
+    <script src="releases.js" defer></script>
+  </body>
+</html>

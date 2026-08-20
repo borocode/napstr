@@ -1,0 +1,39 @@
+[package]
+name = "napstr"
+version = "0.1.0"
+description = "Private audio sharing over Nostr and Tor"
+authors = ["Napstr contributors"]
+edition = "2021"
+license = "MIT"
+
+[lib]
+name = "napstr_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "napstr"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = { version = "2", default-features = false, features = ["xdg-portal"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+sha2 = "0.10"
+hex = "0.4"
+walkdir = "2"
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "6"
+tokio = { version = "1", features = ["full"] }
+tokio-socks = "0.5"
+nostr-sdk = { version = "0.44.1", features = ["nip44", "nip59"] }
+rand = "0.9"
+futures-util = "0.3"
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+tokio-util = "0.7"
+notify = "8"
