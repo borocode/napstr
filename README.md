@@ -1,6 +1,7 @@
 <img width="300" height="100" alt="napstr-logo-small" src="https://github.com/user-attachments/assets/83c9ccea-3241-4fce-a7cf-16c83629484b" />
 
 > Showcasing the power of nostr as a discovery layer for apps
+> Uses Tor, file chunking and hashing for file sharing 
 
 <img width="600" alt="image" src="https://github.com/user-attachments/assets/ce3e6404-98ad-4368-be4a-0543835f1cd2" />
 
