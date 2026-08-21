@@ -58,7 +58,7 @@ if (!checkOnly) {
   );
   replaceExactlyOnce(
     paths.cargoLock,
-    /(\[\[package\]\]\nname = "napstr"\nversion = ")[^"]+("\n)/,
+    /(\[\[package\]\]\r?\nname = "napstr"\r?\nversion = ")[^"]+("(?:\r?\n|$))/,
     `$1${version}$2`,
     'Napstr Cargo lock entry'
   );
@@ -75,7 +75,7 @@ const actualVersions = {
   'package-lock.json root package': packageLock.packages?.['']?.version,
   'tauri.conf.json': tauriConfig.version,
   'Cargo.toml': /\[package\][\s\S]*?\nversion\s*=\s*"([^"]+)"/.exec(cargoToml)?.[1],
-  'Cargo.lock': /\[\[package\]\]\nname = "napstr"\nversion = "([^"]+)"/.exec(cargoLock)?.[1]
+  'Cargo.lock': /\[\[package\]\]\r?\nname = "napstr"\r?\nversion = "([^"]+)"/.exec(cargoLock)?.[1]
 };
 
 for (const [source, actualVersion] of Object.entries(actualVersions)) {
