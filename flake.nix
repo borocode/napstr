@@ -14,6 +14,9 @@
           rustc
           cargo
           rustfmt
+          appimage-run
+          curl
+          file
           tor
           zenity
           pkg-config

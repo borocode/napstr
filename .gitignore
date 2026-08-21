@@ -3,6 +3,7 @@ node_modules/
 build/
 src-tauri/target/
 src-tauri/gen/
+src-tauri/resources/tor/
+.cache/
 *.log
 .DS_Store
-

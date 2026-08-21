@@ -10,7 +10,10 @@
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
     "tauri": "tauri",
     "desktop": "tauri dev",
-    "bundle": "tauri build"
+    "bundle": "tauri build",
+    "appimage:build": "bash scripts/build-appimage-local.sh build",
+    "appimage:run": "bash scripts/build-appimage-local.sh launch",
+    "appimage": "bash scripts/build-appimage-local.sh run"
   },
   "devDependencies": {
     "@sveltejs/adapter-static": "^3.0.8",

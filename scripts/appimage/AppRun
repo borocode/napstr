@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -e
+
+appdir="$(readlink -f "$(dirname "$0")")"
+export APPDIR="$appdir"
+export PATH="$appdir/usr/bin:${PATH:-/usr/bin:/bin}"
+export XDG_DATA_DIRS="$appdir/usr/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+
+# Keep the GTK integration prepared by linuxdeploy, but let WebKit and the
+# bundled Tor process discover the host's compatible media and graphics stack.
+# The hook is generated inside the AppImage.
+# shellcheck disable=SC1091
+source "$appdir/apprun-hooks/linuxdeploy-plugin-gtk.sh"
+export LD_LIBRARY_PATH="$appdir/usr/lib:$appdir/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+unset GST_PLUGIN_SYSTEM_PATH GST_PLUGIN_SYSTEM_PATH_1_0
+
+# WebKitGTK's helper paths in this AppDir are relative to usr/.
+cd "$appdir/usr"
+exec "$appdir/usr/bin/napstr" "$@"

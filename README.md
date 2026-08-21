@@ -21,6 +21,22 @@ Development builds use `NAPSTR_TOR_PATH` when set, then a bundled Tor binary, th
 
 On NixOS, enter the included shell with `nix develop` first.
 
+To build the release-style AppImage, apply the same portability repair as CI,
+and launch the packaged result locally on NixOS, use one command from the
+repository root. The build runs in an Ubuntu 22.04 Docker container so the
+result is linked for ordinary Linux machines rather than against Nix store
+paths:
+
+```bash
+nix develop -c npm run appimage
+```
+
+Use `nix develop -c npm run appimage:build` when you only want to create the
+artifact. The command prints its exact output path when it finishes; container
+builds are cached under `src-tauri/target/appimage-container/`. After building,
+`nix develop -c npm run appimage:run` launches the existing artifact without
+rebuilding it.
+
 ## Verify
 
 ```bash
@@ -65,4 +81,3 @@ Unsigned builds can trigger operating-system warnings. Public distribution requi
 - Play controls revalidate the exact SHA-256 audio file and open it in the operating system's default player, keeping untrusted codec decoding outside Napstr's key- and network-holding process.
 
 Public information includes the Napstr profile, catalogue metadata, canonical file ID, and profiles advertising it. NIP-17 requests, onion endpoints, capabilities, contents, and peer IP addresses remain private. Tor use may still be visible to a user's ISP; Napstr does not claim perfect anonymity.
-

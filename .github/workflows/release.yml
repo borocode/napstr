@@ -75,7 +75,9 @@ jobs:
             libxdo-dev \
             patchelf \
             pkg-config \
-            wget
+            wget \
+            xauth \
+            xvfb
       - run: npm ci
       - name: Verify interface
         run: npm run check
@@ -99,3 +101,36 @@ jobs:
           releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }}
+      - name: Repair and smoke-test Linux AppImage
+        if: matrix.platform == 'ubuntu-22.04'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          appimage="$(find src-tauri/target/release/bundle/appimage -maxdepth 1 -type f -name '*.AppImage' -print -quit)"
+          if [[ -z "$appimage" ]]; then
+            echo "Tauri did not produce an AppImage" >&2
+            exit 1
+          fi
+
+          bash scripts/postprocess-appimage.sh "$appimage"
+
+          smoke_log="$RUNNER_TEMP/napstr-appimage-smoke.log"
+          set +e
+          timeout 15s xvfb-run -a env APPIMAGE_EXTRACT_AND_RUN=1 "$appimage" >"$smoke_log" 2>&1
+          smoke_status=$?
+          set -e
+          cat "$smoke_log"
+
+          if grep -Eqi 'EGL_BAD_PARAMETER|Unable to spawn|error while loading shared libraries' "$smoke_log"; then
+            echo "The AppImage hit a known graphics, WebKit, or library startup failure" >&2
+            exit 1
+          fi
+          if [[ "$smoke_status" -ne 124 ]]; then
+            echo "The AppImage exited unexpectedly during its startup smoke test (status $smoke_status)" >&2
+            exit 1
+          fi
+
+          # tauri-action has already uploaded the initial bundle. Replace that
+          # asset with the repaired, verified AppImage under the same filename.
+          gh release upload "$RELEASE_TAG" "$appimage" --clobber
