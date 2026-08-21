@@ -2,6 +2,8 @@
 
 > Showcasing the power of Nostr as a discovery layer for apps.
 
+<img height="400" alt="image" src="https://github.com/user-attachments/assets/95b4d9f8-a844-49e1-ba9a-6dd003c8acd3" />
+
 There is no Napstr server, tracker, file store, TURN service, WebRTC transport, or direct-IP transfer fallback.
 
 Napstr uses Nostr for discovery and Tor for private file sharing. Each track is identified by its complete SHA-256 hash and streamed from one responsive seeder.
