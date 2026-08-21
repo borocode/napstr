@@ -189,9 +189,10 @@ fn initialise_database(path: &Path, app_data: &Path) -> Result<(), String> {
         ("display_name", "napstr-user".to_string()),
         (
             "profile_about",
-            "Sharing files privately with Napstr.".to_string(),
+            "Sharing files privately with Napstr. napstr.net".to_string(),
         ),
         ("profile_picture", "".to_string()),
+        ("profile_event_fingerprint", "".to_string()),
     ] {
         connection
             .execute(
@@ -215,6 +216,23 @@ fn initialise_database(path: &Path, app_data: &Path) -> Result<(), String> {
             params![DEFAULT_NOSTR_RELAYS, LEGACY_DEFAULT_NOSTR_RELAYS],
         )
         .map_err(|error| error.to_string())?;
+    let migrated_profile = connection
+        .execute(
+            "UPDATE settings SET value=?1 WHERE key='profile_about' AND value=?2",
+            params![
+                "Sharing files privately with Napstr. napstr.net",
+                "Sharing files privately with Napstr."
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    if migrated_profile > 0 {
+        connection
+            .execute(
+                "UPDATE settings SET value='' WHERE key='profile_event_fingerprint'",
+                [],
+            )
+            .map_err(|error| error.to_string())?;
+    }
     Ok(())
 }
 
@@ -621,6 +639,9 @@ fn save_settings(settings: Settings, state: State<'_, AppState>) -> Result<AppSn
     validate_length("profile about", &settings.profile_about, 500)?;
     validate_length("relay list", &settings.nostr_relays, 4096)?;
     let connection = open_db(&state)?;
+    let profile_changed = get_setting(&connection, "display_name")? != settings.display_name
+        || get_setting(&connection, "profile_about")? != settings.profile_about
+        || get_setting(&connection, "profile_picture")? != settings.profile_picture;
     for (key, value) in [
         ("shared_folder", settings.napstr_folder),
         ("nostr_relays", settings.nostr_relays),
@@ -632,6 +653,14 @@ fn save_settings(settings: Settings, state: State<'_, AppState>) -> Result<AppSn
             .execute(
                 "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)",
                 params![key, value],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    if profile_changed {
+        connection
+            .execute(
+                "UPDATE settings SET value='' WHERE key='profile_event_fingerprint'",
+                [],
             )
             .map_err(|error| error.to_string())?;
     }
@@ -1174,6 +1203,48 @@ mod tests {
         assert!(Path::new(&settings.napstr_folder).is_dir());
         assert!(get_setting(&connection, "download_folder").is_err());
         assert_eq!(settings.nostr_relays, DEFAULT_NOSTR_RELAYS);
+        assert_eq!(
+            settings.profile_about,
+            "Sharing files privately with Napstr. napstr.net"
+        );
+        assert_eq!(
+            get_setting(&connection, "profile_event_fingerprint").unwrap(),
+            ""
+        );
+        drop(connection);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn legacy_default_profile_is_migrated_and_queued_for_publication() {
+        let directory = test_directory("default-profile-migration-test");
+        let db_path = directory.join("napstr.sqlite3");
+        initialise_database(&db_path, &directory).unwrap();
+        let connection = open_connection(&db_path).unwrap();
+        connection
+            .execute(
+                "UPDATE settings SET value='Sharing files privately with Napstr.' WHERE key='profile_about'",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE settings SET value='already-published' WHERE key='profile_event_fingerprint'",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        initialise_database(&db_path, &directory).unwrap();
+        let connection = open_connection(&db_path).unwrap();
+        assert_eq!(
+            get_setting(&connection, "profile_about").unwrap(),
+            "Sharing files privately with Napstr. napstr.net"
+        );
+        assert_eq!(
+            get_setting(&connection, "profile_event_fingerprint").unwrap(),
+            ""
+        );
         drop(connection);
         fs::remove_dir_all(directory).unwrap();
     }

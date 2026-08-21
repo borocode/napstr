@@ -5,6 +5,7 @@ use keyring::Entry;
 use nostr_sdk::prelude::*;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
@@ -150,9 +151,6 @@ impl NetworkService {
         if relays.is_empty() {
             return Err("at least one Nostr relay is required".into());
         }
-        let display_name = super::get_setting(&connection, "display_name")?;
-        let profile_about = super::get_setting(&connection, "profile_about")?;
-        let profile_picture = super::get_setting(&connection, "profile_picture")?;
         drop(connection);
 
         let client = Client::new(keys.clone());
@@ -165,20 +163,8 @@ impl NetworkService {
         }
         client.connect().await;
 
-        let mut metadata = Metadata::new()
-            .name(display_name.clone())
-            .display_name(display_name)
-            .about(profile_about);
-        if !profile_picture.trim().is_empty() {
-            metadata = metadata.picture(
-                Url::parse(&profile_picture)
-                    .map_err(|error| format!("invalid profile picture URL: {error}"))?,
-            );
-        }
-        client
-            .set_metadata(&metadata)
-            .await
-            .map_err(|error| format!("profile publication failed: {error}"))?;
+        self.publish_profile_with_client(&client, keys.public_key())
+            .await?;
         let dm_tags = relays
             .iter()
             .map(|relay| Tag::parse(["relay", relay.as_str()]).map_err(|error| error.to_string()))
@@ -397,11 +383,31 @@ impl NetworkService {
             .await
             .clone()
             .ok_or("Nostr is not connected")?;
+        let public_key = self
+            .keys
+            .read()
+            .await
+            .as_ref()
+            .map(Keys::public_key)
+            .ok_or("Nostr identity is not loaded")?;
+        self.publish_profile_with_client(&client, public_key).await
+    }
+
+    async fn publish_profile_with_client(
+        &self,
+        client: &Client,
+        public_key: PublicKey,
+    ) -> Result<(), String> {
         let connection = super::open_connection(&self.db_path)?;
         let display_name = super::get_setting(&connection, "display_name")?;
         let about = super::get_setting(&connection, "profile_about")?;
         let picture = super::get_setting(&connection, "profile_picture")?;
+        let published_fingerprint = super::get_setting(&connection, "profile_event_fingerprint")?;
         drop(connection);
+        let fingerprint = profile_fingerprint(public_key, &display_name, &about, &picture);
+        if published_fingerprint == fingerprint {
+            return Ok(());
+        }
         let mut metadata = Metadata::new()
             .name(display_name.clone())
             .display_name(display_name)
@@ -416,6 +422,12 @@ impl NetworkService {
             .set_metadata(&metadata)
             .await
             .map_err(|error| format!("profile publication failed: {error}"))?;
+        super::open_connection(&self.db_path)?
+            .execute(
+                "INSERT OR REPLACE INTO settings(key,value) VALUES('profile_event_fingerprint',?1)",
+                [&fingerprint],
+            )
+            .map_err(|error| error.to_string())?;
         Ok(())
     }
 
@@ -967,6 +979,25 @@ fn profile_keyring_account(profile: Option<&str>) -> Result<String, String> {
     Ok(format!("nostr-identity-{profile}"))
 }
 
+fn profile_fingerprint(
+    public_key: PublicKey,
+    display_name: &str,
+    about: &str,
+    picture: &str,
+) -> String {
+    let mut digest = Sha256::new();
+    for value in [
+        public_key.to_hex(),
+        display_name.into(),
+        about.into(),
+        picture.into(),
+    ] {
+        digest.update((value.len() as u64).to_be_bytes());
+        digest.update(value.as_bytes());
+    }
+    hex::encode(digest.finalize())
+}
+
 type PublishFile = (String, String, u64, String, String);
 
 fn load_publish_files(db_path: &PathBuf) -> Result<Vec<PublishFile>, String> {
@@ -1089,6 +1120,40 @@ mod tests {
         );
         assert!(profile_keyring_account(Some("../alice")).is_err());
         assert!(profile_keyring_account(Some("")).is_err());
+    }
+
+    #[test]
+    fn profile_publication_fingerprint_tracks_identity_and_contents() {
+        let alice = Keys::generate();
+        let bob = Keys::generate();
+        let original = profile_fingerprint(
+            alice.public_key(),
+            "napstr-user",
+            "Sharing files privately with Napstr. napstr.net",
+            "",
+        );
+        assert_eq!(
+            original,
+            profile_fingerprint(
+                alice.public_key(),
+                "napstr-user",
+                "Sharing files privately with Napstr. napstr.net",
+                "",
+            )
+        );
+        assert_ne!(
+            original,
+            profile_fingerprint(alice.public_key(), "Alice", "Updated profile", "")
+        );
+        assert_ne!(
+            original,
+            profile_fingerprint(
+                bob.public_key(),
+                "napstr-user",
+                "Sharing files privately with Napstr. napstr.net",
+                "",
+            )
+        );
     }
 
     #[tokio::test]

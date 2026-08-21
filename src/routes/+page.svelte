@@ -84,7 +84,7 @@
   let napstrFolder = '';
   let nostrRelays = 'wss://relay.damus.io, wss://nos.lol, wss://relay.nostr.com, wss://relay.primal.net, wss://relay.snort.social, wss://nostr.mom';
   let displayName = 'napstr-user';
-  let profileAbout = 'Sharing files privately with Napstr.';
+  let profileAbout = 'Sharing files privately with Napstr. napstr.net';
   let profilePicture = '';
   let indexedBytes = 0;
   let networkConnected = false;
