@@ -52,7 +52,7 @@
                 <div><b>Kind:</b> <code>30421</code></div>
                 <div><b>Identity:</b> the <code>d</code> and <code>x</code> tags contain the full-file SHA-256</div>
                 <div><b>Tags:</b> <code>t=napstr</code>, filename, byte size, MIME type and alt text</div>
-                <div><b>JSON:</b> title, artist, album, format, license, description and search tags</div>
+                <div><b>JSON:</b> the indexed filename, audio format, MIME type and byte size</div>
                 <div><b>Not included:</b> audio bytes, local file path, Tor address or transfer capability</div>
               </div>
               <p class="small-print">
@@ -85,7 +85,7 @@
               <ol class="flow-list">
                 <li>Napstr fetches public <code>30421</code> catalogue events and live <code>30422</code> heartbeats.</li>
                 <li>The downloader sends selected seeders an encrypted NIP-17 request containing only a request ID and file ID.</li>
-                <li>A seeder creates a temporary Tor onion and replies with its address and a random, short-lived capability inside NIP-17.</li>
+                <li>A seeder replies with its private app-session Tor onion and a random, short-lived per-file capability inside NIP-17.</li>
                 <li>The audio transfer then leaves Nostr entirely and continues over Tor.</li>
               </ol>
             </section>

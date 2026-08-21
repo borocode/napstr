@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <meta name="description" content="How Napstr uses temporary Tor onion services for private audio transfers." />
+    <meta name="description" content="How Napstr uses private app-session Tor onion services for audio transfers." />
     <title>Napstr — Tor</title>
     <link rel="icon" href="assets/napstr-logo.png" />
     <link rel="stylesheet" href="styles.css" />
@@ -28,8 +28,8 @@
             <a class="active" href="tor.html">Tor</a>
           </nav>
           <div class="sidebar-meta">
-            <span>Temporary Onions</span>
-            <span>Verified Chunks</span>
+            <span>Private Tor Sessions</span>
+            <span>Verified Files</span>
             <span>No Direct-IP Mode</span>
           </div>
         </aside>
@@ -46,7 +46,7 @@
               <h2>Tor Is Included</h2>
               <p>
                 Official Windows, macOS and Linux releases package a pinned Tor Expert Bundle.
-                Napstr starts and manages it automatically when the first transfer needs it.
+                Napstr starts and manages it automatically while the application is open.
                 Users do not need to install the Tor Browser or configure a separate Tor daemon.
               </p>
               <p class="small-print">
@@ -56,19 +56,20 @@
             </section>
 
             <section>
-              <h2>A Temporary Transfer</h2>
+              <h2>A Private App Session</h2>
               <ol class="flow-list">
                 <li>The downloader requests an exact SHA-256 file ID through encrypted NIP-17.</li>
                 <li>The seeder validates the audio and opens a server on loopback only: <code>127.0.0.1</code>.</li>
-                <li>Napstr asks Tor to create a new v3 onion that maps to that loopback server. The onion private key is discarded.</li>
+                <li>Napstr asks Tor to create a v3 onion that maps to that loopback server and lasts only for the current app session. Its private key is discarded.</li>
                 <li>Napstr creates a random 256-bit capability and sends it with the onion address inside NIP-17.</li>
-                <li>The downloader rejects non-onion destinations and connects through Napstr’s local Tor SOCKS port.</li>
-                <li>The seeder requires the capability and negotiated file ID before revealing the chunk manifest.</li>
-                <li>Each chunk and the reconstructed audio file are verified with SHA-256.</li>
+                <li>The downloader rejects non-onion destinations and races up to three offers through Napstr’s local Tor SOCKS port.</li>
+                <li>The first valid, responsive seeder streams the complete file; the others remain available as fallbacks.</li>
+                <li>The seeder requires the capability and negotiated file ID before beginning the stream.</li>
+                <li>The complete audio file is accepted only when its SHA-256 matches the catalogue file ID.</li>
               </ol>
               <div class="privacy-box">
                 A capability expires after fifteen minutes, can authorize only its negotiated
-                file ID, and disappears with the temporary onion service.
+                file ID. The private onion service disappears when Napstr closes.
               </div>
             </section>
 
@@ -77,7 +78,7 @@
               <table class="protocol-table">
                 <thead><tr><th>Party</th><th>Network visibility</th></tr></thead>
                 <tbody>
-                  <tr><td>Downloader</td><td>Receives a temporary onion, not the seeder’s direct IP address</td></tr>
+                  <tr><td>Downloader</td><td>Receives an app-session onion, not the seeder’s direct IP address</td></tr>
                   <tr><td>Seeder</td><td>Receives a Tor stream on loopback, not the downloader’s direct IP address</td></tr>
                   <tr><td>Nostr relay</td><td>Carries the encrypted onion offer but cannot read its plaintext</td></tr>
                   <tr><td>ISP / network</td><td>May observe that the computer is using Tor, but not the transferred filename or audio contents</td></tr>

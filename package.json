@@ -13,6 +13,7 @@
     "bundle": "tauri build",
     "appimage:build": "bash scripts/build-appimage-local.sh build",
     "appimage:run": "bash scripts/build-appimage-local.sh launch",
+    "appimage:test-user": "bash scripts/run-appimage-test-user.sh",
     "appimage": "bash scripts/build-appimage-local.sh run"
   },
   "devDependencies": {

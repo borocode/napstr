@@ -4,7 +4,7 @@
 
 There is no Napstr server, tracker, file store, TURN service, WebRTC transport, or direct-IP transfer fallback.
 
-Napstr uses Nostr for discovery and Tor for private file sharing. Files are hashed chunked and pulled for different peers.
+Napstr uses Nostr for discovery and Tor for private file sharing. Each track is identified by its complete SHA-256 hash and streamed from one responsive seeder.
 
 https://napstr.net
 
@@ -37,6 +37,16 @@ builds are cached under `src-tauri/target/appimage-container/`. After building,
 `nix develop -c npm run appimage:run` launches the existing artifact without
 rebuilding it.
 
+To run two isolated users, launch each profile in a separate terminal:
+
+```bash
+nix develop -c npm run appimage:test-user -- alice
+nix develop -c npm run appimage:test-user -- bob
+```
+
+Each profile keeps separate app data, Tor state, and a keyring-generated Nostr
+identity.
+
 ## Verify
 
 ```bash
@@ -45,7 +55,7 @@ npm run build
 cd src-tauri && cargo test
 ```
 
-The Rust tests cover deterministic file/chunk hashing, verified reconstruction, protocol framing, NIP-17/NIP-44/NIP-59 gift-wrap confidentiality, and rejection of incorrect transfer capabilities. An ignored live test exercises Tor bootstrap, `ADD_ONION`, SOCKS transfer, and teardown against the real Tor network; the release transport was also validated with the pinned Linux expert bundle.
+The Rust tests cover deterministic file hashing, verified whole-file transfer, protocol framing, NIP-17/NIP-44/NIP-59 gift-wrap confidentiality, and rejection of incorrect transfer capabilities. An ignored live test exercises Tor bootstrap, `ADD_ONION`, SOCKS transfer, and teardown against the real Tor network; the release transport was also validated with the pinned Linux expert bundle.
 
 ## Build AppImage, EXE, and DMG installers
 
@@ -71,13 +81,13 @@ Unsigned builds can trigger operating-system warnings. Public distribution requi
 - A dedicated Nostr identity is generated for Napstr and kept in the operating-system keyring. `NAPSTR_NSEC` can supply a dedicated identity in development.
 - Kind `30421` parameterized-replaceable catalogue events publish signed file metadata, keyed by full-file SHA-256. Removed shares are withdrawn with replacement events.
 - Kind `30422` expiring, parameterized-replaceable availability heartbeats identify profiles currently seeding each exact file ID. Search aggregates identical files by SHA-256 and displays live seeders and their Nostr profiles.
-- Kind `10050` advertises the user's NIP-17 inbox relays. Download requests, refusals, temporary onion endpoints, and capabilities use NIP-17 gift wraps (NIP-44 encryption and NIP-59 wrapping) through `nostr-sdk`.
-- A managed, bundled Tor process creates a fresh `ADD_ONION` service and random 256-bit capability for each accepted request. The service listens only on `127.0.0.1`; the control connection keeps it alive for at most 15 minutes. The downloader rejects every destination that is not `.onion`.
-- The binary transfer protocol supports `HELLO`, `REQUEST_CHUNK`, `CHUNK_DATA`, `TRANSFER_COMPLETE`, and `CANCEL`. A peer can request only an indexed file ID—never a path.
-- Files are streamed in 1 MiB chunks. Available exact-file seeders negotiate independently over NIP-17 and claim missing chunks from one shared scheduler, so one download can use several Tor peers concurrently. Failed claims return to the pool. Every chunk and the reconstructed file are SHA-256 verified; the SQLite ledger records which seeder supplied each chunk and `.napstr-parts` retains valid resume data until completion.
-- The selected shared directory is watched recursively. Changes trigger re-indexing, catalogue replacement/withdrawal, and a fresh availability heartbeat while connected.
-- The share boundary accepts only content-validated MP3, FLAC, PCM WAV, Ogg Vorbis, and Opus files. Embedded cover artwork is allowed, while extensions must match the codec and additional media streams, malformed containers, appended WAV payloads, and unsupported formats are rejected. Validation runs while indexing, publishing, serving, and after reconstruction.
+- Kind `10050` advertises the user's NIP-17 inbox relays. Download requests, refusals, app-session onion endpoints, and capabilities use NIP-17 gift wraps (NIP-44 encryption and NIP-59 wrapping) through `nostr-sdk`.
+- A managed, bundled Tor process and private `ADD_ONION` service stay ready for the app session and close with Napstr. The service listens only on `127.0.0.1`; every accepted request receives a separate random 256-bit capability that expires after 15 minutes. The downloader rejects every destination that is not `.onion`.
+- The binary transfer protocol supports `HELLO`, `REQUEST_FILE`, `FILE_DATA`, `TRANSFER_COMPLETE`, and `CANCEL`. A peer can request only an indexed file ID—never a path.
+- Napstr races up to three exact-file seeders and streams the complete track from the first source to establish a valid Tor session. Other responders remain standbys; if the primary stream fails, the next source restarts the transfer automatically. The completed file must match its catalogue SHA-256 before it is accepted.
+- One selected Napstr folder is used for both downloads and recursively shared audio. Changes and completed downloads trigger re-indexing, catalogue replacement/withdrawal, and a fresh availability heartbeat while connected.
+- The share boundary accepts only content-validated MP3, FLAC, PCM WAV, Ogg Vorbis, and Opus files. Embedded cover artwork is allowed, while extensions must match the codec and additional media streams, malformed containers, appended WAV payloads, and unsupported formats are rejected. Validation runs while indexing, publishing, serving, and after each download.
 - Local SHA-256 and Nostr-publisher blocks are enforced across discovery, requests, publication, and serving. Signed public NIP-56 reports identify the catalogue event, publisher, and exact-file hash.
-- Play controls revalidate the exact SHA-256 audio file and open it in the operating system's default player, keeping untrusted codec decoding outside Napstr's key- and network-holding process.
+- The built-in player revalidates the exact SHA-256 audio file before exposing it to the packaged media engine.
 
 Public information includes the Napstr profile, catalogue metadata, canonical file ID, and profiles advertising it. NIP-17 requests, onion endpoints, capabilities, contents, and peer IP addresses remain private. Tor use may still be visible to a user's ISP; Napstr does not claim perfect anonymity.

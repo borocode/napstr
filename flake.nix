@@ -15,6 +15,7 @@
           cargo
           rustfmt
           appimage-run
+          alsa-lib
           curl
           file
           tor
@@ -28,6 +29,7 @@
           patchelf
         ];
         nativeBuildInputs = with pkgs; [
+          alsa-lib.dev
           dbus.dev
           gtk3.dev
           webkitgtk_4_1.dev

@@ -44,7 +44,7 @@ jobs:
             tor_sha256: 73fdccde8136678e41a625160993e6a9dc4f4ff8cd376318b5e41e5627d55682
     runs-on: ${{ matrix.platform }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Validate release tag
         shell: bash
         run: |
@@ -52,7 +52,7 @@ jobs:
             echo "Release tag must look like v0.1.0 or v0.1.0-beta.1" >&2
             exit 1
           fi
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
           cache: npm
@@ -67,6 +67,13 @@ jobs:
             build-essential \
             curl \
             file \
+            gstreamer1.0-alsa \
+            gstreamer1.0-libav \
+            gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-good \
+            gstreamer1.0-pulseaudio \
+            gstreamer1.0-tools \
+            libasound2-dev \
             libayatana-appindicator3-dev \
             libgirepository1.0-dev \
             librsvg2-dev \

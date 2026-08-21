@@ -8,7 +8,7 @@ use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -18,12 +18,9 @@ use std::{
 };
 use tokio::{
     fs::{self, File},
-    io::{
-        AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter,
-        SeekFrom,
-    },
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter},
     net::TcpListener,
-    sync::{watch, Mutex, RwLock},
+    sync::{watch, Mutex, RwLock, Semaphore},
     task::JoinHandle,
     time::timeout,
 };
@@ -57,6 +54,7 @@ pub struct TransferService {
     tor: Arc<TorManager>,
     grants: Arc<RwLock<HashMap<String, SessionGrant>>>,
     listener: Mutex<Option<ListenerRuntime>>,
+    session_onion: Mutex<Option<Arc<OnionLease>>>,
     active: Arc<Mutex<HashMap<String, Arc<DownloadCoordinator>>>>,
     globally_paused: AtomicBool,
 }
@@ -64,21 +62,10 @@ pub struct TransferService {
 struct DownloadCoordinator {
     cancel: CancellationToken,
     paused: watch::Sender<bool>,
-    claims: Mutex<HashSet<usize>>,
-    verified: Mutex<HashSet<usize>>,
-    manifest: Mutex<Option<PeerManifest>>,
     destination: Mutex<Option<PathBuf>>,
+    primary_slot: Arc<Semaphore>,
     workers: AtomicUsize,
-    finalizing: AtomicBool,
     complete: AtomicBool,
-}
-
-#[derive(Clone, PartialEq, Eq)]
-struct PeerManifest {
-    filename: String,
-    size: u64,
-    chunk_size: u32,
-    chunk_hashes: Vec<String>,
 }
 
 impl DownloadCoordinator {
@@ -87,12 +74,9 @@ impl DownloadCoordinator {
         Arc::new(Self {
             cancel: CancellationToken::new(),
             paused,
-            claims: Mutex::new(HashSet::new()),
-            verified: Mutex::new(HashSet::new()),
-            manifest: Mutex::new(None),
             destination: Mutex::new(None),
+            primary_slot: Arc::new(Semaphore::new(1)),
             workers: AtomicUsize::new(0),
-            finalizing: AtomicBool::new(false),
             complete: AtomicBool::new(false),
         })
     }
@@ -105,9 +89,23 @@ impl TransferService {
             tor,
             grants: Arc::new(RwLock::new(HashMap::new())),
             listener: Mutex::new(None),
+            session_onion: Mutex::new(None),
             active: Arc::new(Mutex::new(HashMap::new())),
             globally_paused: AtomicBool::new(false),
         }
+    }
+
+    pub async fn warm_tor(&self) -> Result<(), String> {
+        self.tor.start().await.map(|_| ())
+    }
+
+    pub async fn warm_for_sharing(&self) -> Result<(), String> {
+        let port = self.ensure_listener().await?;
+        let mut session_onion = self.session_onion.lock().await;
+        if session_onion.is_none() {
+            *session_onion = Some(self.tor.create_onion(port).await?);
+        }
+        Ok(())
     }
 
     pub async fn create_offer(
@@ -158,7 +156,16 @@ impl TransferService {
         }
 
         let port = self.ensure_listener().await?;
-        let onion_lease = self.tor.create_onion(port).await?;
+        let onion_lease = {
+            let mut session_onion = self.session_onion.lock().await;
+            if session_onion.is_none() {
+                *session_onion = Some(self.tor.create_onion(port).await?);
+            }
+            session_onion
+                .as_ref()
+                .cloned()
+                .ok_or("Tor session onion disappeared")?
+        };
         let mut random = [0u8; 32];
         rand::rng().fill_bytes(&mut random);
         let capability = hex::encode(random);
@@ -377,31 +384,17 @@ where
     }
 
     let connection = crate::open_connection(db_path)?;
-    let record: Option<(String, String, i64, i64, String)> = connection
+    let record: Option<(String, String, i64)> = connection
         .query_row(
-            "SELECT path, filename, size, chunk_size, chunk_hashes FROM files WHERE file_id = ?1 AND NOT EXISTS(SELECT 1 FROM blocked_files WHERE file_id=?1)",
+            "SELECT path, filename, size FROM files WHERE file_id = ?1 AND NOT EXISTS(SELECT 1 FROM blocked_files WHERE file_id=?1)",
             [&file_id],
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                ))
-            },
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()
         .map_err(|error| error.to_string())?;
-    let (path, filename, size, chunk_size, chunk_hashes) =
-        record.ok_or("shared file disappeared")?;
+    let (path, filename, size) = record.ok_or("shared file disappeared")?;
     crate::audio::validate_audio(Path::new(&path))
         .map_err(|error| format!("shared file failed the audio-only policy: {error}"))?;
-    let chunk_hashes: Vec<String> = chunk_hashes
-        .split(',')
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned)
-        .collect();
     write_frame(
         &mut stream,
         &ServerFrame::Welcome {
@@ -409,61 +402,55 @@ where
             file_id: file_id.clone(),
             filename,
             size: size as u64,
-            chunk_size: chunk_size as u32,
-            chunk_hashes: chunk_hashes.clone(),
         },
     )
     .await?;
 
     let mut file = File::open(path).await.map_err(|error| error.to_string())?;
+    let mut sent_file = false;
     loop {
         match timeout(
-            Duration::from_secs(120),
+            Duration::from_secs(15 * 60),
             read_frame::<_, ClientFrame>(&mut stream),
         )
         .await
         .map_err(|_| "peer was idle for too long".to_string())??
         {
-            ClientFrame::RequestChunk { index } => {
-                let Some(expected_hash) = chunk_hashes.get(index as usize) else {
-                    write_frame(
-                        &mut stream,
-                        &ServerFrame::Error {
-                            code: "BAD_CHUNK".into(),
-                            message: "chunk index is out of range".into(),
-                        },
-                    )
-                    .await?;
-                    continue;
-                };
-                let offset = index as u64 * chunk_size as u64;
-                let remaining = (size as u64).saturating_sub(offset);
-                let count = remaining.min(chunk_size as u64) as usize;
-                let mut bytes = vec![0u8; count];
-                file.seek(SeekFrom::Start(offset))
-                    .await
-                    .map_err(|error| error.to_string())?;
-                file.read_exact(&mut bytes)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                if hex::encode(Sha256::digest(&bytes)) != *expected_hash {
-                    return Err("local shared file changed after indexing".into());
-                }
+            ClientFrame::RequestFile if !sent_file => {
                 write_frame(
                     &mut stream,
-                    &ServerFrame::ChunkData {
-                        index,
-                        size: count as u32,
-                        sha256: expected_hash.clone(),
+                    &ServerFrame::FileData {
+                        size: size as u64,
+                        sha256: file_id.clone(),
                     },
                 )
                 .await?;
-                stream
-                    .write_all(&bytes)
-                    .await
-                    .map_err(|error| error.to_string())?;
+                let mut remaining = size as u64;
+                let mut hasher = Sha256::new();
+                let mut buffer = vec![0u8; 256 * 1024];
+                while remaining > 0 {
+                    let wanted = remaining.min(buffer.len() as u64) as usize;
+                    let count = file
+                        .read(&mut buffer[..wanted])
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    if count == 0 {
+                        return Err("shared file became shorter while streaming".into());
+                    }
+                    hasher.update(&buffer[..count]);
+                    stream
+                        .write_all(&buffer[..count])
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    remaining -= count as u64;
+                }
                 stream.flush().await.map_err(|error| error.to_string())?;
+                if hex::encode(hasher.finalize()) != file_id {
+                    return Err("local shared file changed after indexing".into());
+                }
+                sent_file = true;
             }
+            ClientFrame::RequestFile => return Err("duplicate file request".into()),
             ClientFrame::TransferComplete => {
                 write_frame(&mut stream, &ServerFrame::TransferComplete).await?;
                 grants.write().await.remove(&key);
@@ -487,14 +474,22 @@ async fn download_offer(
     mut pause: watch::Receiver<bool>,
 ) -> Result<(), String> {
     let existing_progress = current_progress(db_path, &offer.request_id).unwrap_or(0.0);
-    update_download(
+    update_source_status(
         db_path,
         &offer.request_id,
-        existing_progress,
-        "Connecting another Tor seeder",
-        "Connecting…",
-        Some(&offer.onion),
+        source_pubkey,
+        "Racing Tor connection",
     )?;
+    if coordinator.primary_slot.available_permits() > 0 {
+        update_download(
+            db_path,
+            &offer.request_id,
+            existing_progress,
+            "Racing responsive Tor seeders",
+            "Connecting…",
+            Some(&offer.onion),
+        )?;
+    }
     let mut stream = tor
         .connect_onion_with_retry(&offer.onion, offer.port, &coordinator.cancel)
         .await?;
@@ -510,212 +505,167 @@ async fn download_offer(
     let welcome: ServerFrame = timeout(Duration::from_secs(60), read_frame(&mut stream))
         .await
         .map_err(|_| "peer manifest timed out".to_string())??;
-    let (filename, size, chunk_size, chunk_hashes) = match welcome {
+    let size = match welcome {
         ServerFrame::Welcome {
             version,
             file_id,
-            filename,
             size,
-            chunk_size,
-            chunk_hashes,
-        } if version == PROTOCOL_VERSION && file_id == offer.file_id => {
-            (filename, size, chunk_size, chunk_hashes)
-        }
+            ..
+        } if version == PROTOCOL_VERSION && file_id == offer.file_id => size,
         ServerFrame::Error { message, .. } => return Err(message),
         _ => return Err("peer returned an invalid manifest".into()),
     };
-    if chunk_hashes.is_empty() && size > 0 {
-        return Err("peer returned an empty chunk manifest".into());
-    }
-    if chunk_size as usize != crate::CHUNK_SIZE
-        || chunk_hashes.len() != ((size + chunk_size as u64 - 1) / chunk_size as u64) as usize
-    {
-        return Err("peer returned an incompatible chunk manifest".into());
-    }
-    let peer_manifest = PeerManifest {
-        filename: filename.clone(),
-        size,
-        chunk_size,
-        chunk_hashes: chunk_hashes.clone(),
-    };
-    {
-        let mut manifest = coordinator.manifest.lock().await;
-        match manifest.as_ref() {
-            Some(existing) if existing != &peer_manifest => {
-                return Err("seeder manifest did not match the other exact-file seeders".into())
-            }
-            None => *manifest = Some(peer_manifest),
-            _ => {}
-        }
+    let (filename, expected_size): (String, i64) = crate::open_connection(db_path)?
+        .query_row(
+            "SELECT filename,size FROM network_downloads WHERE request_id=?1 AND file_id=?2",
+            params![offer.request_id, offer.file_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|error| error.to_string())?;
+    if size != expected_size as u64 {
+        return Err("seeder file size did not match the signed catalogue".into());
     }
 
+    // Connections and manifests race in parallel, but only the first valid
+    // source is allowed to carry file bytes. Other connected sources wait here
+    // as cheap fallbacks and are promoted automatically if the primary fails.
+    update_source_status(db_path, &offer.request_id, source_pubkey, "Ready fallback")?;
+    let _primary = tokio::select! {
+        permit = coordinator.primary_slot.clone().acquire_owned() => {
+            permit.map_err(|_| "download source selector closed".to_string())?
+        }
+        _ = coordinator.cancel.cancelled() => return Err("cancelled".into()),
+    };
+    if coordinator.complete.load(Ordering::SeqCst) {
+        let _ = write_frame(&mut stream, &ClientFrame::Cancel).await;
+        return Ok(());
+    }
+    update_source_status(db_path, &offer.request_id, source_pubkey, "Primary")?;
+    let previous_progress = current_progress(db_path, &offer.request_id).unwrap_or(0.0);
+    let source_status = if previous_progress > 0.0 {
+        "Primary seeder failed · restarting with backup"
+    } else {
+        "Downloading from fastest responsive Tor seeder"
+    };
+    update_download(
+        db_path,
+        &offer.request_id,
+        0.0,
+        source_status,
+        "Starting…",
+        Some(&offer.onion),
+    )?;
+
     let connection = crate::open_connection(db_path)?;
-    let download_folder = PathBuf::from(super::get_setting(&connection, "download_folder")?);
-    fs::create_dir_all(&download_folder)
-        .await
-        .map_err(|error| error.to_string())?;
-    let parts = download_folder.join(".napstr-parts").join(&offer.file_id);
-    fs::create_dir_all(&parts)
+    let napstr_folder = PathBuf::from(super::get_setting(&connection, "shared_folder")?);
+    fs::create_dir_all(&napstr_folder)
         .await
         .map_err(|error| error.to_string())?;
     let destination = {
         let mut selected = coordinator.destination.lock().await;
         selected
-            .get_or_insert_with(|| super::unique_destination(&download_folder, &filename))
+            .get_or_insert_with(|| super::unique_destination(&napstr_folder, &filename))
             .clone()
     };
     drop(connection);
-
-    let started = std::time::Instant::now();
-    loop {
-        if coordinator.complete.load(Ordering::SeqCst) {
-            let _ = write_frame(&mut stream, &ClientFrame::Cancel).await;
-            return Ok(());
-        }
-        let complete = coordinator.verified.lock().await.len();
+    let partial = destination.with_extension(format!(
+        "{}part",
+        destination
+            .extension()
+            .and_then(|value| value.to_str())
+            .map(|value| format!("{value}."))
+            .unwrap_or_default()
+    ));
+    let final_result: Result<(), String> = async {
         while *pause.borrow() {
             update_download(
                 db_path,
                 &offer.request_id,
-                complete as f64 / chunk_hashes.len().max(1) as f64 * 100.0,
+                0.0,
                 "Paused",
                 "—",
                 Some(&offer.onion),
             )?;
             tokio::select! {
-                _ = coordinator.cancel.cancelled() => {
-                    let _ = write_frame(&mut stream, &ClientFrame::Cancel).await;
-                    return Err("cancelled".into());
-                }
+                _ = coordinator.cancel.cancelled() => return Err("cancelled".into()),
                 changed = pause.changed() => { if changed.is_err() { break; } }
             }
         }
-        if coordinator.cancel.is_cancelled() {
-            let _ = write_frame(&mut stream, &ClientFrame::Cancel).await;
-            return Err("cancelled".into());
-        }
-        if complete == chunk_hashes.len() {
-            break;
-        }
-
-        let claimed = {
-            let verified = coordinator.verified.lock().await;
-            let mut claims = coordinator.claims.lock().await;
-            (0..chunk_hashes.len()).find(|index| !verified.contains(index) && claims.insert(*index))
-        };
-        let Some(index) = claimed else {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            continue;
-        };
-        let expected = &chunk_hashes[index];
-        let part = parts.join(format!("{index:08}.chunk"));
-        let existing_valid = fs::read(&part)
+        write_frame(&mut stream, &ClientFrame::RequestFile).await?;
+        let header: ServerFrame = timeout(Duration::from_secs(60), read_frame(&mut stream))
             .await
-            .ok()
-            .map(|bytes| hex::encode(Sha256::digest(&bytes)) == *expected)
-            .unwrap_or(false);
-        let chunk_result: Result<(), String> = async {
-            if !existing_valid {
-                write_frame(&mut stream, &ClientFrame::RequestChunk { index: index as u32 }).await?;
-                let header: ServerFrame = timeout(Duration::from_secs(60), read_frame(&mut stream)).await.map_err(|_| "chunk header timed out".to_string())??;
-                let (received_index, received_size, received_hash) = match header {
-                    ServerFrame::ChunkData { index, size, sha256 } => (index, size, sha256),
-                    ServerFrame::Error { message, .. } => return Err(message),
-                    _ => return Err("peer returned an invalid chunk header".into()),
-                };
-                let expected_size = (size.saturating_sub(index as u64 * chunk_size as u64)).min(chunk_size as u64) as u32;
-                if received_index != index as u32 || received_hash != *expected || received_size != expected_size { return Err("chunk header did not match the signed manifest".into()); }
-                let mut bytes = vec![0u8; received_size as usize];
-                timeout(Duration::from_secs(120), stream.read_exact(&mut bytes)).await.map_err(|_| "chunk body timed out".to_string())?.map_err(|error| error.to_string())?;
-                if hex::encode(Sha256::digest(&bytes)) != *expected { return Err(format!("chunk {index} failed SHA-256 verification")); }
-                let temporary = parts.join(format!("{index:08}.{}.tmp", offer.request_id));
-                fs::write(&temporary, &bytes).await.map_err(|error| error.to_string())?;
-                fs::rename(temporary, &part).await.map_err(|error| error.to_string())?;
-            }
-            crate::open_connection(db_path)?.execute(
-                "INSERT OR REPLACE INTO download_chunks(request_id,chunk_index,sha256,path,source_pubkey,verified_at) VALUES (?1,?2,?3,?4,?5,?6)",
-                params![offer.request_id, index as i64, expected, part.to_string_lossy(), source_pubkey, Utc::now().to_rfc3339()],
-            ).map_err(|error| error.to_string())?;
-            coordinator.verified.lock().await.insert(index);
-            Ok(())
-        }.await;
-        coordinator.claims.lock().await.remove(&index);
-        chunk_result?;
-
-        let complete = coordinator.verified.lock().await.len();
-        let progress = complete as f64 / chunk_hashes.len().max(1) as f64 * 100.0;
-        let received = (complete as u64 * chunk_size as u64).min(size);
-        let speed = if started.elapsed() > Duration::from_millis(250) {
-            format_speed(received as f64 / started.elapsed().as_secs_f64())
-        } else {
-            "—".into()
-        };
-        update_download(
-            db_path,
-            &offer.request_id,
-            progress,
-            "Downloading verified chunks from multiple Tor seeders",
-            &speed,
-            Some(&offer.onion),
-        )?;
-    }
-
-    loop {
-        if coordinator
-            .finalizing
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
-        {
-            break;
+            .map_err(|_| "file stream header timed out".to_string())??;
+        match header {
+            ServerFrame::FileData {
+                size: offered_size,
+                sha256,
+            } if offered_size == size && sha256 == offer.file_id => {}
+            ServerFrame::Error { message, .. } => return Err(message),
+            _ => return Err("peer returned an invalid file stream header".into()),
         }
-        while !coordinator.complete.load(Ordering::SeqCst)
-            && coordinator.finalizing.load(Ordering::SeqCst)
-        {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        if coordinator.complete.load(Ordering::SeqCst) {
-            let _ = write_frame(&mut stream, &ClientFrame::Cancel).await;
-            return Ok(());
-        }
-    }
 
-    let final_result: Result<(), String> = async {
-        let partial = destination.with_extension(format!(
-            "{}part",
-            destination
-                .extension()
-                .and_then(|value| value.to_str())
-                .map(|value| format!("{value}."))
-                .unwrap_or_default()
-        ));
         let mut writer = BufWriter::new(
             File::create(&partial)
                 .await
                 .map_err(|error| error.to_string())?,
         );
         let mut full_hasher = Sha256::new();
-        for index in 0..chunk_hashes.len() {
-            let mut reader = BufReader::new(
-                File::open(parts.join(format!("{index:08}.chunk")))
-                    .await
-                    .map_err(|error| error.to_string())?,
-            );
-            let mut bytes = Vec::new();
-            reader
-                .read_to_end(&mut bytes)
+        let mut received = 0u64;
+        let mut buffer = vec![0u8; 256 * 1024];
+        let started = std::time::Instant::now();
+        let mut last_update = std::time::Instant::now();
+        while received < size {
+            while *pause.borrow() {
+                let progress = received as f64 / size.max(1) as f64 * 100.0;
+                update_download(
+                    db_path,
+                    &offer.request_id,
+                    progress,
+                    "Paused",
+                    "—",
+                    Some(&offer.onion),
+                )?;
+                tokio::select! {
+                    _ = coordinator.cancel.cancelled() => return Err("cancelled".into()),
+                    changed = pause.changed() => { if changed.is_err() { break; } }
+                }
+            }
+            if coordinator.cancel.is_cancelled() {
+                return Err("cancelled".into());
+            }
+            let wanted = (size - received).min(buffer.len() as u64) as usize;
+            let count = timeout(Duration::from_secs(45), stream.read(&mut buffer[..wanted]))
                 .await
+                .map_err(|_| "file stream stalled".to_string())?
                 .map_err(|error| error.to_string())?;
-            full_hasher.update(&bytes);
+            if count == 0 {
+                return Err("seeder closed the file stream early".into());
+            }
             writer
-                .write_all(&bytes)
+                .write_all(&buffer[..count])
                 .await
                 .map_err(|error| error.to_string())?;
+            full_hasher.update(&buffer[..count]);
+            received += count as u64;
+            if last_update.elapsed() >= Duration::from_millis(250) || received == size {
+                let progress = received as f64 / size.max(1) as f64 * 100.0;
+                let speed =
+                    format_speed(received as f64 / started.elapsed().as_secs_f64().max(0.001));
+                update_download(
+                    db_path,
+                    &offer.request_id,
+                    progress,
+                    "Downloading from fastest responsive Tor seeder",
+                    &speed,
+                    Some(&offer.onion),
+                )?;
+                last_update = std::time::Instant::now();
+            }
         }
         writer.flush().await.map_err(|error| error.to_string())?;
         drop(writer);
         if hex::encode(full_hasher.finalize()) != offer.file_id {
-            let _ = fs::remove_file(&partial).await;
-            return Err("final file SHA-256 verification failed".into());
+            return Err("downloaded file SHA-256 verification failed".into());
         }
         let blocked: bool = crate::open_connection(db_path)?
             .query_row(
@@ -728,18 +678,21 @@ async fn download_offer(
             let _ = fs::remove_file(&partial).await;
             return Err("download rejected because this file hash is blocked".into());
         }
-        if let Err(error) = crate::audio::validate_audio(&partial) {
-            let _ = fs::remove_file(&partial).await;
-            return Err(format!(
-                "download rejected by the audio-only policy: {error}"
-            ));
-        }
+        let audio = match crate::audio::validate_audio(&partial) {
+            Ok(audio) => audio,
+            Err(error) => {
+                let _ = fs::remove_file(&partial).await;
+                return Err(format!(
+                    "download rejected by the audio-only policy: {error}"
+                ));
+            }
+        };
         let mut final_destination = destination.clone();
         loop {
             match fs::hard_link(&partial, &final_destination).await {
                 Ok(()) => break,
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    final_destination = super::unique_destination(&download_folder, &filename);
+                    final_destination = super::unique_destination(&napstr_folder, &filename);
                 }
                 Err(error) => return Err(error.to_string()),
             }
@@ -748,6 +701,37 @@ async fn download_offer(
             .await
             .map_err(|error| error.to_string())?;
         *coordinator.destination.lock().await = Some(final_destination.clone());
+
+        {
+            let mut connection = crate::open_connection(db_path)?;
+            let transaction = connection
+                .transaction()
+                .map_err(|error| error.to_string())?;
+            crate::upsert_verified_file(
+                &transaction,
+                &napstr_folder,
+                &final_destination,
+                &offer.file_id,
+                size,
+                audio,
+            )?;
+            transaction
+                .execute(
+                    "DELETE FROM download_sources WHERE request_id=?1",
+                    [&offer.request_id],
+                )
+                .map_err(|error| error.to_string())?;
+            transaction
+                .execute(
+                    "DELETE FROM network_downloads WHERE request_id=?1",
+                    [&offer.request_id],
+                )
+                .map_err(|error| error.to_string())?;
+            transaction.commit().map_err(|error| error.to_string())?;
+        }
+        coordinator.complete.store(true, Ordering::SeqCst);
+        coordinator.cancel.cancel();
+
         if write_frame(&mut stream, &ClientFrame::TransferComplete)
             .await
             .is_ok()
@@ -758,34 +742,12 @@ async fn download_offer(
             )
             .await;
         }
-        let _ = fs::remove_dir_all(&parts).await;
-        update_download(
-            db_path,
-            &offer.request_id,
-            100.0,
-            "Verified · Complete",
-            "—",
-            Some(&offer.onion),
-        )?;
-        let connection = crate::open_connection(db_path)?;
-        connection
-            .execute(
-                "UPDATE network_downloads SET destination = ?1 WHERE request_id = ?2",
-                params![final_destination.to_string_lossy(), offer.request_id],
-            )
-            .map_err(|error| error.to_string())?;
-        connection
-            .execute(
-                "DELETE FROM download_chunks WHERE request_id = ?1",
-                [&offer.request_id],
-            )
-            .map_err(|error| error.to_string())?;
-        coordinator.complete.store(true, Ordering::SeqCst);
         Ok(())
     }
     .await;
     if final_result.is_err() {
-        coordinator.finalizing.store(false, Ordering::SeqCst);
+        let _ = write_frame(&mut stream, &ClientFrame::Cancel).await;
+        let _ = fs::remove_file(&partial).await;
     }
     final_result
 }
@@ -798,6 +760,21 @@ fn current_progress(db_path: &Path, request_id: &str) -> Result<f64, String> {
             |row| row.get(0),
         )
         .map_err(|error| error.to_string())
+}
+
+fn update_source_status(
+    db_path: &Path,
+    request_id: &str,
+    source_pubkey: &str,
+    status: &str,
+) -> Result<(), String> {
+    crate::open_connection(db_path)?
+        .execute(
+            "UPDATE download_sources SET status=?1,updated_at=?2 WHERE request_id=?3 AND source_pubkey=?4",
+            params![status, Utc::now().to_rfc3339(), request_id, source_pubkey],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 fn update_download(
@@ -851,12 +828,38 @@ mod tests {
         bytes.extend_from_slice(b"WAVEfmt \x10\0\0\0\x01\0\x01\0\x44\xac\0\0\x88\x58\x01\0\x02\0\x10\0data\x08\0\0\0audio123");
         let file_path = directory.join("payload.wav");
         std::fs::write(&file_path, &bytes).unwrap();
-        let (file_id, chunks, size) = crate::hash_file(&file_path).unwrap();
+        let (file_id, size) = crate::hash_file(&file_path).unwrap();
         Connection::open(&db_path).unwrap().execute(
-            "INSERT INTO files(file_id,filename,path,size,format,chunk_size,chunk_hashes,indexed_at,mime) VALUES(?1,'payload.wav',?2,?3,'WAV',?4,?5,?6,'audio/wav')",
-            params![file_id, file_path.to_string_lossy(), size as i64, crate::CHUNK_SIZE as i64, chunks.join(","), Utc::now().to_rfc3339()],
+            "INSERT INTO files(file_id,filename,path,size,format,indexed_at,mime) VALUES(?1,'payload.wav',?2,?3,'WAV',?4,'audio/wav')",
+            params![file_id, file_path.to_string_lossy(), size as i64, Utc::now().to_rfc3339()],
         ).unwrap();
         (directory, db_path, file_id, bytes)
+    }
+
+    #[tokio::test]
+    async fn standby_is_promoted_only_after_primary_releases() {
+        let coordinator = DownloadCoordinator::new(false);
+        let primary = coordinator
+            .primary_slot
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+        assert!(timeout(
+            Duration::from_millis(20),
+            coordinator.primary_slot.clone().acquire_owned()
+        )
+        .await
+        .is_err());
+        drop(primary);
+        let backup = timeout(
+            Duration::from_secs(1),
+            coordinator.primary_slot.clone().acquire_owned(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        drop(backup);
     }
 
     #[tokio::test]
@@ -903,11 +906,11 @@ mod tests {
             read_frame::<_, ServerFrame>(&mut stream).await.unwrap(),
             ServerFrame::Welcome { .. }
         ));
-        write_frame(&mut stream, &ClientFrame::RequestChunk { index: 0 })
+        write_frame(&mut stream, &ClientFrame::RequestFile)
             .await
             .unwrap();
         let size = match read_frame::<_, ServerFrame>(&mut stream).await.unwrap() {
-            ServerFrame::ChunkData { index: 0, size, .. } => size,
+            ServerFrame::FileData { size, .. } => size,
             other => panic!("unexpected response: {other:?}"),
         };
         let mut received = vec![0; size as usize];

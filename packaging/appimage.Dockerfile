@@ -21,6 +21,13 @@ RUN apt-get update \
     curl \
     file \
     git \
+    gstreamer1.0-alsa \
+    gstreamer1.0-libav \
+    gstreamer1.0-plugins-base \
+    gstreamer1.0-plugins-good \
+    gstreamer1.0-pulseaudio \
+    gstreamer1.0-tools \
+    libasound2-dev \
     libayatana-appindicator3-dev \
     libgirepository1.0-dev \
     librsvg2-dev \

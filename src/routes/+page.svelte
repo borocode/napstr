@@ -5,6 +5,7 @@
   import { open } from '@tauri-apps/plugin-dialog';
 
   type View = 'Search' | 'Downloads' | 'Shared' | 'Profile' | 'Settings';
+  type PlayerMode = 'single' | 'folder' | 'all';
   type WindowResizeDirection = 'East' | 'North' | 'NorthEast' | 'NorthWest' | 'South' | 'SouthEast' | 'SouthWest' | 'West';
   type Result = {
     id: number;
@@ -25,11 +26,13 @@
   type SourceDetail = { pubkey: string; npub: string; displayName: string; relay: string; about: string; picture: string; eventId: string };
   type Transfer = {
     id: number;
+    fileId: string;
     name: string;
     size: string;
     speed: string;
     progress: number;
     status: string;
+    destination: string;
   };
 
   const views: { label: View; icon: string }[] = [
@@ -47,12 +50,17 @@
     { id: 4, name: 'Commons Choir — Homeward', format: 'OPUS', size: '6.1 MB', sources: 2, speed: 'Tor', length: '4:31', fileId: '72A0 ECF1 354C 82B7…', remote: true }
   ];
 
-  type NativeFile = { fileId: string; filename: string; path: string; size: number; format: string; chunkCount: number; status: string; title: string; artist: string; album: string; mime: string; license: string; description: string; tags: string };
+  type NativeFile = { fileId: string; filename: string; path: string; folder: string; size: number; format: string; status: string; title: string; artist: string; album: string; mime: string; license: string; description: string; tags: string };
   type NativeTransfer = { id: number; fileId: string; filename: string; size: number; progress: number; status: string; speed: string; destination: string };
-  type NativeSettings = { sharedFolder: string; downloadFolder: string; nostrRelays: string; displayName: string; profileAbout: string; profilePicture: string };
+  type NativeSettings = { napstrFolder: string; nostrRelays: string; displayName: string; profileAbout: string; profilePicture: string };
   type Snapshot = { files: NativeFile[]; transfers: NativeTransfer[]; settings: NativeSettings; indexedBytes: number; native: boolean };
-  type NetworkStatus = { connected: boolean; npub: string; pubkey: string; relayCount: number; torRunning: boolean; error: string };
+  type NetworkStatus = { connected: boolean; npub: string; pubkey: string; relayCount: number; torRunning: boolean; torStarting: boolean; torProgress: number; torError: string; error: string };
   type NetworkResult = { fileId: string; filename: string; title: string; artist: string; album: string; format: string; mime: string; size: number; license: string; description: string; tags: string; sources: SourceDetail[] };
+  type PlayerTrack = { fileId: string; name: string; folder: string; artist: string; mime: string };
+  type PlaybackStatus = { fileId: string; currentTime: number; duration: number; playing: boolean; ended: boolean };
+  type BlockConfirmation =
+    | { kind: 'file'; fileId: string; label: string }
+    | { kind: 'user'; pubkey: string; label: string };
 
   let activeView: View = 'Search';
   let results: Result[] = demoResults;
@@ -61,16 +69,19 @@
   let minimumSources = 1;
   let maximumSize = '';
   let searchedQuery = 'All audio';
+  let resultsAreNetwork = false;
   let selected: Result | null = results[0];
   let advanced = false;
   let paused = false;
   let aboutOpen = false;
   let sourceProfile: SourceDetail | null = null;
+  let blockConfirmation: BlockConfirmation | null = null;
+  let blockInProgress = false;
+  let startingDownloads = new Set<string>();
   let clock = '';
   let nativeReady = false;
   let activityMessage = 'Browser preview — open in the desktop app to use local files';
-  let sharedFolder = '';
-  let downloadFolder = '';
+  let napstrFolder = '';
   let nostrRelays = 'wss://relay.damus.io, wss://nos.lol, wss://relay.nostr.com, wss://relay.primal.net, wss://relay.snort.social, wss://nostr.mom';
   let displayName = 'napstr-user';
   let profileAbout = 'Sharing files privately with Napstr.';
@@ -78,20 +89,34 @@
   let indexedBytes = 0;
   let networkConnected = false;
   let torRunning = false;
+  let torStarting = false;
+  let torProgress = 0;
+  let torError = '';
   let identityNpub = '';
   let networkError = '';
   let selectedSource = 0;
   let selectedShared: NativeFile | null = null;
+  let libraryFolderView = '*';
+  let playerMode: PlayerMode = 'single';
+  let playerQueue: PlayerTrack[] = [];
+  let playerQueueIndex = -1;
+  let currentTrack: PlayerTrack | null = null;
+  let playerPlaying = false;
+  let playerLoading = false;
+  let playerCurrentTime = 0;
+  let playerDuration = 0;
+  let playerVolume = 0.85;
+  let playerEnded = false;
   let transferPaneHeight = 119;
   let stopTransferResize = () => {};
   let transfers: Transfer[] = [
-    { id: 1, name: 'Copyleft Sessions — First Light.flac', size: '31 MB', speed: '1.8 MB/s', progress: 74, status: 'Downloading verified audio' },
-    { id: 2, name: 'Open Tape Archive — Night Train.ogg', size: '8.4 MB', speed: '620 KB/s', progress: 42, status: 'Downloading verified audio' }
+    { id: 1, fileId: '', name: 'Copyleft Sessions — First Light.flac', size: '31 MB', speed: '1.8 MB/s', progress: 74, status: 'Downloading verified audio', destination: '' },
+    { id: 2, fileId: '', name: 'Open Tape Archive — Night Train.ogg', size: '8.4 MB', speed: '620 KB/s', progress: 42, status: 'Downloading verified audio', destination: '' }
   ];
 
   let sharedFiles: Array<NativeFile & { name: string; readableSize: string; peers: number }> = [
-    { fileId: '', filename: 'My Copyleft Track.flac', name: 'My Copyleft Track.flac', path: '', size: 31 * 1024 ** 2, readableSize: '31 MB', format: 'FLAC', chunkCount: 0, status: 'Demo', peers: 0, title: '', artist: '', album: '', mime: 'audio/flac', license: 'copyleft', description: '', tags: '' },
-    { fileId: '', filename: 'Commons Recording.ogg', name: 'Commons Recording.ogg', path: '', size: 8.4 * 1024 ** 2, readableSize: '8.4 MB', format: 'OGG', chunkCount: 0, status: 'Demo', peers: 0, title: '', artist: '', album: '', mime: 'audio/ogg', license: 'copyleft', description: '', tags: '' }
+    { fileId: '', filename: 'My Copyleft Track.flac', name: 'My Copyleft Track.flac', path: '', folder: 'Albums/Example', size: 31 * 1024 ** 2, readableSize: '31 MB', format: 'FLAC', status: 'Demo', peers: 0, title: '', artist: '', album: '', mime: 'audio/flac', license: 'copyleft', description: '', tags: '' },
+    { fileId: '', filename: 'Commons Recording.ogg', name: 'Commons Recording.ogg', path: '', folder: '', size: 8.4 * 1024 ** 2, readableSize: '8.4 MB', format: 'OGG', status: 'Demo', peers: 0, title: '', artist: '', album: '', mime: 'audio/ogg', license: 'copyleft', description: '', tags: '' }
   ];
 
   const readableSize = (bytes: number) => {
@@ -136,11 +161,198 @@
     return transfer.progress < 100 && !/^(Failed|Cancelled|Refused|All seeders refused)/.test(transfer.status);
   }
 
+  function isCompleteTransfer(transfer: Transfer) {
+    return transfer.progress >= 100 && transfer.status === 'Verified · Complete' && Boolean(transfer.destination);
+  }
+
+  function isFinishedTransfer(transfer: Transfer) {
+    return isCompleteTransfer(transfer) || /^(Failed|Cancelled|Refused|All seeders refused)/.test(transfer.status);
+  }
+
+  function mapTransfers(items: NativeTransfer[]): Transfer[] {
+    return items.map((transfer) => ({
+      id: transfer.id,
+      fileId: transfer.fileId,
+      name: transfer.filename,
+      size: readableSize(transfer.size),
+      speed: transfer.speed,
+      progress: transfer.progress,
+      status: transfer.status,
+      destination: transfer.destination
+    }));
+  }
+
+  function isLocalFile(fileId: string) {
+    return sharedFiles.some((file) => file.fileId === fileId);
+  }
+
+  function folderName(folder: string) {
+    return folder || '(Napstr folder)';
+  }
+
+  function libraryFolders() {
+    return [...new Set(sharedFiles.map((file) => file.folder))]
+      .sort((left, right) => folderName(left).localeCompare(folderName(right)));
+  }
+
+  function visibleSharedFiles() {
+    return libraryFolderView === '*'
+      ? sharedFiles
+      : sharedFiles.filter((file) => file.folder === libraryFolderView);
+  }
+
+  function toPlayerTrack(file: NativeFile): PlayerTrack {
+    return {
+      fileId: file.fileId,
+      name: file.title || file.filename,
+      folder: file.folder,
+      artist: file.artist,
+      mime: file.mime
+    };
+  }
+
+  function sortedLibraryTracks() {
+    return sharedFiles
+      .map(toPlayerTrack)
+      .sort((left, right) => left.folder.localeCompare(right.folder) || left.name.localeCompare(right.name));
+  }
+
+  function queueForTrack(track: PlayerTrack, mode: PlayerMode) {
+    const library = sortedLibraryTracks();
+    if (!library.some((item) => item.fileId === track.fileId)) return [track];
+    if (mode === 'all') return library;
+    if (mode === 'folder') return library.filter((item) => item.folder === track.folder);
+    return [track];
+  }
+
+  function formatPlayerTime(seconds: number) {
+    if (!Number.isFinite(seconds) || seconds < 0) return '0:00';
+    const whole = Math.floor(seconds);
+    return `${Math.floor(whole / 60)}:${String(whole % 60).padStart(2, '0')}`;
+  }
+
+  async function loadPlayerTrack(index: number) {
+    const track = playerQueue[index];
+    if (!track || playerLoading) return;
+    playerLoading = true;
+    playerQueueIndex = index;
+    currentTrack = track;
+    playerCurrentTime = 0;
+    playerDuration = 0;
+    playerEnded = false;
+    try {
+      applyPlaybackStatus(await invoke<PlaybackStatus>('play_audio', { fileId: track.fileId, volume: playerVolume }));
+      activityMessage = `Playing ${track.name}${track.folder ? ` · ${track.folder}` : ''}`;
+    } catch (error) {
+      playerPlaying = false;
+      activityMessage = `Playback failed: ${String(error)}`;
+    } finally {
+      playerLoading = false;
+    }
+  }
+
+  async function playAudio(fileId: string, name: string, mode: PlayerMode = playerMode) {
+    if (!nativeReady || !fileId) return;
+    const indexed = sharedFiles.find((file) => file.fileId === fileId);
+    const track = indexed
+      ? toPlayerTrack(indexed)
+      : { fileId, name, folder: '', artist: '', mime: '' };
+    playerMode = indexed ? mode : 'single';
+    playerQueue = queueForTrack(track, playerMode);
+    const index = Math.max(0, playerQueue.findIndex((item) => item.fileId === fileId));
+    await loadPlayerTrack(index);
+  }
+
+  async function togglePlayer() {
+    if (!currentTrack) {
+      if (selectedShared) await playAudio(selectedShared.fileId, selectedShared.filename);
+      else if (selected && isLocalFile(selected.fileId)) await playAudio(selected.fileId, selected.name);
+      else activityMessage = 'Select a local song to play';
+      return;
+    }
+    if (playerEnded) {
+      await loadPlayerTrack(playerQueueIndex);
+      return;
+    }
+    try { applyPlaybackStatus(await invoke<PlaybackStatus>('toggle_audio')); }
+    catch (error) { activityMessage = `Playback failed: ${String(error)}`; }
+  }
+
+  async function stopPlayer() {
+    try { applyPlaybackStatus(await invoke<PlaybackStatus>('stop_audio')); }
+    catch (error) { activityMessage = `Could not stop playback: ${String(error)}`; return; }
+    playerEnded = false;
+    if (currentTrack) activityMessage = `Stopped ${currentTrack.name}`;
+  }
+
+  async function nextPlayerTrack() {
+    if (playerQueueIndex + 1 < playerQueue.length) await loadPlayerTrack(playerQueueIndex + 1);
+    else stopPlayer();
+  }
+
+  async function previousPlayerTrack() {
+    if (playerCurrentTime > 3 || playerQueueIndex <= 0) {
+      try { applyPlaybackStatus(await invoke<PlaybackStatus>('seek_audio', { seconds: 0 })); }
+      catch (error) { activityMessage = `Could not rewind playback: ${String(error)}`; }
+      return;
+    }
+    await loadPlayerTrack(playerQueueIndex - 1);
+  }
+
+  async function playerTrackEnded() {
+    playerPlaying = false;
+    playerEnded = true;
+    if (playerMode !== 'single' && playerQueueIndex + 1 < playerQueue.length) {
+      await loadPlayerTrack(playerQueueIndex + 1);
+    }
+  }
+
+  function changePlayerMode() {
+    window.localStorage.setItem('napstr-player-mode', playerMode);
+    if (!currentTrack) return;
+    playerQueue = queueForTrack(currentTrack, playerMode);
+    playerQueueIndex = Math.max(0, playerQueue.findIndex((item) => item.fileId === currentTrack?.fileId));
+  }
+
+  async function seekPlayer(event: Event) {
+    try {
+      applyPlaybackStatus(await invoke<PlaybackStatus>('seek_audio', { seconds: Number((event.currentTarget as HTMLInputElement).value) }));
+      playerEnded = false;
+    } catch (error) { activityMessage = `Could not seek in this track: ${String(error)}`; }
+  }
+
+  function changePlayerVolume(event: Event) {
+    playerVolume = Number((event.currentTarget as HTMLInputElement).value);
+    if (currentTrack) invoke<PlaybackStatus>('set_audio_volume', { volume: playerVolume }).catch(() => {});
+    window.localStorage.setItem('napstr-player-volume', String(playerVolume));
+  }
+
+  function applyPlaybackStatus(status: PlaybackStatus) {
+    if (!currentTrack || status.fileId !== currentTrack.fileId) return;
+    playerCurrentTime = status.currentTime;
+    playerDuration = status.duration;
+    playerPlaying = status.playing;
+  }
+
+  function syncResultLocality() {
+    const selectedFileId = selected?.fileId;
+    if (resultsAreNetwork) {
+      results = results.map((result) => {
+        const local = isLocalFile(result.fileId);
+        return { ...result, remote: !local, speed: local ? 'Local' : 'Tor' };
+      });
+    } else if (!query.trim() || searchedQuery === 'local catalogue' || searchedQuery === 'All audio') {
+      results = mapFiles(sharedFiles);
+    } else {
+      results = results.filter((result) => isLocalFile(result.fileId));
+    }
+    selected = (selectedFileId ? results.find((result) => result.fileId === selectedFileId) : null) ?? results[0] ?? null;
+  }
+
   function applySnapshot(snapshot: Snapshot) {
     nativeReady = snapshot.native;
     indexedBytes = snapshot.indexedBytes;
-    sharedFolder = snapshot.settings.sharedFolder;
-    downloadFolder = snapshot.settings.downloadFolder;
+    napstrFolder = snapshot.settings.napstrFolder;
     nostrRelays = snapshot.settings.nostrRelays;
     displayName = snapshot.settings.displayName;
     profileAbout = snapshot.settings.profileAbout;
@@ -148,14 +360,41 @@
     sharedFiles = snapshot.files.map((file) => ({ ...file, name: file.filename, readableSize: readableSize(file.size), peers: 0 }));
     if (selectedShared) selectedShared = snapshot.files.find((file) => file.fileId === selectedShared?.fileId) ?? null;
     results = mapFiles(snapshot.files);
+    resultsAreNetwork = false;
     selected = results[0] ?? null;
     searchedQuery = 'local catalogue';
-    transfers = snapshot.transfers.map((transfer) => ({ id: transfer.id, name: transfer.filename, size: readableSize(transfer.size), speed: transfer.speed, progress: transfer.progress, status: transfer.status }));
-    activityMessage = snapshot.files.length ? `${snapshot.files.length} local file(s) indexed and ready` : 'Choose a shared folder to begin';
+    transfers = mapTransfers(snapshot.transfers);
+    activityMessage = snapshot.files.length ? `${snapshot.files.length} local file(s) indexed and ready` : 'Choose a Napstr folder to begin';
   }
 
   async function refreshSnapshot() {
     try { applySnapshot(await invoke<Snapshot>('get_snapshot')); } catch { nativeReady = false; }
+  }
+
+  async function refreshLocalLibrary() {
+    try {
+      const snapshot = await invoke<Snapshot>('get_snapshot');
+      indexedBytes = snapshot.indexedBytes;
+      const nextFiles = snapshot.files.map((file) => ({ ...file, name: file.filename, readableSize: readableSize(file.size), peers: 0 }));
+      const removedCurrentTrack = currentTrack && !nextFiles.some((file) => file.fileId === currentTrack?.fileId);
+      sharedFiles = nextFiles;
+      if (selectedShared) selectedShared = nextFiles.find((file) => file.fileId === selectedShared?.fileId) ?? null;
+      if (removedCurrentTrack) {
+        invoke<PlaybackStatus>('stop_audio').catch(() => {});
+        currentTrack = null;
+        playerQueue = [];
+        playerQueueIndex = -1;
+        playerPlaying = false;
+        playerLoading = false;
+        playerCurrentTime = 0;
+        playerDuration = 0;
+        activityMessage = 'Stopped playback because the file was removed from the Napstr folder';
+      } else if (currentTrack) {
+        playerQueue = queueForTrack(currentTrack, playerMode);
+        playerQueueIndex = playerQueue.findIndex((item) => item.fileId === currentTrack?.fileId);
+      }
+      syncResultLocality();
+    } catch { /* the next folder-watch or transfer poll will retry */ }
   }
 
   async function connectNetwork() {
@@ -163,17 +402,32 @@
     activityMessage = 'Connecting to Nostr relays and opening encrypted inbox…';
     try {
       const status = await invoke<NetworkStatus>('start_network');
-      networkConnected = status.connected;
-      torRunning = status.torRunning;
-      identityNpub = status.npub;
-      networkError = status.error;
+      applyNetworkStatus(status);
       activityMessage = `Nostr connected · loading the most available audio from ${status.relayCount} relay(s)…`;
       await search();
+      if (status.torError) activityMessage = `Tor failed: ${status.torError} · click the connection panel to retry`;
     } catch (error) {
       networkConnected = false;
       networkError = String(error);
       activityMessage = `Network unavailable: ${String(error)}`;
     }
+  }
+
+  function applyNetworkStatus(status: NetworkStatus) {
+    networkConnected = status.connected;
+    torRunning = status.torRunning;
+    torStarting = status.torStarting;
+    torProgress = status.torProgress;
+    torError = status.torError;
+    identityNpub = status.npub;
+    networkError = status.error;
+  }
+
+  function torStatusLabel() {
+    if (torRunning) return 'Tor connected';
+    if (torError) return 'Tor failed';
+    if (torStarting && torProgress > 0) return `Tor connecting ${torProgress}%`;
+    return nativeReady ? 'Tor connecting' : 'Tor unavailable';
   }
 
   async function search() {
@@ -185,12 +439,14 @@
           .filter((item) => item.sources.length >= minimumSources && item.size <= maximumBytes() && matchesType(item.mime, item.format))
           .sort((left, right) => right.sources.length - left.sources.length || left.filename.localeCompare(right.filename));
         results = mapNetworkFiles(ranked);
+        resultsAreNetwork = true;
         activityMessage = `${results.length} globally aggregated file ID(s), ranked by active seeders`;
       } catch (error) { activityMessage = `Global search failed: ${String(error)}`; }
     } else if (nativeReady) {
       try {
         const matches = await invoke<NativeFile[]>('search_catalog', { query: query.trim() });
         results = mapFiles(matches.filter((item) => minimumSources <= 1 && item.size <= maximumBytes() && matchesType(item.mime, item.format)));
+        resultsAreNetwork = false;
         activityMessage = `${results.length} local match(es) found`;
       } catch (error) { activityMessage = `Search failed: ${String(error)}`; }
     }
@@ -199,80 +455,104 @@
   }
 
   async function startDownload() {
-    if (!selected) return;
-    if (nativeReady && !selected.remote) {
-      activityMessage = `${selected.name} is already on this computer · use Play`;
+    const target = selected;
+    if (!target) return;
+    if (nativeReady && isLocalFile(target.fileId)) {
+      await playAudio(target.fileId, target.name);
       return;
     }
-    if (transfers.some((item) => item.name.startsWith(selected!.name))) return;
+    const activeTransfer = transfers.find((item) => item.fileId === target.fileId && isActiveTransfer(item));
+    if (activeTransfer || startingDownloads.has(target.fileId)) {
+      activityMessage = `${target.name} is already downloading`;
+      return;
+    }
     if (nativeReady) {
-      const sources = selected.sourceDetails ?? [];
+      const sources = target.sourceDetails ?? [];
       if (!sources.length) { activityMessage = 'No seeder is available for this file'; return; }
-      activityMessage = `Sending encrypted NIP-17 requests to ${sources.length} seeder(s)…`;
+      startingDownloads = new Set(startingDownloads).add(target.fileId);
+      transfers = [{
+        id: Date.now(), fileId: target.fileId, name: target.name, size: target.size,
+        speed: 'Contacting seeders…', progress: 0, status: 'Sending encrypted NIP-17 request', destination: ''
+      }, ...transfers];
+      const candidateCount = Math.min(sources.length, 3);
+      activityMessage = `Racing ${candidateCount} seeder${candidateCount === 1 ? '' : 's'} for the fastest Tor connection…`;
       try {
-        await invoke('request_network_download', { fileId: selected.fileId, sourcePubkeys: sources.map((source) => source.pubkey) });
-        await refreshSnapshot();
-        activeView = 'Downloads';
-        activityMessage = 'Encrypted requests sent · waiting for temporary onion services';
-      } catch (error) { activityMessage = `Request failed: ${String(error)}`; }
+        await invoke('request_network_download', { fileId: target.fileId, sourcePubkeys: sources.map((source) => source.pubkey) });
+        transfers = mapTransfers(await invoke<NativeTransfer[]>('get_transfers'));
+        activityMessage = 'Seeder race started · the fastest responsive source will stream the file';
+      } catch (error) {
+        try { transfers = mapTransfers(await invoke<NativeTransfer[]>('get_transfers')); }
+        catch { transfers = transfers.filter((item) => item.fileId !== target.fileId); }
+        activityMessage = `Request failed: ${String(error)}`;
+      } finally {
+        const nextStarting = new Set(startingDownloads);
+        nextStarting.delete(target.fileId);
+        startingDownloads = nextStarting;
+      }
       return;
     }
     transfers = [
       ...transfers,
-      { id: Date.now(), name: `${selected.name}.${selected.format.toLowerCase()}`, size: selected.size, speed: 'Negotiating…', progress: 2, status: 'Requesting private Tor session' }
+      { id: Date.now(), fileId: target.fileId, name: `${target.name}.${target.format.toLowerCase()}`, size: target.size, speed: 'Negotiating…', progress: 2, status: 'Requesting private Tor session', destination: '' }
     ];
-    activeView = 'Downloads';
   }
 
   async function playSelectedAudio() {
-    if (!nativeReady || !selected || selected.remote) return;
-    try {
-      await invoke('play_shared_audio', { fileId: selected.fileId });
-      activityMessage = `Opened ${selected.name} in the system audio player`;
-    } catch (error) { activityMessage = `Playback failed: ${String(error)}`; }
+    if (!selected || !isLocalFile(selected.fileId)) return;
+    await playAudio(selected.fileId, selected.name);
+  }
+
+  async function playSelectedSharedAudio() {
+    if (!selectedShared) return;
+    await playAudio(selectedShared.fileId, selectedShared.filename);
+  }
+
+  async function playSelectedFolder() {
+    if (!selectedShared) return;
+    await playAudio(selectedShared.fileId, selectedShared.filename, 'folder');
+  }
+
+  async function playAllSongs() {
+    const first = selectedShared ?? visibleSharedFiles()[0] ?? sharedFiles[0];
+    if (!first) return;
+    await playAudio(first.fileId, first.filename, 'all');
   }
 
   async function activateSelected() {
-    if (nativeReady && selected && !selected.remote) await playSelectedAudio();
+    if (nativeReady && selected && isLocalFile(selected.fileId)) await playSelectedAudio();
     else await startDownload();
   }
 
-  async function playTransferAudio(id: number) {
-    if (!nativeReady) return;
-    try {
-      await invoke('play_transfer_audio', { id });
-      activityMessage = 'Opened verified audio in the system player';
-    } catch (error) { activityMessage = `Playback failed: ${String(error)}`; }
+  function blockSelectedFile() {
+    if (!nativeReady || !selected?.remote) return;
+    blockConfirmation = { kind: 'file', fileId: selected.fileId, label: selected.name };
   }
 
-  async function blockSelectedFile() {
-    if (!nativeReady || !selected?.remote || !window.confirm('Block this SHA-256 file ID? Every seeder offering the exact same bytes will be hidden.')) return;
-    try {
-      await invoke('block_file', { fileId: selected.fileId });
-      activityMessage = 'File hash blocked locally';
-      await search();
-    } catch (error) { activityMessage = `Could not block file: ${String(error)}`; }
-  }
-
-  async function blockSelectedUser() {
+  function blockSelectedUser() {
     const source = selected?.sourceDetails?.[selectedSource];
-    if (!nativeReady || !source || !window.confirm(`Block ${source.displayName}? Their catalogue entries and requests will be ignored.`)) return;
-    try {
-      await invoke('block_user', { pubkey: source.pubkey });
-      activityMessage = 'Nostr publisher blocked locally';
-      await search();
-    } catch (error) { activityMessage = `Could not block publisher: ${String(error)}`; }
+    if (!nativeReady || !source) return;
+    blockConfirmation = { kind: 'user', pubkey: source.pubkey, label: source.displayName };
   }
 
-  async function reportSelectedFile() {
-    const source = selected?.sourceDetails?.[selectedSource];
-    if (!nativeReady || !selected?.remote || !source) return;
-    const reason = window.prompt('Reason for the public, signed NIP-56 report:');
-    if (!reason?.trim()) return;
+  async function confirmBlock() {
+    if (!blockConfirmation || blockInProgress) return;
+    const target = blockConfirmation;
+    blockInProgress = true;
     try {
-      await invoke('report_catalogue', { fileId: selected.fileId, sourcePubkey: source.pubkey, eventId: source.eventId, reportType: 'illegal', reason: reason.trim() });
-      activityMessage = 'Signed NIP-56 report published';
-    } catch (error) { activityMessage = `Report failed: ${String(error)}`; }
+      if (target.kind === 'file') {
+        await invoke('block_file', { fileId: target.fileId });
+        activityMessage = 'File hash blocked locally';
+      } else {
+        await invoke('block_user', { pubkey: target.pubkey });
+        activityMessage = 'Nostr publisher blocked locally';
+      }
+      blockConfirmation = null;
+      await search();
+    } catch (error) {
+      activityMessage = `Could not block ${target.kind}: ${String(error)}`;
+    } finally {
+      blockInProgress = false;
+    }
   }
 
   async function removeTransfer(id: number) {
@@ -280,6 +560,25 @@
       try { await invoke('cancel_transfer', { id }); await invoke('remove_transfer', { id }); } catch (error) { activityMessage = `Could not remove transfer: ${String(error)}`; }
     }
     transfers = transfers.filter((transfer) => transfer.id !== id);
+    if (nativeReady) await refreshLocalLibrary();
+  }
+
+  async function clearFinishedTransfers() {
+    const finished = transfers.filter(isFinishedTransfer);
+    if (!finished.length) return;
+    const removed = new Set<number>();
+    for (const transfer of finished) {
+      try {
+        if (nativeReady) await invoke('remove_transfer', { id: transfer.id });
+        removed.add(transfer.id);
+      } catch (error) {
+        activityMessage = `Could not clear every finished transfer: ${String(error)}`;
+        break;
+      }
+    }
+    transfers = transfers.filter((transfer) => !removed.has(transfer.id));
+    if (removed.size === finished.length) activityMessage = `Cleared ${removed.size} finished transfer${removed.size === 1 ? '' : 's'}`;
+    if (nativeReady) await refreshLocalLibrary();
   }
 
   async function togglePause() {
@@ -290,40 +589,30 @@
     }
   }
 
-  async function chooseSharedFolder() {
+  async function chooseNapstrFolder() {
     if (!nativeReady) { activityMessage = 'Folder selection is available in the packaged desktop app'; return; }
     try {
-      const selectedPath = await open({ directory: true, multiple: false, title: 'Choose the folder Napstr may share', defaultPath: sharedFolder || undefined });
+      const selectedPath = await open({ directory: true, multiple: false, title: 'Choose the folder Napstr uses for downloads and sharing', defaultPath: napstrFolder || undefined });
       if (!selectedPath || Array.isArray(selectedPath)) return;
       activityMessage = 'Indexing files and calculating SHA-256 hashes…';
-      const report = await invoke<{ fileCount: number; totalBytes: number; errors: string[] }>('set_shared_folder', { path: selectedPath });
+      const report = await invoke<{ fileCount: number; totalBytes: number; errors: string[] }>('set_napstr_folder', { path: selectedPath });
       await refreshSnapshot();
       if (networkConnected) await invoke('publish_catalogue');
       activityMessage = `Indexed ${report.fileCount} file(s), ${readableSize(report.totalBytes)}${report.errors.length ? ` · ${report.errors.length} skipped` : ''}`;
     } catch (error) { activityMessage = `Folder selection failed: ${String(error)}`; }
   }
 
-  async function chooseDownloadFolder() {
-    if (!nativeReady) { activityMessage = 'Folder selection is available in the packaged desktop app'; return; }
-    try {
-      const selectedPath = await open({ directory: true, multiple: false, title: 'Choose where Napstr saves downloads', defaultPath: downloadFolder || undefined });
-      if (!selectedPath || Array.isArray(selectedPath)) return;
-      downloadFolder = selectedPath;
-      await persistSettings();
-    } catch (error) { activityMessage = `Folder selection failed: ${String(error)}`; }
-  }
-
-  async function openDownloadsFolder() {
+  async function openNapstrFolder() {
     if (!nativeReady) return;
-    try { await invoke('open_downloads_folder'); }
-    catch (error) { activityMessage = `Could not open downloads folder: ${String(error)}`; }
+    try { await invoke('open_napstr_folder'); }
+    catch (error) { activityMessage = `Could not open Napstr folder: ${String(error)}`; }
   }
 
   async function rescanSharedFolder() {
     if (!nativeReady) return;
-    activityMessage = 'Rescanning shared folder…';
+    activityMessage = 'Rescanning Napstr folder…';
     try {
-      const report = await invoke<{ fileCount: number; totalBytes: number }>('rescan_shared_folder');
+      const report = await invoke<{ fileCount: number; totalBytes: number }>('rescan_napstr_folder');
       await refreshSnapshot();
       if (networkConnected) await invoke('publish_catalogue');
       activityMessage = `Indexed ${report.fileCount} file(s), ${readableSize(report.totalBytes)}`;
@@ -333,20 +622,10 @@
   async function persistSettings() {
     if (!nativeReady) return;
     try {
-      applySnapshot(await invoke<Snapshot>('save_settings', { settings: { sharedFolder, downloadFolder, nostrRelays, displayName, profileAbout, profilePicture } }));
+      applySnapshot(await invoke<Snapshot>('save_settings', { settings: { napstrFolder, nostrRelays, displayName, profileAbout, profilePicture } }));
       if (networkConnected) await invoke('publish_profile');
       activityMessage = networkConnected ? 'Settings saved and profile published' : 'Settings saved';
     } catch (error) { activityMessage = `Could not save settings: ${String(error)}`; }
-  }
-
-  async function saveFileMetadata() {
-    if (!nativeReady || !selectedShared) return;
-    try {
-      selectedShared = await invoke<NativeFile>('update_file_metadata', { metadata: selectedShared });
-      await refreshSnapshot();
-      if (networkConnected) await invoke('publish_catalogue');
-      activityMessage = 'Metadata saved and catalogue republished';
-    } catch (error) { activityMessage = `Metadata update failed: ${String(error)}`; }
   }
 
   const windowCommand = async (command: 'minimise_window' | 'toggle_maximise' | 'close_window') => {
@@ -361,7 +640,7 @@
   }
 
   function transferPaneMaximum() {
-    return typeof window === 'undefined' ? 300 : Math.max(80, window.innerHeight - 340);
+    return typeof window === 'undefined' ? 300 : Math.max(80, window.innerHeight - 395);
   }
 
   function setTransferPaneHeight(height: number, remember = false) {
@@ -401,6 +680,10 @@
   }
 
   onMount(() => {
+    const savedPlayerMode = window.localStorage.getItem('napstr-player-mode');
+    if (savedPlayerMode === 'single' || savedPlayerMode === 'folder' || savedPlayerMode === 'all') playerMode = savedPlayerMode;
+    const savedPlayerVolume = Number(window.localStorage.getItem('napstr-player-volume'));
+    if (Number.isFinite(savedPlayerVolume) && savedPlayerVolume >= 0 && savedPlayerVolume <= 1) playerVolume = savedPlayerVolume;
     const savedTransferHeight = Number(window.localStorage.getItem('napstr-transfer-pane-height'));
     setTransferPaneHeight(Number.isFinite(savedTransferHeight) && savedTransferHeight > 0 ? savedTransferHeight : window.innerHeight < 700 ? 94 : 119);
     const clampTransferPane = () => setTransferPaneHeight(transferPaneHeight);
@@ -414,13 +697,27 @@
     const networkTimer = window.setInterval(() => {
       if (!nativeReady) return;
       invoke<NetworkStatus>('network_status').then((status) => {
-        networkConnected = status.connected; torRunning = status.torRunning; identityNpub = status.npub; networkError = status.error;
+        const previousTorError = torError;
+        applyNetworkStatus(status);
+        if (status.torError && status.torError !== previousTorError) {
+          activityMessage = `Tor failed: ${status.torError} · click the connection panel to retry`;
+        }
       }).catch(() => {});
     }, 5000);
     const transferTimer = window.setInterval(() => {
       if (nativeReady) {
-        invoke<NativeTransfer[]>('get_transfers').then((items) => {
-          transfers = items.map((transfer) => ({ id: transfer.id, name: transfer.filename, size: readableSize(transfer.size), speed: transfer.speed, progress: transfer.progress, status: transfer.status }));
+        invoke<NativeTransfer[]>('get_transfers').then(async (items) => {
+          const previouslyComplete = new Set(transfers.filter(isCompleteTransfer).map((transfer) => transfer.fileId));
+          const updated = mapTransfers(items);
+          const newlyComplete = updated.filter((transfer) => isCompleteTransfer(transfer) && !previouslyComplete.has(transfer.fileId));
+          const vanishedActive = transfers.filter((transfer) => !startingDownloads.has(transfer.fileId) && isActiveTransfer(transfer) && !updated.some((item) => item.id === transfer.id));
+          const optimistic = transfers.filter((transfer) => startingDownloads.has(transfer.fileId) && !updated.some((item) => item.fileId === transfer.fileId));
+          transfers = [...optimistic, ...updated];
+          if (newlyComplete.length || vanishedActive.length) {
+            await refreshLocalLibrary();
+            const latest = newlyComplete[0] ?? vanishedActive[0];
+            activityMessage = `${latest.name} downloaded, verified, and ready to play`;
+          }
         }).catch(() => {});
         return;
       }
@@ -436,17 +733,31 @@
         };
       });
     }, 1000);
+    const libraryTimer = window.setInterval(() => {
+      if (nativeReady) refreshLocalLibrary();
+    }, 2000);
+    const playerTimer = window.setInterval(() => {
+      if (!nativeReady || !currentTrack || playerLoading) return;
+      invoke<PlaybackStatus>('audio_status').then((status) => {
+        const naturallyEnded = status.fileId === currentTrack?.fileId && status.ended && !playerEnded;
+        applyPlaybackStatus(status);
+        if (naturallyEnded) void playerTrackEnded();
+      }).catch(() => {});
+    }, 250);
     return () => {
       clearInterval(clockTimer);
       clearInterval(networkTimer);
       clearInterval(transferTimer);
+      clearInterval(libraryTimer);
+      clearInterval(playerTimer);
       window.removeEventListener('resize', clampTransferPane);
       stopTransferResize();
+      if (nativeReady && currentTrack) invoke<PlaybackStatus>('stop_audio').catch(() => {});
     };
   });
 </script>
 
-<svelte:head><title>Napstr — Nostr file sharing</title></svelte:head>
+<svelte:head><title>Napstr - own your music again</title></svelte:head>
 
 <main class="desktop">
   <section class="app-window" style={`--transfer-height: ${transferPaneHeight}px`} aria-label="Napstr application window">
@@ -478,7 +789,10 @@
         </button>
       {/each}
       <div class="toolbar-spacer"></div>
-      <button class="connection-box" onclick={connectNetwork} title={networkError || 'Reconnect network'}><span class:amber={!networkConnected} class="led"></span><strong>{networkConnected ? 'Nostr connected' : nativeReady ? 'Connect network' : 'Preview mode'}</strong><small>{networkConnected ? `${torRunning ? 'Tor active' : 'Tor on demand'} · NIP-17 ready` : nativeReady ? 'Click to retry' : 'Native features unavailable'}</small></button>
+      <button class="connection-box" onclick={connectNetwork} title={torError || networkError || 'Reconnect Nostr and Tor'}>
+        <span class="connection-status"><i class:amber={!networkConnected} class="led"></i><strong>{networkConnected ? 'Nostr connected' : nativeReady ? 'Connect Nostr' : 'Preview mode'}</strong></span>
+        <span class="connection-status"><i class:amber={!torRunning} class:error={Boolean(torError)} class="led"></i><strong>{torStatusLabel()}</strong></span>
+      </button>
       <button class="tool-button help-button" onclick={() => (aboutOpen = true)}><span class="tool-icon">?</span><span>About</span></button>
     </div>
 
@@ -487,6 +801,31 @@
       <span>{activityMessage}</span>
       <span class="strip-right">{nativeReady ? displayName : 'demo@napstr'} <i class:amber={!nativeReady} class="led"></i></span>
     </div>
+
+    <section class="player-bar" aria-label="Napstr audio player">
+      <div class="player-display">
+        <span class:playing={playerPlaying} class="player-led">{playerLoading ? '···' : playerPlaying ? '▶' : '■'}</span>
+        <div><strong>{currentTrack?.name ?? 'No track selected'}</strong><small>{currentTrack ? `${currentTrack.artist || 'Unknown artist'} · ${folderName(currentTrack.folder)}` : 'Choose a local song to begin'}</small></div>
+      </div>
+      <div class="player-controls">
+        <button onclick={previousPlayerTrack} disabled={!currentTrack || playerLoading} title="Previous track">|◀</button>
+        <button class="player-primary" onclick={togglePlayer} disabled={playerLoading} title={playerPlaying ? 'Pause' : 'Play'}>{playerLoading ? '…' : playerPlaying ? 'Ⅱ' : '▶'}</button>
+        <button onclick={stopPlayer} disabled={!currentTrack || playerLoading} title="Stop">■</button>
+        <button onclick={nextPlayerTrack} disabled={playerLoading || playerQueueIndex < 0 || playerQueueIndex + 1 >= playerQueue.length} title="Next track">▶|</button>
+      </div>
+      <div class="player-seek">
+        <input aria-label="Track position" type="range" min="0" max={Math.max(0, playerDuration || 0)} step="0.1" value={playerCurrentTime} oninput={seekPlayer} disabled={!currentTrack} />
+        <span>{formatPlayerTime(playerCurrentTime)} / {formatPlayerTime(playerDuration)}</span>
+      </div>
+      <label class="player-mode">After track
+        <select bind:value={playerMode} onchange={changePlayerMode}>
+          <option value="single">Stop</option>
+          <option value="folder">Play folder</option>
+          <option value="all">Play all</option>
+        </select>
+      </label>
+      <label class="player-volume">Vol <input aria-label="Volume" type="range" min="0" max="1" step="0.05" value={playerVolume} oninput={changePlayerVolume} /></label>
+    </section>
 
     <div class="workspace">
       {#if activeView === 'Search'}
@@ -533,7 +872,7 @@
               {#if selected.artist || selected.album || selected.description}<div class="file-metadata"><b>{selected.artist || 'Unknown creator'}</b>{#if selected.album}<span> · {selected.album}</span>{/if}{#if selected.description}<p>{selected.description}</p>{/if}{#if selected.license}<small>License: {selected.license}</small>{/if}</div>{/if}
               <fieldset><legend>Seeders</legend>
                 <div class="sources-list">
-                  {#if selected.remote}
+                  {#if !isLocalFile(selected.fileId)}
                     {#each selected.sourceDetails ?? [] as source, index}
                       <button class:selected-source={selectedSource === index} class="source-row" onclick={() => (selectedSource = index)}><span class="user-icon">☺</span><b>{source.displayName}</b><small>{source.npub.slice(0, 12)}…</small><span class="online"><i></i> Seeding</span></button>
                     {/each}
@@ -542,19 +881,19 @@
                   {/if}
                 </div>
               </fieldset>
-              <div class="detail-actions">{#if selected.remote}<button class="classic-button primary" onclick={startDownload}>⇩ Download</button><button class="classic-button" onclick={() => (sourceProfile = selected?.sourceDetails?.[selectedSource] ?? null)}>View profile</button>{:else}<button class="classic-button primary" onclick={playSelectedAudio}>▶ Play</button>{/if}</div>
-              {#if selected.remote}<div class="detail-actions moderation-actions"><button class="classic-button" onclick={reportSelectedFile}>Report</button><button class="classic-button" onclick={blockSelectedFile}>Block file</button><button class="classic-button" onclick={blockSelectedUser}>Block user</button></div>{/if}
-              {#if selected.remote}<p class="privacy-note"><span>♜</span> Transfer will use a private, temporary Tor onion service.</p>{:else}<p class="privacy-note"><span>♬</span> This audio is already stored locally and will not be downloaded again.</p>{/if}
+              <div class="detail-actions">{#if !isLocalFile(selected.fileId)}<button class="classic-button primary" disabled={startingDownloads.has(selected.fileId)} onclick={startDownload}>{startingDownloads.has(selected.fileId) ? '… Requesting' : '⇩ Download'}</button><button class="classic-button" onclick={() => (sourceProfile = selected?.sourceDetails?.[selectedSource] ?? null)}>View profile</button>{:else}<button class="classic-button primary" onclick={playSelectedAudio}>▶ Play</button><button class="classic-button" onclick={openNapstrFolder}>Open folder</button>{/if}</div>
+              {#if !isLocalFile(selected.fileId)}<div class="detail-actions moderation-actions"><button class="classic-button" onclick={blockSelectedFile}>Block file</button><button class="classic-button" onclick={blockSelectedUser}>Block user</button></div>{/if}
+              {#if !isLocalFile(selected.fileId)}<p class="privacy-note"><span>♜</span> Transfer will use the seeder’s private, app-session Tor onion service.</p>{:else}<p class="privacy-note"><span>♬</span> Downloaded and verified · ready to play from your Napstr folder.</p>{/if}
             {:else}<p class="empty-state">Select a result to see active seeders.</p>{/if}
           </aside>
         </div>
       {:else if activeView === 'Downloads'}
         <section class="full-panel">
           <div class="panel-title"><span></span><b>Download Manager</b><span></span></div>
-          <div class="actionbar"><button class="classic-button" onclick={togglePause}>{paused ? '▶ Resume all' : 'Ⅱ Pause all'}</button><button class="classic-button" onclick={openDownloadsFolder}>Open downloads folder</button><div class="spacer"></div><span>{transfers.filter(isActiveTransfer).length} active transfer(s)</span></div>
+          <div class="actionbar"><button class="classic-button" onclick={togglePause}>{paused ? '▶ Resume all' : 'Ⅱ Pause all'}</button><button class="classic-button" onclick={openNapstrFolder}>Open Napstr folder</button><button class="classic-button" onclick={clearFinishedTransfers} disabled={!transfers.some(isFinishedTransfer)}>Clear finished</button><div class="spacer"></div><span>{transfers.filter(isActiveTransfer).length} active · {transfers.filter(isCompleteTransfer).length} ready to play</span></div>
           <table class="file-table download-table"><thead><tr><th>Download order</th><th>Progress</th><th>Size</th><th>Speed</th><th>Status</th><th></th></tr></thead><tbody>
             {#each transfers as transfer}
-              <tr><td><span class="download-arrow">⇩</span>{transfer.name}</td><td><div class="progress"><span style={`width:${transfer.progress}%`}></span><b>{Math.round(transfer.progress)}%</b></div></td><td>{transfer.size}</td><td>{transfer.speed}</td><td>{transfer.status}</td><td>{#if transfer.status === 'Verified · Complete'}<button class="tiny-button" onclick={() => playTransferAudio(transfer.id)} title="Play verified audio">▶</button>{/if}<button class="tiny-button" onclick={() => removeTransfer(transfer.id)} title="Remove">×</button></td></tr>
+              <tr class:transfer-complete={isCompleteTransfer(transfer)} ondblclick={() => { if (isCompleteTransfer(transfer)) playAudio(transfer.fileId, transfer.name); }}><td><span class="download-arrow">{isCompleteTransfer(transfer) ? '▶' : '⇩'}</span>{transfer.name}</td><td><div class="progress"><span style={`width:${transfer.progress}%`}></span><b>{Math.round(transfer.progress)}%</b></div></td><td>{transfer.size}</td><td>{isCompleteTransfer(transfer) ? 'Local' : transfer.speed}</td><td>{isCompleteTransfer(transfer) ? 'Ready to play' : transfer.status}</td><td class="transfer-actions">{#if isCompleteTransfer(transfer)}<button class="classic-button transfer-play" onclick={(event) => { event.stopPropagation(); playAudio(transfer.fileId, transfer.name); }} title="Play verified audio">▶ Play</button>{/if}<button class="tiny-button" onclick={(event) => { event.stopPropagation(); removeTransfer(transfer.id); }} title="Remove from this list">×</button></td></tr>
             {/each}
           </tbody></table>
           {#if transfers.length === 0}<p class="empty-state">There are no downloads in the queue.</p>{/if}
@@ -562,22 +901,11 @@
       {:else if activeView === 'Shared'}
         <section class="full-panel">
           <div class="panel-title"><span></span><b>My Shared Files</b><span></span></div>
-          <div class="actionbar"><button class="classic-button primary" onclick={chooseSharedFolder}>＋ Add shared folder</button><button class="classic-button" onclick={rescanSharedFolder}>↻ Rescan</button><div class="spacer"></div><span>Sharing {sharedFiles.length} files · {readableSize(indexedBytes)}</span></div>
-          <div class="folder-path"><b>Shared folder:</b><input value={sharedFolder || 'No folder selected'} readonly /><button class="classic-button" onclick={chooseSharedFolder}>Browse…</button></div>
-          <table class="file-table"><thead><tr><th>Name</th><th>Size</th><th>Catalogue</th><th>Active peers</th></tr></thead><tbody>{#each sharedFiles as file}<tr class:selected={selectedShared?.fileId === file.fileId} onclick={() => (selectedShared = { ...file })}><td><span class="file-icon">▶</span>{file.name}</td><td>{file.readableSize}</td><td><span class:amber={!networkConnected} class="led"></span>{networkConnected ? 'Published' : 'Indexed'}</td><td>{file.peers}</td></tr>{/each}</tbody></table>
-          {#if selectedShared}
-            <fieldset class="metadata-editor"><legend>Public catalogue metadata</legend>
-              <label>Title <input bind:value={selectedShared.title} placeholder={selectedShared.filename} /></label>
-              <label>Artist <input bind:value={selectedShared.artist} /></label>
-              <label>Album <input bind:value={selectedShared.album} /></label>
-              <label>MIME type <input value={selectedShared.mime} readonly /></label>
-              <label>License <input bind:value={selectedShared.license} /></label>
-              <label>Tags <input bind:value={selectedShared.tags} placeholder="comma,separated,tags" /></label>
-              <label>Description <input bind:value={selectedShared.description} /></label>
-              <button class="classic-button primary" onclick={saveFileMetadata}>Save &amp; publish</button>
-            </fieldset>
-          {/if}
-          <p class="privacy-note wide"><span>♜</span> Only validated MP3, FLAC, WAV, Ogg Vorbis, and Opus audio is indexed recursively. Embedded cover artwork is allowed.</p>
+          <div class="actionbar"><button class="classic-button" onclick={rescanSharedFolder}>↻ Rescan</button><button class="classic-button" onclick={openNapstrFolder}>Open folder</button><button class="classic-button" onclick={playSelectedSharedAudio} disabled={!selectedShared}>▶ Play</button><button class="classic-button" onclick={playSelectedFolder} disabled={!selectedShared}>▶ Play folder</button><button class="classic-button primary" onclick={playAllSongs} disabled={!sharedFiles.length}>▶ Play all</button><div class="spacer"></div><span>Sharing {sharedFiles.length} files · {readableSize(indexedBytes)}</span></div>
+          <div class="folder-path"><b>Napstr folder:</b><input value={napstrFolder || 'No folder selected'} readonly /><button class="classic-button" onclick={chooseNapstrFolder}>Browse…</button></div>
+          <div class="library-filter"><label>View folder: <select bind:value={libraryFolderView}><option value="*">All folders</option>{#each libraryFolders() as folder}<option value={folder}>{folderName(folder)}</option>{/each}</select></label><span>{visibleSharedFiles().length} song{visibleSharedFiles().length === 1 ? '' : 's'} shown</span></div>
+          <table class="file-table shared-table"><thead><tr><th>Name</th><th>Folder</th><th>Size</th><th>Catalogue</th><th>Active peers</th></tr></thead><tbody>{#each visibleSharedFiles() as file}<tr class:selected={selectedShared?.fileId === file.fileId} onclick={() => (selectedShared = { ...file })} ondblclick={() => playAudio(file.fileId, file.name)}><td><span class="file-icon">▶</span>{file.name}</td><td>{folderName(file.folder)}</td><td>{file.readableSize}</td><td><span class:amber={!networkConnected} class="led"></span>{networkConnected ? 'Published' : 'Indexed'}</td><td>{file.peers}</td></tr>{/each}</tbody></table>
+          <p class="privacy-note wide"><span>♜</span> Only validated MP3, FLAC, WAV, Ogg Vorbis, and Opus audio is indexed recursively. Subfolders become player folders; folder names remain local and are not published. Embedded cover artwork is allowed.</p>
         </section>
       {:else if activeView === 'Profile'}
         <section class="full-panel profile-view">
@@ -590,7 +918,7 @@
         <section class="full-panel settings-view">
           <div class="panel-title"><span></span><b>Napstr Settings</b><span></span></div>
           <fieldset><legend>Network</legend><label><input type="checkbox" checked disabled /> Connect automatically at startup</label><label><input type="checkbox" checked disabled /> Never allow direct-IP file transfer</label><label>Nostr relays <input bind:value={nostrRelays} /></label><label>Tor <input value="Bundled, managed automatically" readonly /></label></fieldset>
-          <fieldset><legend>Downloads</legend><label>Save files to <input bind:value={downloadFolder} /><button class="classic-button" onclick={chooseDownloadFolder}>Browse…</button></label><label>Chunk size <select disabled><option>1 MB</option></select></label><label><input type="checkbox" checked disabled /> Verify every chunk and final SHA-256</label></fieldset>
+          <fieldset><legend>Files</legend><label>Downloads and shared audio <input value={napstrFolder} readonly /><button class="classic-button" onclick={chooseNapstrFolder}>Browse…</button></label><label>Transfer mode <select disabled><option>Whole file</option></select></label><label><input type="checkbox" checked disabled /> Downloaded audio is automatically shared</label><label><input type="checkbox" checked disabled /> Verify the complete file with SHA-256</label></fieldset>
           <div class="settings-actions"><button class="classic-button primary" onclick={persistSettings}>OK</button><button class="classic-button" onclick={refreshSnapshot}>Cancel</button><button class="classic-button" onclick={persistSettings}>Apply</button></div>
         </section>
       {/if}
@@ -606,15 +934,15 @@
         onkeydown={resizeTransferWithKeyboard}
         ondblclick={() => setTransferPaneHeight(window.innerHeight < 700 ? 94 : 119, true)}
       ></button>
-      <div class="dock-title"><span></span><b>Transfer Manager</b><span></span><button onclick={() => (activeView = 'Downloads')}>□</button></div>
+      <div class="dock-title"><span></span><b>Transfer Manager</b><span></span><button class="dock-clear" onclick={clearFinishedTransfers} disabled={!transfers.some(isFinishedTransfer)}>Clear finished</button><button onclick={() => (activeView = 'Downloads')} title="Open Download Manager">□</button></div>
       <div class="mini-transfers">
         {#each transfers.slice(0, 2) as transfer}
-          <div class="mini-row"><span class="download-arrow">⇩</span><span class="mini-name">{transfer.name}</span><div class="progress"><span style={`width:${transfer.progress}%`}></span></div><span>{transfer.size}</span><span>{transfer.speed}</span></div>
+          <div class:transfer-complete={isCompleteTransfer(transfer)} class="mini-row">{#if isCompleteTransfer(transfer)}<button class="mini-play" onclick={() => playAudio(transfer.fileId, transfer.name)} title="Play verified audio">▶</button>{:else}<span class="download-arrow">⇩</span>{/if}<span class="mini-name">{transfer.name}</span><div class="progress"><span style={`width:${transfer.progress}%`}></span></div><span>{transfer.size}</span><span>{isCompleteTransfer(transfer) ? 'Ready' : transfer.speed}</span></div>
         {/each}
       </div>
     </section>
 
-    <footer class="statusbar"><span>{activityMessage}</span><span><i class:amber={!networkConnected} class="led"></i> Nostr {networkConnected ? 'online' : 'offline'}</span><span>♜ Tor: {torRunning ? 'running' : 'starts on demand'}</span><span class="status-clock">{clock}</span></footer>
+    <footer class="statusbar"><span>{activityMessage}</span><span><i class:amber={!networkConnected} class="led"></i> Nostr {networkConnected ? 'online' : 'offline'}</span><span title={torError}>♜ Tor: {torRunning ? 'ready' : torError ? 'failed' : torStarting && torProgress > 0 ? `${torProgress}%` : 'starting'}</span><span class="status-clock">{clock}</span></footer>
   </section>
 
   {#if aboutOpen}
@@ -633,6 +961,16 @@
         <header class="titlebar"><div class="title-left"><span class="app-icon"><img src="/napstr-logo.png" alt="" /></span><span>Public Napstr Profile</span></div><div class="window-controls"><button onclick={() => (sourceProfile = null)}>×</button></div></header>
         <div class="dialog-body"><div class="about-logo">☺</div><div><h2>{sourceProfile.displayName}</h2><p>{sourceProfile.about || 'No profile description published.'}</p><code>{sourceProfile.npub}</code></div></div>
         <div class="dialog-actions"><button class="classic-button primary" onclick={() => (sourceProfile = null)}>OK</button></div>
+      </dialog>
+    </div>
+  {/if}
+
+  {#if blockConfirmation}
+    <div class="modal-backdrop" role="presentation" onclick={() => { if (!blockInProgress) blockConfirmation = null; }}>
+      <dialog class="dialog confirm-dialog" open aria-label="Confirm block" onclick={(e) => e.stopPropagation()} onkeydown={(e) => { if (e.key === 'Escape' && !blockInProgress) blockConfirmation = null; }}>
+        <header class="titlebar"><div class="title-left"><span class="app-icon">!</span><span>Confirm block</span></div><div class="window-controls"><button disabled={blockInProgress} onclick={() => (blockConfirmation = null)}>×</button></div></header>
+        <div class="dialog-body"><div class="confirm-icon">!</div><div><h3>Are you sure?</h3>{#if blockConfirmation.kind === 'file'}<p>Block <strong>{blockConfirmation.label}</strong>?</p><p>Every seeder offering these exact file bytes will be hidden.</p>{:else}<p>Block <strong>{blockConfirmation.label}</strong>?</p><p>Their catalogue entries and download requests will be ignored.</p>{/if}</div></div>
+        <div class="dialog-actions"><button class="classic-button primary" disabled={blockInProgress} onclick={confirmBlock}>{blockInProgress ? 'Blocking…' : 'Block'}</button><button class="classic-button" disabled={blockInProgress} onclick={() => (blockConfirmation = null)}>Cancel</button></div>
       </dialog>
     </div>
   {/if}

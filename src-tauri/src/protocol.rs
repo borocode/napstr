@@ -1,7 +1,7 @@
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 pub const MAX_CONTROL_FRAME: usize = 64 * 1024;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -12,9 +12,7 @@ pub enum ClientFrame {
         capability: String,
         file_id: String,
     },
-    RequestChunk {
-        index: u32,
-    },
+    RequestFile,
     TransferComplete,
     Cancel,
 }
@@ -27,12 +25,9 @@ pub enum ServerFrame {
         file_id: String,
         filename: String,
         size: u64,
-        chunk_size: u32,
-        chunk_hashes: Vec<String>,
     },
-    ChunkData {
-        index: u32,
-        size: u32,
+    FileData {
+        size: u64,
         sha256: String,
     },
     TransferComplete,
@@ -88,12 +83,12 @@ mod tests {
     async fn round_trips_a_protocol_frame() {
         let (mut left, mut right) = duplex(2048);
         let sender = tokio::spawn(async move {
-            write_frame(&mut left, &ClientFrame::RequestChunk { index: 42 })
+            write_frame(&mut left, &ClientFrame::RequestFile)
                 .await
                 .unwrap();
         });
         let frame: ClientFrame = read_frame(&mut right).await.unwrap();
         sender.await.unwrap();
-        assert!(matches!(frame, ClientFrame::RequestChunk { index: 42 }));
+        assert!(matches!(frame, ClientFrame::RequestFile));
     }
 }

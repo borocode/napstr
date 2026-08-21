@@ -20,6 +20,7 @@ use uuid::Uuid;
 
 pub const CATALOGUE_KIND: u16 = 30421;
 pub const AVAILABILITY_KIND: u16 = 30422;
+const MAX_SEEDER_CANDIDATES: usize = 3;
 
 pub fn validate_profile_picture(value: &str) -> Result<(), String> {
     if value.trim().is_empty() {
@@ -40,6 +41,9 @@ pub struct NetworkStatus {
     pub pubkey: String,
     pub relay_count: usize,
     pub tor_running: bool,
+    pub tor_starting: bool,
+    pub tor_progress: u8,
+    pub tor_error: String,
     pub error: String,
 }
 
@@ -286,6 +290,9 @@ impl NetworkService {
             pubkey,
             relay_count,
             tor_running: false,
+            tor_starting: false,
+            tor_progress: 0,
+            tor_error: String::new(),
             error: self.last_error.read().await.clone(),
         })
     }
@@ -298,6 +305,12 @@ impl NetworkService {
             .clone()
             .ok_or("Nostr is not connected")?;
         let files = load_publish_files(&self.db_path)?;
+        if !files.is_empty() {
+            let transfers = self.transfers.clone();
+            tokio::spawn(async move {
+                let _ = transfers.warm_for_sharing().await;
+            });
+        }
         let current_ids: HashSet<String> = files.iter().map(|file| file.0.clone()).collect();
         let stale = load_published_ids(&self.db_path)?
             .into_iter()
@@ -329,31 +342,14 @@ impl NetworkService {
                 .map_err(|error| error.to_string())?;
         }
         let mut published = 0;
-        for (
-            file_id,
-            filename,
-            size,
-            format,
-            title,
-            artist,
-            album,
-            mime,
-            license,
-            description,
-            content_tags,
-        ) in files
-        {
+        for (file_id, filename, size, format, mime) in files {
             let content = CatalogueContent {
                 protocol: "napstr/1".into(),
                 file_id: file_id.clone(),
                 filename: filename.clone(),
-                title: if title.is_empty() {
-                    filename.clone()
-                } else {
-                    title
-                },
-                artist,
-                album,
+                title: filename.clone(),
+                artist: String::new(),
+                album: String::new(),
                 format: format.clone(),
                 mime: if mime.is_empty() || mime == "application/octet-stream" {
                     mime_for_format(&format)
@@ -361,13 +357,9 @@ impl NetworkService {
                     mime
                 },
                 size,
-                license: if license.is_empty() {
-                    "unspecified".into()
-                } else {
-                    license
-                },
-                description,
-                tags: content_tags,
+                license: "unspecified".into(),
+                description: String::new(),
+                tags: String::new(),
             };
             let tags = vec![
                 Tag::parse(["d", file_id.as_str()]),
@@ -512,7 +504,6 @@ impl NetworkService {
                 }
             }
         }
-        let query = query.trim().to_lowercase();
         let mut aggregated: HashMap<String, CatalogueResult> = HashMap::new();
         let connection = super::open_connection(&self.db_path)?;
         for event in events.iter() {
@@ -527,17 +518,7 @@ impl NetworkService {
             {
                 continue;
             }
-            let haystack = format!(
-                "{} {} {} {} {} {}",
-                content.filename,
-                content.title,
-                content.artist,
-                content.album,
-                content.description,
-                content.tags
-            )
-            .to_lowercase();
-            if !query.is_empty() && !haystack.contains(&query) {
+            if !super::search_matches(query, &[&content.filename]) {
                 continue;
             }
             let pubkey = event.pubkey.to_hex();
@@ -561,9 +542,10 @@ impl NetworkService {
                 picture: String::new(),
                 event_id: event.id.to_hex(),
             };
+            let catalogue_name = content.filename.clone();
             connection.execute(
                 "INSERT OR REPLACE INTO remote_catalogue (file_id,source_pubkey,filename,title,artist,album,format,mime,size,license,description,tags,event_id,seen_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
-                params![content.file_id, pubkey, content.filename, content.title, content.artist, content.album, content.format, content.mime, content.size as i64, content.license, content.description, content.tags, event.id.to_hex(), Utc::now().to_rfc3339()],
+                params![content.file_id, pubkey, catalogue_name, catalogue_name, "", "", content.format, content.mime, content.size as i64, "unspecified", "", "", event.id.to_hex(), Utc::now().to_rfc3339()],
             ).map_err(|error| error.to_string())?;
             aggregated
                 .entry(content.file_id.clone())
@@ -578,16 +560,16 @@ impl NetworkService {
                 })
                 .or_insert(CatalogueResult {
                     file_id: content.file_id,
-                    filename: content.filename,
-                    title: content.title,
-                    artist: content.artist,
-                    album: content.album,
+                    filename: catalogue_name.clone(),
+                    title: catalogue_name,
+                    artist: String::new(),
+                    album: String::new(),
                     format: content.format,
                     mime: content.mime,
                     size: content.size,
-                    license: content.license,
-                    description: content.description,
-                    tags: content.tags,
+                    license: "unspecified".into(),
+                    description: String::new(),
+                    tags: String::new(),
                     sources: vec![source],
                 });
         }
@@ -657,10 +639,17 @@ impl NetworkService {
             .into_iter()
             .collect::<Vec<_>>();
         unique.sort();
-        unique.truncate(32);
+        // A small race finds a responsive onion without opening a data stream
+        // to every profile advertising the file. The remaining candidates are
+        // automatic fallbacks if the selected source fails.
+        unique.truncate(MAX_SEEDER_CANDIDATES);
         if unique.is_empty() {
             return Err("at least one seeder is required".into());
         }
+        let tor = self.transfers.clone();
+        tokio::spawn(async move {
+            let _ = tor.warm_tor().await;
+        });
         let connection = super::open_connection(&self.db_path)?;
         let already_local: bool = connection
             .query_row(
@@ -711,7 +700,7 @@ impl NetworkService {
         let (filename, size) = file_record.ok_or("catalogue record disappeared")?;
         let request_id = Uuid::new_v4().to_string();
         connection.execute(
-            "INSERT INTO network_downloads (request_id,file_id,source_pubkey,filename,size,progress,status,speed,destination,onion,updated_at) VALUES (?1,?2,?3,?4,?5,0,'Waiting for encrypted multi-source offers','—','','',?6)",
+            "INSERT INTO network_downloads (request_id,file_id,source_pubkey,filename,size,progress,status,speed,destination,onion,updated_at) VALUES (?1,?2,?3,?4,?5,0,'Racing responsive Tor seeders','—','','',?6)",
             params![request_id, file_id, unique[0], filename, size, Utc::now().to_rfc3339()],
         ).map_err(|error| error.to_string())?;
         for (source, _) in &receivers {
@@ -724,12 +713,22 @@ impl NetworkService {
             file_id,
         };
         let content = serde_json::to_string(&message).map_err(|error| error.to_string())?;
+        let deliveries = stream::iter(receivers.into_iter().map(|(source, receiver)| {
+            let client = client.clone();
+            let content = content.clone();
+            async move {
+                let result = client
+                    .send_private_msg(receiver, content, signal_tags())
+                    .await;
+                (source, result)
+            }
+        }))
+        .buffer_unordered(MAX_SEEDER_CANDIDATES)
+        .collect::<Vec<_>>()
+        .await;
         let mut sent = 0;
-        for (source, receiver) in receivers {
-            match client
-                .send_private_msg(receiver, content.clone(), signal_tags())
-                .await
-            {
+        for (source, result) in deliveries {
+            match result {
                 Ok(_) => sent += 1,
                 Err(error) => {
                     if let Ok(connection) = super::open_connection(&self.db_path) {
@@ -739,6 +738,12 @@ impl NetworkService {
             }
         }
         if sent == 0 {
+            super::open_connection(&self.db_path)?
+                .execute(
+                    "UPDATE network_downloads SET status='Failed: NIP-17 request could not be delivered',updated_at=?1 WHERE request_id=?2",
+                    params![Utc::now().to_rfc3339(), request_id],
+                )
+                .map_err(|error| error.to_string())?;
             return Err("NIP-17 request could not be delivered to any seeder".into());
         }
         Ok(request_id)
@@ -892,12 +897,6 @@ pub fn initialise_network_schema(connection: &Connection) -> Result<(), String> 
            size INTEGER NOT NULL, progress REAL NOT NULL, status TEXT NOT NULL, speed TEXT NOT NULL,
            destination TEXT NOT NULL, onion TEXT NOT NULL, updated_at TEXT NOT NULL
          );
-         CREATE TABLE IF NOT EXISTS download_chunks (
-           request_id TEXT NOT NULL, chunk_index INTEGER NOT NULL, sha256 TEXT NOT NULL,
-           path TEXT NOT NULL, source_pubkey TEXT NOT NULL DEFAULT '', verified_at TEXT NOT NULL,
-           PRIMARY KEY(request_id, chunk_index),
-           FOREIGN KEY(request_id) REFERENCES network_downloads(request_id) ON DELETE CASCADE
-         );
          CREATE TABLE IF NOT EXISTS download_sources (
            request_id TEXT NOT NULL, source_pubkey TEXT NOT NULL, status TEXT NOT NULL, updated_at TEXT NOT NULL,
            PRIMARY KEY(request_id, source_pubkey),
@@ -907,7 +906,6 @@ pub fn initialise_network_schema(connection: &Connection) -> Result<(), String> 
     ).map_err(|error| error.to_string())
     .and_then(|_| super::ensure_column(connection, "remote_catalogue", "description", "TEXT NOT NULL DEFAULT ''"))
     .and_then(|_| super::ensure_column(connection, "remote_catalogue", "tags", "TEXT NOT NULL DEFAULT ''"))
-    .and_then(|_| super::ensure_column(connection, "download_chunks", "source_pubkey", "TEXT NOT NULL DEFAULT ''"))
 }
 
 pub fn load_network_transfers(connection: &Connection) -> Result<Vec<super::Transfer>, String> {
@@ -934,8 +932,8 @@ fn load_or_create_identity() -> Result<Keys, String> {
     if let Ok(nsec) = std::env::var("NAPSTR_NSEC") {
         return Keys::parse(&nsec).map_err(|error| error.to_string());
     }
-    let entry =
-        Entry::new("social.napstr.desktop", "nostr-identity").map_err(|error| error.to_string())?;
+    let account = profile_keyring_account(std::env::var("NAPSTR_PROFILE").ok().as_deref())?;
+    let entry = Entry::new("social.napstr.desktop", &account).map_err(|error| error.to_string())?;
     if let Ok(secret) = entry.get_password() {
         return Keys::parse(&secret).map_err(|error| error.to_string());
     }
@@ -950,24 +948,31 @@ fn load_or_create_identity() -> Result<Keys, String> {
     Ok(keys)
 }
 
-type PublishFile = (
-    String,
-    String,
-    u64,
-    String,
-    String,
-    String,
-    String,
-    String,
-    String,
-    String,
-    String,
-);
+fn profile_keyring_account(profile: Option<&str>) -> Result<String, String> {
+    let Some(profile) = profile else {
+        return Ok("nostr-identity".into());
+    };
+    let profile = profile.trim();
+    if profile.is_empty()
+        || profile.len() > 32
+        || !profile
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(
+            "NAPSTR_PROFILE must contain 1-32 ASCII letters, numbers, hyphens, or underscores"
+                .into(),
+        );
+    }
+    Ok(format!("nostr-identity-{profile}"))
+}
+
+type PublishFile = (String, String, u64, String, String);
 
 fn load_publish_files(db_path: &PathBuf) -> Result<Vec<PublishFile>, String> {
     let connection = super::open_connection(db_path)?;
     let mut statement = connection.prepare(
-        "SELECT file_id, filename, size, format, title, artist, album, mime, license, description, tags, path
+        "SELECT file_id, filename, size, format, mime, path
          FROM files WHERE NOT EXISTS(SELECT 1 FROM blocked_files WHERE blocked_files.file_id=files.file_id)
          ORDER BY filename"
     ).map_err(|error| error.to_string())?;
@@ -980,50 +985,20 @@ fn load_publish_files(db_path: &PathBuf) -> Result<Vec<PublishFile>, String> {
                 row.get::<_, String>(3)?,
                 row.get::<_, String>(4)?,
                 row.get::<_, String>(5)?,
-                row.get::<_, String>(6)?,
-                row.get::<_, String>(7)?,
-                row.get::<_, String>(8)?,
-                row.get::<_, String>(9)?,
-                row.get::<_, String>(10)?,
-                row.get::<_, String>(11)?,
             ))
         })
         .map_err(|error| error.to_string())?;
     let mut files = Vec::new();
     for row in rows {
-        let (
-            file_id,
-            filename,
-            size,
-            format,
-            title,
-            artist,
-            album,
-            mime,
-            license,
-            description,
-            tags,
-            path,
-        ) = row.map_err(|error| error.to_string())?;
+        let (file_id, filename, size, format, mime, path) =
+            row.map_err(|error| error.to_string())?;
         let Ok(validated) = crate::audio::validate_audio(std::path::Path::new(&path)) else {
             continue;
         };
         if validated.format != format || validated.mime != mime {
             continue;
         }
-        files.push((
-            file_id,
-            filename,
-            size,
-            format,
-            title,
-            artist,
-            album,
-            mime,
-            license,
-            description,
-            tags,
-        ));
+        files.push((file_id, filename, size, format, mime));
     }
     Ok(files)
 }
@@ -1100,6 +1075,21 @@ fn mime_for_format(format: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_profiles_use_separate_keyring_accounts() {
+        assert_eq!(profile_keyring_account(None).unwrap(), "nostr-identity");
+        assert_eq!(
+            profile_keyring_account(Some("alice")).unwrap(),
+            "nostr-identity-alice"
+        );
+        assert_eq!(
+            profile_keyring_account(Some("bob_2")).unwrap(),
+            "nostr-identity-bob_2"
+        );
+        assert!(profile_keyring_account(Some("../alice")).is_err());
+        assert!(profile_keyring_account(Some("")).is_err());
+    }
 
     #[tokio::test]
     async fn nip17_signal_is_gift_wrapped_and_unwraps_for_only_the_receiver() {

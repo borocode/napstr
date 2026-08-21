@@ -1,11 +1,11 @@
 use chrono::Utc;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File},
-    io::{BufReader, Read},
+    io::{BufReader, Read, Seek},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -14,11 +14,12 @@ use walkdir::WalkDir;
 
 mod audio;
 mod network;
+mod player;
 mod protocol;
 mod tor;
 mod transfer;
 
-const CHUNK_SIZE: usize = 1024 * 1024;
+const HASH_BUFFER_SIZE: usize = 256 * 1024;
 const DEFAULT_NOSTR_RELAYS: &str = "wss://relay.damus.io,wss://nos.lol,wss://relay.nostr.com,wss://relay.primal.net,wss://relay.snort.social,wss://nostr.mom";
 const LEGACY_DEFAULT_NOSTR_RELAYS: &str = "wss://relay.damus.io,wss://nos.lol";
 
@@ -27,6 +28,12 @@ struct AppState {
     network: Arc<network::NetworkService>,
     tor: Arc<tor::TorManager>,
     watcher: Mutex<Option<FolderWatcher>>,
+    player: player::NativePlayer,
+}
+
+struct ShutdownServices {
+    network: Arc<network::NetworkService>,
+    tor: Arc<tor::TorManager>,
 }
 
 struct FolderWatcher {
@@ -39,9 +46,9 @@ struct SharedFile {
     file_id: String,
     filename: String,
     path: String,
+    folder: String,
     size: u64,
     format: String,
-    chunk_count: usize,
     status: String,
     title: String,
     artist: String,
@@ -68,8 +75,7 @@ pub(crate) struct Transfer {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Settings {
-    shared_folder: String,
-    download_folder: String,
+    napstr_folder: String,
     nostr_relays: String,
     display_name: String,
     profile_about: String,
@@ -123,12 +129,10 @@ fn initialise_database(path: &Path, app_data: &Path) -> Result<(), String> {
            path TEXT NOT NULL,
            size INTEGER NOT NULL,
            format TEXT NOT NULL,
-           chunk_size INTEGER NOT NULL,
-           chunk_hashes TEXT NOT NULL,
            indexed_at TEXT NOT NULL,
            title TEXT NOT NULL DEFAULT '', artist TEXT NOT NULL DEFAULT '', album TEXT NOT NULL DEFAULT '',
            mime TEXT NOT NULL DEFAULT 'application/octet-stream', license TEXT NOT NULL DEFAULT 'unspecified',
-           description TEXT NOT NULL DEFAULT '', tags TEXT NOT NULL DEFAULT ''
+           description TEXT NOT NULL DEFAULT '', tags TEXT NOT NULL DEFAULT '', folder TEXT NOT NULL DEFAULT ''
          );
          CREATE TABLE IF NOT EXISTS transfers (
            id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -146,8 +150,13 @@ fn initialise_database(path: &Path, app_data: &Path) -> Result<(), String> {
          );
          CREATE TABLE IF NOT EXISTS blocked_pubkeys (
            pubkey TEXT PRIMARY KEY, reason TEXT NOT NULL, created_at TEXT NOT NULL
-         );"
+         );
+         DROP TABLE IF EXISTS download_chunks;"
     ).map_err(|error| error.to_string())?;
+    // Pre-release databases used these transfer fields in the library table.
+    // Whole-file streaming no longer needs them.
+    let _ = connection.execute("ALTER TABLE files DROP COLUMN chunk_hashes", []);
+    let _ = connection.execute("ALTER TABLE files DROP COLUMN chunk_size", []);
     for (column, declaration) in [
         ("title", "TEXT NOT NULL DEFAULT ''"),
         ("artist", "TEXT NOT NULL DEFAULT ''"),
@@ -156,17 +165,26 @@ fn initialise_database(path: &Path, app_data: &Path) -> Result<(), String> {
         ("license", "TEXT NOT NULL DEFAULT 'unspecified'"),
         ("description", "TEXT NOT NULL DEFAULT ''"),
         ("tags", "TEXT NOT NULL DEFAULT ''"),
+        ("folder", "TEXT NOT NULL DEFAULT ''"),
     ] {
         ensure_column(&connection, "files", column, declaration)?;
     }
     network::initialise_network_schema(&connection)?;
+    connection
+        .execute_batch(
+            "DELETE FROM download_sources WHERE request_id IN (
+               SELECT request_id FROM network_downloads WHERE status='Verified · Complete'
+             );
+             DELETE FROM network_downloads WHERE status='Verified · Complete';
+             DELETE FROM transfers WHERE status='Verified · Complete';",
+        )
+        .map_err(|error| error.to_string())?;
 
     let downloads_path = app_data.join("Downloads");
     fs::create_dir_all(&downloads_path).map_err(|error| error.to_string())?;
     let downloads = downloads_path.to_string_lossy().into_owned();
     for (key, value) in [
         ("shared_folder", downloads.clone()),
-        ("download_folder", downloads.clone()),
         ("nostr_relays", DEFAULT_NOSTR_RELAYS.to_string()),
         ("display_name", "napstr-user".to_string()),
         (
@@ -182,6 +200,9 @@ fn initialise_database(path: &Path, app_data: &Path) -> Result<(), String> {
             )
             .map_err(|error| error.to_string())?;
     }
+    connection
+        .execute("DELETE FROM settings WHERE key='download_folder'", [])
+        .map_err(|error| error.to_string())?;
     connection
         .execute(
             "UPDATE settings SET value=?1 WHERE key='shared_folder' AND trim(value)=''",
@@ -207,8 +228,7 @@ fn get_setting(connection: &Connection, key: &str) -> Result<String, String> {
 
 fn load_settings(connection: &Connection) -> Result<Settings, String> {
     Ok(Settings {
-        shared_folder: get_setting(connection, "shared_folder")?,
-        download_folder: get_setting(connection, "download_folder")?,
+        napstr_folder: get_setting(connection, "shared_folder")?,
         nostr_relays: get_setting(connection, "nostr_relays")?,
         display_name: get_setting(connection, "display_name")?,
         profile_about: get_setting(connection, "profile_about")?,
@@ -216,41 +236,111 @@ fn load_settings(connection: &Connection) -> Result<Settings, String> {
     })
 }
 
+fn library_folder(root: &Path, file: &Path) -> String {
+    file.parent()
+        .and_then(|parent| parent.strip_prefix(root).ok())
+        .map(|relative| {
+            relative
+                .components()
+                .filter_map(|component| match component {
+                    std::path::Component::Normal(value) => Some(value.to_string_lossy()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("/")
+        })
+        .unwrap_or_default()
+}
+
 fn load_files(connection: &Connection, query: Option<&str>) -> Result<Vec<SharedFile>, String> {
-    let search = format!("%{}%", query.unwrap_or_default());
-    let mut statement = connection.prepare(
-        "SELECT file_id, filename, path, size, format, chunk_hashes, title, artist, album, mime, license, description, tags FROM files
-         WHERE (?1 = '%%' OR lower(filename) LIKE lower(?1))
-           AND format IN ('MP3','FLAC','WAV','OGG','OPUS')
+    let mut statement = connection
+        .prepare(
+            "SELECT file_id, filename, path, size, format, mime, folder FROM files
+         WHERE format IN ('MP3','FLAC','WAV','OGG','OPUS')
            AND NOT EXISTS(SELECT 1 FROM blocked_files WHERE blocked_files.file_id=files.file_id)
-         ORDER BY filename"
-    ).map_err(|error| error.to_string())?;
+         ORDER BY filename",
+        )
+        .map_err(|error| error.to_string())?;
     let rows = statement
-        .query_map([search], |row| {
-            let chunk_hashes: String = row.get(5)?;
+        .query_map([], |row| {
+            let path: String = row.get(2)?;
+            let filename: String = row.get(1)?;
             Ok(SharedFile {
                 file_id: row.get(0)?,
-                filename: row.get(1)?,
-                path: row.get(2)?,
+                filename: filename.clone(),
+                folder: row.get(6)?,
+                path,
                 size: row.get::<_, i64>(3)? as u64,
                 format: row.get(4)?,
-                chunk_count: chunk_hashes
-                    .split(',')
-                    .filter(|value| !value.is_empty())
-                    .count(),
                 status: "Published".into(),
-                title: row.get(6)?,
-                artist: row.get(7)?,
-                album: row.get(8)?,
-                mime: row.get(9)?,
-                license: row.get(10)?,
-                description: row.get(11)?,
-                tags: row.get(12)?,
+                title: filename,
+                artist: String::new(),
+                album: String::new(),
+                mime: row.get(5)?,
+                license: "unspecified".into(),
+                description: String::new(),
+                tags: String::new(),
             })
         })
         .map_err(|error| error.to_string())?;
-    rows.collect::<Result<Vec<_>, _>>()
-        .map_err(|error| error.to_string())
+    let files = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    let query = query.unwrap_or_default();
+    Ok(files
+        .into_iter()
+        .filter(|file| search_matches(query, &[&file.filename]))
+        .collect())
+}
+
+fn search_matches(query: &str, fields: &[&str]) -> bool {
+    let query_tokens = search_tokens(query);
+    if query_tokens.is_empty() {
+        return true;
+    }
+    let field_tokens = fields
+        .iter()
+        .flat_map(|field| search_tokens(field))
+        .collect::<Vec<_>>();
+    query_tokens.iter().all(|query_token| {
+        field_tokens.iter().any(|field_token| {
+            field_token.contains(query_token)
+                || (query_token.chars().count() >= 5
+                    && edit_distance_at_most(query_token, field_token, 1))
+        })
+    })
+}
+
+fn search_tokens(value: &str) -> Vec<String> {
+    value
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(str::to_lowercase)
+        .collect()
+}
+
+fn edit_distance_at_most(left: &str, right: &str, limit: usize) -> bool {
+    let left = left.chars().collect::<Vec<_>>();
+    let right = right.chars().collect::<Vec<_>>();
+    if left.len().abs_diff(right.len()) > limit {
+        return false;
+    }
+    let mut previous = (0..=right.len()).collect::<Vec<_>>();
+    for (left_index, left_character) in left.iter().enumerate() {
+        let mut current = vec![left_index + 1];
+        for (right_index, right_character) in right.iter().enumerate() {
+            current.push(
+                (previous[right_index + 1] + 1)
+                    .min(current[right_index] + 1)
+                    .min(previous[right_index] + usize::from(left_character != right_character)),
+            );
+        }
+        if current.iter().copied().min().unwrap_or(limit + 1) > limit {
+            return false;
+        }
+        previous = current;
+    }
+    previous[right.len()] <= limit
 }
 
 fn load_transfers(connection: &Connection) -> Result<Vec<Transfer>, String> {
@@ -313,13 +403,14 @@ fn ensure_column(
     Ok(())
 }
 
-fn hash_file(path: &Path) -> Result<(String, Vec<String>, u64), String> {
-    let file = File::open(path).map_err(|error| error.to_string())?;
+fn hash_open_file(file: &File) -> Result<(String, u64), String> {
     let size = file.metadata().map_err(|error| error.to_string())?.len();
-    let mut reader = BufReader::new(file);
+    let mut reader = BufReader::new(file.try_clone().map_err(|error| error.to_string())?);
+    reader
+        .seek(std::io::SeekFrom::Start(0))
+        .map_err(|error| error.to_string())?;
     let mut full_hasher = Sha256::new();
-    let mut hashes = Vec::new();
-    let mut buffer = vec![0u8; CHUNK_SIZE];
+    let mut buffer = vec![0u8; HASH_BUFFER_SIZE];
     loop {
         let count = reader
             .read(&mut buffer)
@@ -328,14 +419,52 @@ fn hash_file(path: &Path) -> Result<(String, Vec<String>, u64), String> {
             break;
         }
         full_hasher.update(&buffer[..count]);
-        hashes.push(hex::encode(Sha256::digest(&buffer[..count])));
     }
-    Ok((hex::encode(full_hasher.finalize()), hashes, size))
+    Ok((hex::encode(full_hasher.finalize()), size))
+}
+
+fn hash_file(path: &Path) -> Result<(String, u64), String> {
+    let file = File::open(path).map_err(|error| error.to_string())?;
+    hash_open_file(&file)
+}
+
+pub(crate) fn upsert_verified_file(
+    connection: &Connection,
+    folder_root: &Path,
+    path: &Path,
+    file_id: &str,
+    size: u64,
+    audio: audio::AudioInfo,
+) -> Result<(), String> {
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("Unnamed file");
+    let relative_folder = library_folder(folder_root, path);
+    connection
+        .execute(
+            "INSERT INTO files (file_id, filename, path, size, format, indexed_at, mime, folder)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(file_id) DO UPDATE SET filename=excluded.filename,path=excluded.path,size=excluded.size,
+             format=excluded.format,mime=excluded.mime,folder=excluded.folder,indexed_at=excluded.indexed_at",
+            params![
+                file_id,
+                filename,
+                path.to_string_lossy(),
+                size as i64,
+                audio.format,
+                Utc::now().to_rfc3339(),
+                audio.mime,
+                relative_folder
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 fn index_path(connection: &mut Connection, folder: &Path) -> Result<IndexReport, String> {
     if !folder.is_dir() {
-        return Err("The selected shared folder does not exist or is not a directory".into());
+        return Err("The selected Napstr folder does not exist or is not a directory".into());
     }
     let transaction = connection
         .transaction()
@@ -350,13 +479,20 @@ fn index_path(connection: &mut Connection, folder: &Path) -> Result<IndexReport,
         .follow_links(false)
         .into_iter()
         .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_file())
+        .filter(|entry| {
+            entry.file_type().is_file()
+                && entry
+                    .path()
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .is_none_or(|extension| !extension.eq_ignore_ascii_case("part"))
+        })
     {
         let path = entry.path();
         match audio::validate_audio(path)
             .and_then(|audio| hash_file(path).map(|hash| (audio, hash)))
         {
-            Ok((audio, (file_id, chunk_hashes, size))) => {
+            Ok((audio, (file_id, size))) => {
                 let blocked: bool = transaction
                     .query_row(
                         "SELECT EXISTS(SELECT 1 FROM blocked_files WHERE file_id=?1)",
@@ -370,17 +506,7 @@ fn index_path(connection: &mut Connection, folder: &Path) -> Result<IndexReport,
                         .push(format!("{}: this file hash is blocked", path.display()));
                     continue;
                 }
-                let filename = path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("Unnamed file");
-                transaction.execute(
-                    "INSERT INTO files (file_id, filename, path, size, format, chunk_size, chunk_hashes, indexed_at, mime)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-                     ON CONFLICT(file_id) DO UPDATE SET filename=excluded.filename,path=excluded.path,size=excluded.size,
-                     format=excluded.format,mime=excluded.mime,chunk_size=excluded.chunk_size,chunk_hashes=excluded.chunk_hashes,indexed_at=excluded.indexed_at",
-                    params![file_id, filename, path.to_string_lossy(), size as i64, audio.format, CHUNK_SIZE as i64, chunk_hashes.join(","), Utc::now().to_rfc3339(), audio.mime]
-                ).map_err(|error| error.to_string())?;
+                upsert_verified_file(&transaction, folder, path, &file_id, size, audio)?;
                 transaction
                     .execute(
                         "INSERT OR IGNORE INTO napstr_seen(file_id) VALUES (?1)",
@@ -455,14 +581,14 @@ fn search_catalog(query: String, state: State<'_, AppState>) -> Result<Vec<Share
 }
 
 #[tauri::command]
-fn set_shared_folder(path: String, state: State<'_, AppState>) -> Result<IndexReport, String> {
+fn set_napstr_folder(path: String, state: State<'_, AppState>) -> Result<IndexReport, String> {
     let folder = PathBuf::from(&path);
     let mut connection = open_db(&state)?;
     let report = index_path(&mut connection, &folder)?;
     connection
         .execute(
             "INSERT OR REPLACE INTO settings (key, value) VALUES ('shared_folder', ?1)",
-            [path],
+            [&path],
         )
         .map_err(|error| error.to_string())?;
     let db_path = state
@@ -482,7 +608,7 @@ fn set_shared_folder(path: String, state: State<'_, AppState>) -> Result<IndexRe
 }
 
 #[tauri::command]
-fn rescan_shared_folder(state: State<'_, AppState>) -> Result<IndexReport, String> {
+fn rescan_napstr_folder(state: State<'_, AppState>) -> Result<IndexReport, String> {
     let mut connection = open_db(&state)?;
     let folder = PathBuf::from(get_setting(&connection, "shared_folder")?);
     index_path(&mut connection, &folder)
@@ -496,8 +622,7 @@ fn save_settings(settings: Settings, state: State<'_, AppState>) -> Result<AppSn
     validate_length("relay list", &settings.nostr_relays, 4096)?;
     let connection = open_db(&state)?;
     for (key, value) in [
-        ("shared_folder", settings.shared_folder),
-        ("download_folder", settings.download_folder),
+        ("shared_folder", settings.napstr_folder),
         ("nostr_relays", settings.nostr_relays),
         ("display_name", settings.display_name),
         ("profile_about", settings.profile_about),
@@ -546,7 +671,6 @@ fn unique_destination(folder: &Path, filename: &str) -> PathBuf {
 fn remove_transfer(id: i64, state: State<'_, AppState>) -> Result<(), String> {
     let connection = open_db(&state)?;
     if id < 0 {
-        connection.execute("DELETE FROM download_chunks WHERE request_id=(SELECT request_id FROM network_downloads WHERE rowid=?1)", [-id]).map_err(|error| error.to_string())?;
         connection.execute("DELETE FROM download_sources WHERE request_id=(SELECT request_id FROM network_downloads WHERE rowid=?1)", [-id]).map_err(|error| error.to_string())?;
         connection
             .execute("DELETE FROM network_downloads WHERE rowid = ?1", [-id])
@@ -578,100 +702,155 @@ fn get_transfers(state: State<'_, AppState>) -> Result<Vec<Transfer>, String> {
     load_transfers(&open_db(&state)?)
 }
 
-#[tauri::command]
-fn open_downloads_folder(state: State<'_, AppState>) -> Result<(), String> {
-    let folder = PathBuf::from(get_setting(&open_db(&state)?, "download_folder")?);
-    fs::create_dir_all(&folder).map_err(|error| error.to_string())?;
-    #[cfg(target_os = "windows")]
-    let mut command = std::process::Command::new("explorer");
-    #[cfg(target_os = "macos")]
-    let mut command = std::process::Command::new("open");
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let mut command = std::process::Command::new("xdg-open");
-    command
-        .arg(folder)
+#[cfg(all(unix, not(target_os = "macos")))]
+fn clean_appimage_environment(command: &mut std::process::Command) {
+    let app_dir = std::env::var_os("APPDIR").map(PathBuf::from);
+    let host_xdg_data_dirs = std::env::var_os("XDG_DATA_DIRS").and_then(|value| {
+        std::env::join_paths(std::env::split_paths(&value).filter(|path| {
+            app_dir
+                .as_ref()
+                .map(|app_dir| !path.starts_with(app_dir))
+                .unwrap_or(true)
+        }))
+        .ok()
+    });
+    let host_library_path = std::env::var_os("LD_LIBRARY_PATH").and_then(|value| {
+        std::env::join_paths(std::env::split_paths(&value).filter(|path| {
+            app_dir
+                .as_ref()
+                .map(|app_dir| !path.starts_with(app_dir))
+                .unwrap_or(true)
+        }))
+        .ok()
+    });
+    for key in [
+        "APPDIR",
+        "APPIMAGE",
+        "LD_LIBRARY_PATH",
+        "LD_PRELOAD",
+        "GTK_DATA_PREFIX",
+        "GTK_EXE_PREFIX",
+        "GTK_PATH",
+        "GTK_IM_MODULE_FILE",
+        "GDK_PIXBUF_MODULE_FILE",
+        "GIO_EXTRA_MODULES",
+        "GSETTINGS_SCHEMA_DIR",
+        "GDK_BACKEND",
+        "GTK_THEME",
+        "XDG_DATA_DIRS",
+    ] {
+        command.env_remove(key);
+    }
+    if let Some(value) = host_xdg_data_dirs {
+        command.env("XDG_DATA_DIRS", value);
+    }
+    if let Some(value) = host_library_path {
+        command.env("LD_LIBRARY_PATH", value);
+    }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn launch_desktop_opener(command: &mut std::process::Command) -> Result<(), String> {
+    use std::process::Stdio;
+
+    let mut child = command
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
-        .map_err(|error| format!("could not open downloads folder: {error}"))?;
+        .map_err(|error| error.to_string())?;
+    for _ in 0..12 {
+        match child.try_wait().map_err(|error| error.to_string())? {
+            Some(status) if status.success() => return Ok(()),
+            Some(status) => {
+                let mut stderr = String::new();
+                if let Some(mut output) = child.stderr.take() {
+                    let _ = output.read_to_string(&mut stderr);
+                }
+                return Err(if stderr.trim().is_empty() {
+                    format!("exited with {status}")
+                } else {
+                    stderr.trim().to_string()
+                });
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(25)),
+        }
+    }
     Ok(())
 }
 
-fn launch_validated_audio(path: &Path, expected_file_id: &str) -> Result<(), String> {
-    let canonical = path.canonicalize().map_err(|error| error.to_string())?;
-    let info = audio::validate_audio(&canonical)
-        .map_err(|error| format!("playback rejected by the audio-only policy: {error}"))?;
-    let (actual_file_id, _, _) = hash_file(&canonical)?;
-    if actual_file_id != expected_file_id {
-        return Err("playback rejected because the file changed after verification".into());
-    }
+fn open_with_system(path: &Path, description: &str) -> Result<(), String> {
     #[cfg(target_os = "windows")]
-    let mut command = std::process::Command::new("explorer");
-    #[cfg(target_os = "macos")]
-    let mut command = std::process::Command::new("open");
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let mut command = std::process::Command::new("xdg-open");
-    command.arg(&canonical).spawn().map_err(|error| {
-        format!(
-            "could not open {} audio in the system player: {error}",
-            info.format
-        )
-    })?;
-    Ok(())
-}
-
-#[tauri::command]
-fn play_shared_audio(file_id: String, state: State<'_, AppState>) -> Result<(), String> {
-    let connection = open_db(&state)?;
-    let path: Option<String> = connection.query_row(
-        "SELECT path FROM files WHERE file_id=?1 AND NOT EXISTS(SELECT 1 FROM blocked_files WHERE file_id=?1)",
-        [&file_id], |row| row.get(0),
-    ).optional().map_err(|error| error.to_string())?;
-    launch_validated_audio(
-        Path::new(&path.ok_or("shared audio was not found")?),
-        &file_id,
-    )
-}
-
-#[tauri::command]
-fn play_transfer_audio(id: i64, state: State<'_, AppState>) -> Result<(), String> {
-    let connection = open_db(&state)?;
-    let record: Option<(String, String, String)> = if id < 0 {
-        connection
-            .query_row(
-                "SELECT file_id,destination,status FROM network_downloads WHERE rowid=?1",
-                [-id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .optional()
-            .map_err(|error| error.to_string())?
-    } else {
-        connection
-            .query_row(
-                "SELECT file_id,destination,status FROM transfers WHERE id=?1",
-                [id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .optional()
-            .map_err(|error| error.to_string())?
-    };
-    let (file_id, destination, status) = record.ok_or("completed transfer was not found")?;
-    if status != "Verified · Complete" {
-        return Err("audio can be played only after verification completes".into());
+    {
+        std::process::Command::new("explorer")
+            .arg(path)
+            .spawn()
+            .map_err(|error| format!("could not open {description}: {error}"))?;
+        return Ok(());
     }
-    launch_validated_audio(Path::new(&destination), &file_id)
+    #[cfg(target_os = "macos")]
+    {
+        let status = std::process::Command::new("open")
+            .arg(path)
+            .status()
+            .map_err(|error| format!("could not open {description}: {error}"))?;
+        return status
+            .success()
+            .then_some(())
+            .ok_or_else(|| format!("the system opener could not open {description}"));
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let mut failures = Vec::new();
+        for (program, prefix) in [("xdg-open", None), ("gio", Some("open"))] {
+            let mut command = std::process::Command::new(program);
+            clean_appimage_environment(&mut command);
+            if let Some(prefix) = prefix {
+                command.arg(prefix);
+            }
+            command.arg(path);
+            match launch_desktop_opener(&mut command) {
+                Ok(()) => return Ok(()),
+                Err(error) => failures.push(format!("{program}: {error}")),
+            }
+        }
+        Err(format!(
+            "could not open {description} ({})",
+            failures.join("; ")
+        ))
+    }
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct FileMetadataUpdate {
-    file_id: String,
-    title: String,
-    artist: String,
-    album: String,
-    #[serde(rename = "mime")]
-    _mime: String,
-    license: String,
-    description: String,
-    tags: String,
+#[tauri::command]
+fn open_napstr_folder(state: State<'_, AppState>) -> Result<(), String> {
+    let folder = PathBuf::from(get_setting(&open_db(&state)?, "shared_folder")?);
+    fs::create_dir_all(&folder).map_err(|error| error.to_string())?;
+    open_with_system(&folder, "Napstr folder")
+}
+
+fn playable_audio_path(connection: &Connection, file_id: &str) -> Result<PathBuf, String> {
+    let blocked: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM blocked_files WHERE file_id=?1)",
+            [file_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if blocked {
+        return Err("playback rejected because this file hash is blocked".into());
+    }
+    let mut statement = connection
+        .prepare("SELECT path FROM files WHERE file_id=?1")
+        .map_err(|error| error.to_string())?;
+    let paths = statement
+        .query_map([file_id], |row| row.get::<_, String>(0))
+        .map_err(|error| error.to_string())?;
+    for path in paths {
+        let path = PathBuf::from(path.map_err(|error| error.to_string())?);
+        if path.is_file() {
+            return Ok(path);
+        }
+    }
+    Err("audio is not present in the indexed Napstr folder".into())
 }
 
 fn validate_length(label: &str, value: &str, maximum: usize) -> Result<(), String> {
@@ -683,43 +862,35 @@ fn validate_length(label: &str, value: &str, maximum: usize) -> Result<(), Strin
 }
 
 #[tauri::command]
-fn update_file_metadata(
-    metadata: FileMetadataUpdate,
-    state: State<'_, AppState>,
-) -> Result<SharedFile, String> {
-    for (label, value, maximum) in [
-        ("title", metadata.title.as_str(), 256),
-        ("artist", metadata.artist.as_str(), 256),
-        ("album", metadata.album.as_str(), 256),
-        ("license", metadata.license.as_str(), 128),
-        ("description", metadata.description.as_str(), 2048),
-        ("tags", metadata.tags.as_str(), 512),
-    ] {
-        validate_length(label, value, maximum)?;
-    }
-    let connection = open_db(&state)?;
-    connection.execute(
-        "UPDATE files SET title=?1,artist=?2,album=?3,license=?4,description=?5,tags=?6 WHERE file_id=?7",
-        params![metadata.title.trim(), metadata.artist.trim(), metadata.album.trim(), metadata.license.trim(), metadata.description.trim(), metadata.tags.trim(), metadata.file_id],
-    ).map_err(|error| error.to_string())?;
-    load_files(&connection, None)?
-        .into_iter()
-        .find(|file| file.file_id == metadata.file_id)
-        .ok_or("file ID was not found".into())
-}
-
-#[tauri::command]
 async fn start_network(state: State<'_, AppState>) -> Result<network::NetworkStatus, String> {
+    let tor = state.tor.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = tor.start().await;
+    });
     let mut status = state.network.start().await?;
-    status.tor_running = state.tor.status().await;
+    apply_tor_status(&mut status, state.tor.status().await);
     Ok(status)
 }
 
 #[tauri::command]
 async fn network_status(state: State<'_, AppState>) -> Result<network::NetworkStatus, String> {
     let mut status = state.network.status().await?;
-    status.tor_running = state.tor.status().await;
+    let tor_status = state.tor.status().await;
+    if !tor_status.running && !tor_status.starting {
+        let tor = state.tor.clone();
+        tauri::async_runtime::spawn(async move {
+            let _ = tor.start().await;
+        });
+    }
+    apply_tor_status(&mut status, tor_status);
     Ok(status)
+}
+
+fn apply_tor_status(status: &mut network::NetworkStatus, tor: tor::TorStatus) {
+    status.tor_running = tor.running;
+    status.tor_starting = tor.starting;
+    status.tor_progress = tor.bootstrap_progress;
+    status.tor_error = tor.error;
 }
 
 #[tauri::command]
@@ -831,9 +1002,11 @@ async fn close_window(window: tauri::Window, state: State<'_, AppState>) -> Resu
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let shutdown_services = Arc::new(Mutex::new(None::<ShutdownServices>));
+    let setup_shutdown_services = shutdown_services.clone();
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .setup(|app| {
+        .setup(move |app| {
             let app_data = app
                 .path()
                 .app_data_dir()
@@ -847,6 +1020,12 @@ pub fn run() {
             let tor = Arc::new(tor::TorManager::new(app_data, resource_dir));
             let transfers = Arc::new(transfer::TransferService::new(db_path.clone(), tor.clone()));
             let network = network::NetworkService::new(db_path.clone(), transfers);
+            *setup_shutdown_services
+                .lock()
+                .map_err(|_| "shutdown service lock was poisoned")? = Some(ShutdownServices {
+                network: network.clone(),
+                tor: tor.clone(),
+            });
             let existing_folder = open_connection(&db_path)
                 .ok()
                 .and_then(|connection| get_setting(&connection, "shared_folder").ok())
@@ -868,23 +1047,27 @@ pub fn run() {
                 network,
                 tor,
                 watcher: Mutex::new(watcher),
+                player: player::NativePlayer::default(),
             });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             get_snapshot,
             search_catalog,
-            set_shared_folder,
-            rescan_shared_folder,
+            set_napstr_folder,
+            rescan_napstr_folder,
             save_settings,
             remove_transfer,
             get_transfers,
-            open_downloads_folder,
-            play_shared_audio,
-            play_transfer_audio,
+            open_napstr_folder,
+            player::play_audio,
+            player::toggle_audio,
+            player::stop_audio,
+            player::seek_audio,
+            player::set_audio_volume,
+            player::audio_status,
             set_downloads_paused,
             cancel_transfer,
-            update_file_metadata,
             start_network,
             network_status,
             publish_catalogue,
@@ -898,8 +1081,21 @@ pub fn run() {
             toggle_maximise,
             close_window
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Napstr");
+        .build(tauri::generate_context!())
+        .expect("error while building Napstr");
+
+    let exit_code = app.run_return(|_, _| {});
+    if let Some(services) = shutdown_services
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
+    {
+        tauri::async_runtime::block_on(async move {
+            services.network.stop().await;
+            services.tor.stop().await;
+        });
+    }
+    std::process::exit(exit_code);
 }
 
 #[cfg(test)]
@@ -911,17 +1107,16 @@ mod tests {
     }
 
     #[test]
-    fn hashes_file_and_chunks_deterministically() {
+    fn hashes_file_deterministically() {
         let directory = test_directory("hash-test");
         fs::create_dir_all(&directory).unwrap();
         let path = directory.join("hello.txt");
         fs::write(&path, b"abc").unwrap();
-        let (file_hash, chunks, size) = hash_file(&path).unwrap();
+        let (file_hash, size) = hash_file(&path).unwrap();
         assert_eq!(
             file_hash,
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
-        assert_eq!(chunks, vec![file_hash.clone()]);
         assert_eq!(size, 3);
         fs::remove_dir_all(directory).unwrap();
     }
@@ -935,7 +1130,7 @@ mod tests {
         let mut bytes = b"RIFF".to_vec();
         bytes.extend_from_slice(&40u32.to_le_bytes());
         bytes.extend_from_slice(b"WAVEfmt \x10\0\0\0\x01\0\x01\0\x44\xac\0\0\x88\x58\x01\0\x02\0\x10\0data\x04\0\0\0song");
-        fs::write(audio, bytes).unwrap();
+        fs::write(&audio, bytes).unwrap();
         fs::write(directory.join("renamed-video.mp3"), b"not audio").unwrap();
         fs::write(child.join("cover.jpg"), b"image").unwrap();
         let db_path = directory.join("napstr.sqlite3");
@@ -944,25 +1139,87 @@ mod tests {
         let report = index_path(&mut connection, &directory).unwrap();
         assert_eq!(report.file_count, 1);
         assert!(report.errors.len() >= 2);
-        assert_eq!(load_files(&connection, None).unwrap().len(), 1);
+        let indexed = load_files(&connection, None).unwrap();
+        assert_eq!(indexed.len(), 1);
+        assert_eq!(indexed[0].folder, "artist/album");
+        fs::remove_file(&audio).unwrap();
+        let report = index_path(&mut connection, &directory).unwrap();
+        assert_eq!(report.file_count, 0);
+        assert!(load_files(&connection, None).unwrap().is_empty());
         drop(connection);
         fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
-    fn fresh_install_uses_one_download_and_share_folder() {
+    fn search_is_word_based_case_insensitive_and_typo_tolerant() {
+        let fields = ["Metallica_Enter_Sandman_Official_Music_Video.mp3"];
+        assert!(search_matches("METALLICA", &fields));
+        assert!(search_matches("enter sandman", &fields));
+        assert!(search_matches("sandman metallica", &fields));
+        assert!(search_matches("metalica", &fields));
+        assert!(!search_matches("metallica mario", &fields));
+    }
+
+    #[test]
+    fn fresh_install_uses_one_napstr_folder() {
         let directory = test_directory("default-folder-test");
         let db_path = directory.join("napstr.sqlite3");
         initialise_database(&db_path, &directory).unwrap();
         let connection = open_connection(&db_path).unwrap();
         let settings = load_settings(&connection).unwrap();
-        assert_eq!(settings.shared_folder, settings.download_folder);
         assert_eq!(
-            Path::new(&settings.shared_folder),
+            Path::new(&settings.napstr_folder),
             directory.join("Downloads")
         );
-        assert!(Path::new(&settings.shared_folder).is_dir());
+        assert!(Path::new(&settings.napstr_folder).is_dir());
+        assert!(get_setting(&connection, "download_folder").is_err());
         assert_eq!(settings.nostr_relays, DEFAULT_NOSTR_RELAYS);
+        drop(connection);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn playback_uses_only_files_indexed_from_the_napstr_folder() {
+        let directory = test_directory("completed-playback-test");
+        fs::create_dir_all(&directory).unwrap();
+        let db_path = directory.join("napstr.sqlite3");
+        initialise_database(&db_path, &directory).unwrap();
+        let audio = directory.join("new-download.mp3");
+        fs::write(&audio, b"downloaded audio placeholder").unwrap();
+        let file_id = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let connection = open_connection(&db_path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO network_downloads
+                 (request_id,file_id,source_pubkey,filename,size,progress,status,speed,destination,onion,updated_at)
+                 VALUES ('request',?1,'source','new-download.mp3',28,100,'Verified · Complete','—',?2,'example.onion','now')",
+                params![file_id, audio.to_string_lossy()],
+            )
+            .unwrap();
+        assert!(playable_audio_path(&connection, file_id).is_err());
+        connection
+            .execute(
+                "INSERT INTO files
+                 (file_id,filename,path,size,format,indexed_at,mime,folder)
+                 VALUES (?1,'new-download.mp3',?2,28,'MP3','now','audio/mpeg','')",
+                params![file_id, audio.to_string_lossy()],
+            )
+            .unwrap();
+        assert_eq!(playable_audio_path(&connection, file_id).unwrap(), audio);
+        fs::remove_file(&audio).unwrap();
+        assert!(playable_audio_path(&connection, file_id).is_err());
+        drop(connection);
+
+        initialise_database(&db_path, &directory).unwrap();
+        let connection = open_connection(&db_path).unwrap();
+        let completed: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM network_downloads WHERE status='Verified · Complete'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(completed, 0);
         drop(connection);
         fs::remove_dir_all(directory).unwrap();
     }

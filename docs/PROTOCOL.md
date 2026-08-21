@@ -4,7 +4,7 @@
 
 ## Public Nostr events
 
-Catalogue records are parameterized-replaceable kind `30421` events. Required tags are `d=<full SHA-256>`, `t=napstr`, `x=<full SHA-256>`, `name`, `size`, `m`, and `alt`. JSON content carries `protocol`, `fileId`, `filename`, `title`, `artist`, `album`, `format`, `mime`, `size`, `license`, `description`, and `tags`. Publishing the same author/kind/`d` replaces a record. A removed share replaces it with a deletion document that cannot be parsed as a catalogue record.
+Catalogue records are parameterized-replaceable kind `30421` events. Required tags are `d=<full SHA-256>`, `t=napstr`, `x=<full SHA-256>`, `name`, `size`, `m`, and `alt`. JSON content carries `protocol`, `fileId`, `filename`, `title`, `artist`, `album`, `format`, `mime`, `size`, `license`, `description`, and `tags` for protocol compatibility. Napstr sets `title` to the indexed filename and leaves the optional descriptive fields empty; the app has no separate catalogue-metadata editor. Publishing the same author/kind/`d` replaces a record. A removed share replaces it with a deletion document that cannot be parsed as a catalogue record.
 
 Availability uses parameterized-replaceable kind `30422`, tagged with `d=availability-NNNN`, `t=napstr-availability`, and `expiration`. Its JSON content is an array of no more than 400 exact file IDs. Napstr sends fresh batches every four minutes with a ten-minute expiry and accepts only recent heartbeats. Replaceable events are used so relays retain the current heartbeat; ephemeral event kinds would normally not be stored and could not support on-demand search.
 
@@ -30,13 +30,13 @@ The receiver accepts an offer only when the authenticated gift-wrap sender is on
 
 Tor exposes a randomly generated v3 onion at virtual port 80 and forwards it only to a random `127.0.0.1` listener. The onion key is discarded and its authenticated control connection is retained only for the offer lifetime. Downloaders reject non-`.onion` hosts; there is no other connector.
 
-Control messages are a big-endian 32-bit JSON length followed by UTF-8 JSON, capped at 64 KiB. Protocol version is `1`.
+Control messages are a big-endian 32-bit JSON length followed by UTF-8 JSON, capped at 64 KiB. The binary transfer protocol version is `2`.
 
 ```text
 client HELLO             { version, capability, file_id }
-server WELCOME           { version, file_id, filename, size, chunk_size, chunk_hashes }
-client REQUEST_CHUNK     { index }
-server CHUNK_DATA        { index, size, sha256 }
+server WELCOME           { version, file_id, filename, size }
+client REQUEST_FILE
+server FILE_DATA         { size, sha256 }
 server raw bytes         exactly `size` bytes
 client TRANSFER_COMPLETE
 server TRANSFER_COMPLETE
@@ -44,4 +44,4 @@ client CANCEL
 server ERROR             { code, message }
 ```
 
-The server resolves only `file_id` in the indexed `files` table. Each 1 MiB chunk is streamed from disk and re-hashed before transmission. The downloader requires identical manifests across sources, assigns each missing index to one peer at a time, verifies its declared size and SHA-256, then atomically persists it. Reconstruction succeeds only when the final SHA-256 equals `file_id`.
+The server resolves only `file_id` in the indexed `files` table and streams no more than the indexed byte length. The downloader races up to three valid onion offers, selects the first responsive source, and writes one continuous temporary file. If that source fails, a standby restarts the stream. The file is accepted only when its final SHA-256 equals `file_id`.

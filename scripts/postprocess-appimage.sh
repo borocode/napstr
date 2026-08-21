@@ -35,6 +35,66 @@ if [[ ! -x "$app_dir/usr/bin/napstr" ]]; then
   exit 1
 fi
 
+# linuxdeploy intentionally excludes a number of libraries it expects every
+# Linux distribution to provide. NixOS does not expose those libraries through
+# the usual FHS paths. GStreamer's core needs zlib and Napstr's native player
+# links the ALSA compatibility library even when PulseAudio is the selected
+# output. Keep these stable dependencies inside the AppImage.
+if [[ ! -e "$app_dir/usr/lib/libz.so.1" ]]; then
+  zlib_path="$(ldconfig -p 2>/dev/null | awk '$1 == "libz.so.1" { print $NF; exit }')"
+  if [[ -z "$zlib_path" || ! -e "$zlib_path" ]]; then
+    echo "The build host does not provide libz.so.1 for the AppImage" >&2
+    exit 1
+  fi
+  cp -L -- "$zlib_path" "$app_dir/usr/lib/libz.so.1"
+  chmod 0644 "$app_dir/usr/lib/libz.so.1"
+fi
+
+if [[ ! -e "$app_dir/usr/lib/libasound.so.2" ]]; then
+  alsa_path="$(ldconfig -p 2>/dev/null | awk '$1 == "libasound.so.2" { print $NF; exit }')"
+  if [[ -z "$alsa_path" || ! -e "$alsa_path" ]]; then
+    echo "The build host does not provide libasound.so.2 for the AppImage" >&2
+    exit 1
+  fi
+  cp -L -- "$alsa_path" "$app_dir/usr/lib/libasound.so.2"
+  chmod 0644 "$app_dir/usr/lib/libasound.so.2"
+fi
+
+gstreamer_plugins="$app_dir/usr/lib/gstreamer-1.0"
+if [[ ! -f "$gstreamer_plugins/libgstautodetect.so" ]]; then
+  echo "The AppImage is missing GStreamer's autoaudiosink plugin" >&2
+  exit 1
+fi
+if [[ ! -f "$gstreamer_plugins/libgstpulseaudio.so" && ! -f "$gstreamer_plugins/libgstalsa.so" ]]; then
+  echo "The AppImage is missing a GStreamer audio-output plugin" >&2
+  exit 1
+fi
+if [[ ! -f "$app_dir/apprun-hooks/linuxdeploy-plugin-gstreamer.sh" ]]; then
+  echo "The AppImage is missing its GStreamer runtime hook" >&2
+  exit 1
+fi
+
+if command -v gst-inspect-1.0 >/dev/null 2>&1; then
+  for element in \
+    playbin filesrc typefind id3demux mpegaudioparse \
+    audioconvert audioresample volume \
+    autoaudiosink pulsesink alsasink \
+    mpg123audiodec flacdec vorbisdec opusdec wavparse; do
+    if ! env \
+      APPDIR="$app_dir" \
+      LD_LIBRARY_PATH="$app_dir/usr/lib:$app_dir/usr/lib/x86_64-linux-gnu" \
+      GST_REGISTRY_1_0="$work_dir/gstreamer-registry.bin" \
+      GST_REGISTRY_REUSE_PLUGIN_SCANNER=no \
+      GST_PLUGIN_SYSTEM_PATH_1_0="$gstreamer_plugins" \
+      GST_PLUGIN_PATH_1_0="$gstreamer_plugins" \
+      GST_PLUGIN_SCANNER_1_0="$app_dir/usr/lib/gstreamer1.0/gstreamer-1.0/gst-plugin-scanner" \
+      gst-inspect-1.0 "$element" >/dev/null; then
+      echo "The AppImage cannot load the GStreamer element: $element" >&2
+      exit 1
+    fi
+  done
+fi
+
 # linuxdeploy currently copies Ubuntu's Wayland client libraries into the
 # AppImage. They conflict with the host Mesa stack and can leave WebKitGTK as a
 # blank window (EGL_BAD_PARAMETER). Let the host supply this tightly coupled

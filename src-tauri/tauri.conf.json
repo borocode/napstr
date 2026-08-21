@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "Napstr",
+        "title": "Napstr - own your music again",
         "width": 1180,
         "height": 810,
         "minWidth": 560,
@@ -24,7 +24,11 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' asset: https: data:; connect-src 'self' ipc: http://ipc.localhost"
+      "assetProtocol": {
+        "enable": true,
+        "scope": []
+      },
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' asset: https: data:; media-src 'self' asset: http://asset.localhost; connect-src 'self' ipc: http://ipc.localhost"
     }
   },
   "bundle": {
@@ -44,7 +48,7 @@
     "copyright": "Copyright © 2026 Napstr contributors",
     "linux": {
       "appimage": {
-        "bundleMediaFramework": false
+        "bundleMediaFramework": true
       },
       "deb": {
         "depends": []

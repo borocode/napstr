@@ -67,9 +67,10 @@ a:hover { color: #b01a16; }
 
 .masthead blockquote {
   position: absolute;
-  top: 5px;
+  top: 50%;
   left: 228px;
   width: 370px;
+  transform: translateY(-50%);
   margin: 0;
   color: white;
   font-weight: bold;
