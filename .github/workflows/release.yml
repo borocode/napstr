@@ -50,7 +50,7 @@ jobs:
       - name: Validate release tag
         shell: bash
         run: |
-          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]]; then
             echo "Release tag must look like v0.1.0 or v0.1.0-beta.1" >&2
             exit 1
           fi
@@ -58,6 +58,8 @@ jobs:
         with:
           node-version: 24
           cache: npm
+      - name: Set and verify version from release tag
+        run: node scripts/set-release-version.mjs "$RELEASE_TAG"
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.platform == 'macos-15' && 'aarch64-apple-darwin' || '' }}
@@ -88,6 +90,8 @@ jobs:
             xauth \
             xvfb
       - run: npm ci
+      - name: Verify release version remains synchronized
+        run: node scripts/set-release-version.mjs "$RELEASE_TAG" --check
       - name: Verify interface
         run: npm run check
       - name: Test native core

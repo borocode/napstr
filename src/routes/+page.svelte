@@ -3,6 +3,9 @@
   import { invoke } from '@tauri-apps/api/core';
   import { getCurrentWindow } from '@tauri-apps/api/window';
   import { open } from '@tauri-apps/plugin-dialog';
+  import packageInfo from '../../package.json';
+
+  const appVersion = packageInfo.version;
 
   type View = 'Search' | 'Downloads' | 'Shared' | 'Profile' | 'Settings';
   type PlayerMode = 'single' | 'folder' | 'all';
@@ -844,7 +847,7 @@
     <button class="window-resize-handle resize-nw" aria-label="Resize window from top left" onpointerdown={(event) => beginWindowResize(event, 'NorthWest')}></button>
 
     <header class="titlebar" data-tauri-drag-region>
-      <div class="title-left"><span class="app-icon"><img src="/napstr-logo.png" alt="" /></span><span>Napstr</span></div>
+      <div class="title-left"><span class="app-icon"><img src="/napstr-logo.png" alt="" /></span><span>Napstr - own your music again</span></div>
       <div class="window-controls" aria-hidden="true">
         <button tabindex="-1" onclick={() => windowCommand('minimise_window')}>_</button><button tabindex="-1" onclick={() => windowCommand('toggle_maximise')}>□</button><button tabindex="-1" onclick={() => windowCommand('close_window')}>×</button>
       </div>
@@ -1022,7 +1025,7 @@
     <div class="modal-backdrop" role="presentation" onclick={() => (aboutOpen = false)}>
       <dialog class="dialog" open aria-label="About Napstr" onclick={(e) => e.stopPropagation()} onkeydown={(e) => { if (e.key === 'Escape') aboutOpen = false; }}>
         <header class="titlebar"><div class="title-left"><span class="app-icon"><img src="/napstr-logo.png" alt="" /></span><span>About Napstr</span></div><div class="window-controls"><button onclick={() => (aboutOpen = false)}>×</button></div></header>
-        <div class="dialog-body"><div class="about-logo"><img src="/napstr-logo.png" alt="" /></div><div><h2>Napstr</h2><p>Version 0.1.0</p><p>Public discovery over Nostr.<br />Private verified transfers over Tor.</p></div></div>
+        <div class="dialog-body"><div class="about-logo"><img src="/napstr-logo.png" alt="" /></div><div><h2>Napstr</h2><p>Version {appVersion}</p><p>Public discovery over Nostr.<br />Private verified transfers over Tor.</p></div></div>
         <div class="dialog-actions"><button class="classic-button primary" onclick={() => (aboutOpen = false)}>OK</button></div>
       </dialog>
     </div>

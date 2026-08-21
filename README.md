@@ -67,6 +67,7 @@ Release packages include a pinned official Tor Expert Bundle (version 15.0.20) w
 - Windows x86-64: NSIS setup `.exe`
 
 Trigger [the release workflow](.github/workflows/release.yml) manually, or push a version tag such as `v0.1.0`. Tagged outputs are attached to a draft GitHub release.
+The workflow applies the tag version to the npm, Cargo, Tauri, installer, and in-app version metadata before building.
 
 Tauri packages must be produced on their target operating system. For a local package, first run `scripts/prepare-tor.sh` with the platform's official archive URL and pinned hash from the release matrix, then run:
 
