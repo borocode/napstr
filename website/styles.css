@@ -196,6 +196,15 @@ p {
   line-height: 26px;
 }
 
+.homepage-thumb {
+  display: block;
+  width: 100%;
+  max-width: 400px;
+  height: auto;
+  margin: 9px 0 20px;
+  border: 1px solid #222;
+}
+
 .feature-row {
   display: grid;
   grid-template-columns: 120px 1fr;
