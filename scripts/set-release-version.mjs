@@ -5,12 +5,14 @@ import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const repositoryRoot = resolve(fileURLToPath(new URL('..', import.meta.url)));
-const requestedTag = process.argv[2] ?? '';
 const checkOnly = process.argv.includes('--check');
+const requestedTag = process.argv.slice(2).find((argument) => argument !== '--check') ?? process.env.RELEASE_TAG ?? '';
 const match = /^v(\d+\.\d+\.\d+(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?)$/.exec(requestedTag);
 
 if (!match) {
-  throw new Error('Release tag must be valid SemVer such as v0.2.3 or v0.2.3-beta.1');
+  throw new Error(
+    `Release tag must be valid SemVer such as v0.2.3 or v0.2.3-beta.1; received ${JSON.stringify(requestedTag)}`
+  );
 }
 
 const version = match[1];

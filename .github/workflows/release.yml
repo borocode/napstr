@@ -59,7 +59,7 @@ jobs:
           node-version: 24
           cache: npm
       - name: Set and verify version from release tag
-        run: node scripts/set-release-version.mjs "$RELEASE_TAG"
+        run: node scripts/set-release-version.mjs
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.platform == 'macos-15' && 'aarch64-apple-darwin' || '' }}
@@ -91,7 +91,7 @@ jobs:
             xvfb
       - run: npm ci
       - name: Verify release version remains synchronized
-        run: node scripts/set-release-version.mjs "$RELEASE_TAG" --check
+        run: node scripts/set-release-version.mjs --check
       - name: Verify interface
         run: npm run check
       - name: Test native core
