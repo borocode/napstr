@@ -46,13 +46,6 @@
     { label: 'Settings', icon: '⚙' }
   ];
 
-  const demoResults: Result[] = [
-    { id: 1, name: 'Free Culture Orchestra — Overture', format: 'MP3', size: '11 MB', sources: 12, speed: 'Tor', length: '5:03', fileId: '9BD2 186C F11A 702E…', remote: true },
-    { id: 2, name: 'Open Tape Archive — Night Train', format: 'OGG', size: '8.4 MB', sources: 7, speed: 'Tor', length: '3:46', fileId: 'D4E7 B90A 3C18 8EE2…', remote: true },
-    { id: 3, name: 'Copyleft Sessions — First Light', format: 'FLAC', size: '31 MB', sources: 4, speed: 'Tor', length: '4:12', fileId: 'A81C 0F42 76B9 94D1…', remote: true },
-    { id: 4, name: 'Commons Choir — Homeward', format: 'OPUS', size: '6.1 MB', sources: 2, speed: 'Tor', length: '4:31', fileId: '72A0 ECF1 354C 82B7…', remote: true }
-  ];
-
   type NativeFile = { fileId: string; filename: string; path: string; folder: string; size: number; format: string; status: string; title: string; artist: string; album: string; mime: string; license: string; description: string; tags: string };
   type NativeTransfer = { id: number; fileId: string; filename: string; size: number; progress: number; status: string; speed: string; destination: string };
   type NativeSettings = { napstrFolder: string; nostrRelays: string; displayName: string; profileAbout: string; profilePicture: string };
@@ -66,14 +59,14 @@
     | { kind: 'user'; pubkey: string; label: string };
 
   let activeView: View = 'Search';
-  let results: Result[] = demoResults;
+  let results: Result[] = [];
   let query = '';
   let format = 'Audio only';
   let minimumSources = 1;
   let maximumSize = '';
   let searchedQuery = 'All audio';
   let resultsAreNetwork = false;
-  let selected: Result | null = results[0];
+  let selected: Result | null = null;
   let advanced = false;
   let paused = false;
   let aboutOpen = false;
@@ -82,8 +75,9 @@
   let blockInProgress = false;
   let startingDownloads = new Set<string>();
   let clock = '';
+  let desktopRuntime = false;
   let nativeReady = false;
-  let activityMessage = 'Browser preview — open in the desktop app to use local files';
+  let activityMessage = 'Starting Napstr…';
   let napstrFolder = '';
   let nostrRelays = 'wss://relay.damus.io, wss://nos.lol, wss://relay.nostr.com, wss://relay.primal.net, wss://relay.snort.social, wss://nostr.mom';
   let displayName = 'napstr-user';
@@ -114,15 +108,9 @@
   let lastPlayerError = '';
   let transferPaneHeight = 119;
   let stopTransferResize = () => {};
-  let transfers: Transfer[] = [
-    { id: 1, fileId: '', name: 'Copyleft Sessions — First Light.flac', size: '31 MB', speed: '1.8 MB/s', progress: 74, status: 'Downloading verified audio', destination: '' },
-    { id: 2, fileId: '', name: 'Open Tape Archive — Night Train.ogg', size: '8.4 MB', speed: '620 KB/s', progress: 42, status: 'Downloading verified audio', destination: '' }
-  ];
+  let transfers: Transfer[] = [];
 
-  let sharedFiles: Array<NativeFile & { name: string; readableSize: string; peers: number }> = [
-    { fileId: '', filename: 'My Copyleft Track.flac', name: 'My Copyleft Track.flac', path: '', folder: 'Albums/Example', size: 31 * 1024 ** 2, readableSize: '31 MB', format: 'FLAC', status: 'Demo', peers: 0, title: '', artist: '', album: '', mime: 'audio/flac', license: 'copyleft', description: '', tags: '' },
-    { fileId: '', filename: 'Commons Recording.ogg', name: 'Commons Recording.ogg', path: '', folder: '', size: 8.4 * 1024 ** 2, readableSize: '8.4 MB', format: 'OGG', status: 'Demo', peers: 0, title: '', artist: '', album: '', mime: 'audio/ogg', license: 'copyleft', description: '', tags: '' }
-  ];
+  let sharedFiles: Array<NativeFile & { name: string; readableSize: string; peers: number }> = [];
 
   const readableSize = (bytes: number) => {
     if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(1)} GB`;
@@ -528,10 +516,6 @@
       }
       return;
     }
-    transfers = [
-      ...transfers,
-      { id: Date.now(), fileId: target.fileId, name: `${target.name}.${target.format.toLowerCase()}`, size: target.size, speed: 'Negotiating…', progress: 2, status: 'Requesting private Tor session', destination: '' }
-    ];
   }
 
   async function playSelectedAudio() {
@@ -717,6 +701,8 @@
   }
 
   onMount(() => {
+    desktopRuntime = '__TAURI_INTERNALS__' in window;
+    if (!desktopRuntime) return;
     const savedPlayerMode = window.localStorage.getItem('napstr-player-mode');
     if (savedPlayerMode === 'single' || savedPlayerMode === 'folder' || savedPlayerMode === 'all') playerMode = savedPlayerMode;
     const savedPlayerVolume = Number(window.localStorage.getItem('napstr-player-volume'));
@@ -770,37 +756,23 @@
     }, 5000);
     let transferPollPending = false;
     const transferTimer = window.setInterval(async () => {
-      if (nativeReady) {
-        if (transferPollPending) return;
-        transferPollPending = true;
-        try {
-          const items = await invoke<NativeTransfer[]>('get_transfers');
-          const previouslyComplete = new Set(transfers.filter(isCompleteTransfer).map((transfer) => transfer.fileId));
-          const updated = mapTransfers(items);
-          const newlyComplete = updated.filter((transfer) => isCompleteTransfer(transfer) && !previouslyComplete.has(transfer.fileId));
-          const vanishedActive = transfers.filter((transfer) => !startingDownloads.has(transfer.fileId) && isActiveTransfer(transfer) && !updated.some((item) => item.id === transfer.id));
-          const optimistic = transfers.filter((transfer) => startingDownloads.has(transfer.fileId) && !updated.some((item) => item.fileId === transfer.fileId));
-          transfers = [...optimistic, ...updated];
-          if (newlyComplete.length || vanishedActive.length) {
-            await refreshLocalLibrary();
-            const latest = newlyComplete[0] ?? vanishedActive[0];
-            activityMessage = `${latest.name} downloaded, verified, and ready to play`;
-          }
-        } catch { /* the next transfer poll retries */ }
-        finally { transferPollPending = false; }
-        return;
-      }
-      if (paused) return;
-      transfers = transfers.map((item) => {
-        if (item.progress >= 100) return item;
-        const progress = Math.min(100, item.progress + 0.4);
-        return {
-          ...item,
-          progress,
-          speed: item.progress < 4 ? 'Connecting…' : item.speed === 'Negotiating…' ? '892 KB/s' : item.speed,
-          status: progress === 100 ? 'Verified · Complete' : item.progress < 4 ? 'Opening onion service' : item.status
-        };
-      });
+      if (!nativeReady || transferPollPending) return;
+      transferPollPending = true;
+      try {
+        const items = await invoke<NativeTransfer[]>('get_transfers');
+        const previouslyComplete = new Set(transfers.filter(isCompleteTransfer).map((transfer) => transfer.fileId));
+        const updated = mapTransfers(items);
+        const newlyComplete = updated.filter((transfer) => isCompleteTransfer(transfer) && !previouslyComplete.has(transfer.fileId));
+        const vanishedActive = transfers.filter((transfer) => !startingDownloads.has(transfer.fileId) && isActiveTransfer(transfer) && !updated.some((item) => item.id === transfer.id));
+        const optimistic = transfers.filter((transfer) => startingDownloads.has(transfer.fileId) && !updated.some((item) => item.fileId === transfer.fileId));
+        transfers = [...optimistic, ...updated];
+        if (newlyComplete.length || vanishedActive.length) {
+          await refreshLocalLibrary();
+          const latest = newlyComplete[0] ?? vanishedActive[0];
+          activityMessage = `${latest.name} downloaded, verified, and ready to play`;
+        }
+      } catch { /* the next transfer poll retries */ }
+      finally { transferPollPending = false; }
     }, 1000);
     let libraryPollPending = false;
     const libraryTimer = window.setInterval(async () => {
@@ -835,6 +807,7 @@
 
 <svelte:head><title>Napstr - own your music again</title></svelte:head>
 
+{#if desktopRuntime}
 <main class="desktop">
   <section class="app-window" style={`--transfer-height: ${transferPaneHeight}px`} aria-label="Napstr application window">
     <button class="window-resize-handle resize-n" aria-label="Resize window from top" onpointerdown={(event) => beginWindowResize(event, 'North')}></button>
@@ -866,7 +839,7 @@
       {/each}
       <div class="toolbar-spacer"></div>
       <button class="connection-box" onclick={connectNetwork} title={torError || networkError || 'Reconnect Nostr and Tor'}>
-        <span class="connection-status"><i class:amber={!networkConnected} class="led"></i><strong>{networkConnected ? 'Nostr connected' : nativeReady ? 'Connect Nostr' : 'Preview mode'}</strong></span>
+        <span class="connection-status"><i class:amber={!networkConnected} class="led"></i><strong>{networkConnected ? 'Nostr connected' : 'Connect Nostr'}</strong></span>
         <span class="connection-status"><i class:amber={!torRunning} class:error={Boolean(torError)} class="led"></i><strong>{torStatusLabel()}</strong></span>
       </button>
       <button class="tool-button help-button" onclick={() => (aboutOpen = true)}><span class="tool-icon">?</span><span>About</span></button>
@@ -875,7 +848,7 @@
     <div class="network-strip">
       <span class="network-pulse">▥</span>
       <span>{activityMessage}</span>
-      <span class="strip-right">{nativeReady ? displayName : 'demo@napstr'} <i class:amber={!nativeReady} class="led"></i></span>
+      <span class="strip-right">{displayName} <i class:amber={!nativeReady} class="led"></i></span>
     </div>
 
     <section class="player-bar" aria-label="Napstr audio player">
@@ -1051,3 +1024,4 @@
     </div>
   {/if}
 </main>
+{/if}
