@@ -10,7 +10,7 @@ npx serve website
 ```
 
 The download page loads the latest published GitHub Release through GitHub's public API and
-matches the Tauri-generated `.exe`, Intel/Apple silicon `.dmg`, and `.AppImage` assets. On a
+matches the Tauri-generated `.exe` and `.AppImage` assets. On a
 standard `owner.github.io/repository` Pages URL, `releases.js` derives the repository name from
 the page address automatically.
 

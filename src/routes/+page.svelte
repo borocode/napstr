@@ -57,7 +57,7 @@
   type NetworkStatus = { connected: boolean; npub: string; pubkey: string; relayCount: number; torRunning: boolean; torStarting: boolean; torProgress: number; torError: string; error: string };
   type NetworkResult = { fileId: string; filename: string; title: string; artist: string; album: string; format: string; mime: string; size: number; license: string; description: string; tags: string; sources: SourceDetail[] };
   type PlayerTrack = { fileId: string; name: string; folder: string; artist: string; mime: string };
-  type PlaybackStatus = { fileId: string; currentTime: number; duration: number; playing: boolean; ended: boolean };
+  type PlaybackStatus = { fileId: string; currentTime: number; duration: number; playing: boolean; ended: boolean; error: string };
   type BlockConfirmation =
     | { kind: 'file'; fileId: string; label: string }
     | { kind: 'user'; pubkey: string; label: string };
@@ -94,6 +94,7 @@
   let torError = '';
   let identityNpub = '';
   let networkError = '';
+  let networkConnectPending = false;
   let selectedSource = 0;
   let selectedShared: NativeFile | null = null;
   let libraryFolderView = '*';
@@ -107,6 +108,7 @@
   let playerDuration = 0;
   let playerVolume = 0.85;
   let playerEnded = false;
+  let lastPlayerError = '';
   let transferPaneHeight = 119;
   let stopTransferResize = () => {};
   let transfers: Transfer[] = [
@@ -242,10 +244,12 @@
     playerEnded = false;
     try {
       applyPlaybackStatus(await invoke<PlaybackStatus>('play_audio', { fileId: track.fileId, volume: playerVolume }));
-      activityMessage = `Playing ${track.name}${track.folder ? ` · ${track.folder}` : ''}`;
+      if (!lastPlayerError) activityMessage = `Playing ${track.name}${track.folder ? ` · ${track.folder}` : ''}`;
     } catch (error) {
       playerPlaying = false;
-      activityMessage = `Playback failed: ${String(error)}`;
+      playerEnded = true;
+      lastPlayerError = String(error);
+      activityMessage = `Playback failed: ${lastPlayerError}`;
     } finally {
       playerLoading = false;
     }
@@ -329,6 +333,14 @@
 
   function applyPlaybackStatus(status: PlaybackStatus) {
     if (!currentTrack || status.fileId !== currentTrack.fileId) return;
+    if (status.error) {
+      playerPlaying = false;
+      playerEnded = true;
+      if (status.error !== lastPlayerError) activityMessage = `Playback failed: ${status.error}`;
+      lastPlayerError = status.error;
+      return;
+    }
+    lastPlayerError = '';
     playerCurrentTime = status.currentTime;
     playerDuration = status.duration;
     playerPlaying = status.playing;
@@ -398,7 +410,8 @@
   }
 
   async function connectNetwork() {
-    if (!nativeReady) return;
+    if (!nativeReady || networkConnectPending) return;
+    networkConnectPending = true;
     activityMessage = 'Connecting to Nostr relays and opening encrypted inbox…';
     try {
       const status = await invoke<NetworkStatus>('start_network');
@@ -410,6 +423,8 @@
       networkConnected = false;
       networkError = String(error);
       activityMessage = `Network unavailable: ${String(error)}`;
+    } finally {
+      networkConnectPending = false;
     }
   }
 
@@ -421,6 +436,25 @@
     torError = status.torError;
     identityNpub = status.npub;
     networkError = status.error;
+  }
+
+  async function recoverAfterSleep() {
+    if (!nativeReady) return;
+    networkConnected = false;
+    torRunning = false;
+    torStarting = true;
+    torProgress = 0;
+    playerPlaying = false;
+    playerLoading = false;
+    playerCurrentTime = 0;
+    playerEnded = currentTrack !== null;
+    lastPlayerError = '';
+    activityMessage = 'Computer resumed · reconnecting Nostr, Tor, and audio…';
+    try {
+      await invoke('recover_after_sleep');
+    } catch (error) {
+      activityMessage = `Resume recovery failed: ${String(error)} · click the connection panel to retry`;
+    }
   }
 
   function torStatusLabel() {
@@ -694,19 +728,50 @@
     };
     updateClock();
     const clockTimer = window.setInterval(updateClock, 30000);
-    const networkTimer = window.setInterval(() => {
-      if (!nativeReady) return;
-      invoke<NetworkStatus>('network_status').then((status) => {
+    let lastWakeTick = Date.now();
+    let lastWakeRecovery = 0;
+    const detectWake = () => {
+      const now = Date.now();
+      const elapsed = now - lastWakeTick;
+      lastWakeTick = now;
+      if (elapsed > 20000 && now - lastWakeRecovery > 15000) {
+        lastWakeRecovery = now;
+        window.setTimeout(() => void recoverAfterSleep(), 1200);
+      }
+    };
+    const foregrounded = () => {
+      if (!document.hidden) detectWake();
+    };
+    window.addEventListener('focus', foregrounded);
+    document.addEventListener('visibilitychange', foregrounded);
+    const wakeTimer = window.setInterval(detectWake, 5000);
+    let networkPollPending = false;
+    const networkTimer = window.setInterval(async () => {
+      if (!nativeReady || networkPollPending) return;
+      networkPollPending = true;
+      try {
+        const status = await invoke<NetworkStatus>('network_status');
         const previousTorError = torError;
+        const wasConnected = networkConnected;
         applyNetworkStatus(status);
         if (status.torError && status.torError !== previousTorError) {
           activityMessage = `Tor failed: ${status.torError} · click the connection panel to retry`;
+        } else if (!wasConnected && status.connected) {
+          activityMessage = 'Nostr reconnected · refreshing the catalogue';
+          void search();
+        } else if (!status.connected && !networkConnectPending) {
+          void connectNetwork();
         }
-      }).catch(() => {});
+      } catch { /* the next health poll retries */ }
+      finally { networkPollPending = false; }
     }, 5000);
-    const transferTimer = window.setInterval(() => {
+    let transferPollPending = false;
+    const transferTimer = window.setInterval(async () => {
       if (nativeReady) {
-        invoke<NativeTransfer[]>('get_transfers').then(async (items) => {
+        if (transferPollPending) return;
+        transferPollPending = true;
+        try {
+          const items = await invoke<NativeTransfer[]>('get_transfers');
           const previouslyComplete = new Set(transfers.filter(isCompleteTransfer).map((transfer) => transfer.fileId));
           const updated = mapTransfers(items);
           const newlyComplete = updated.filter((transfer) => isCompleteTransfer(transfer) && !previouslyComplete.has(transfer.fileId));
@@ -718,7 +783,8 @@
             const latest = newlyComplete[0] ?? vanishedActive[0];
             activityMessage = `${latest.name} downloaded, verified, and ready to play`;
           }
-        }).catch(() => {});
+        } catch { /* the next transfer poll retries */ }
+        finally { transferPollPending = false; }
         return;
       }
       if (paused) return;
@@ -733,8 +799,12 @@
         };
       });
     }, 1000);
-    const libraryTimer = window.setInterval(() => {
-      if (nativeReady) refreshLocalLibrary();
+    let libraryPollPending = false;
+    const libraryTimer = window.setInterval(async () => {
+      if (!nativeReady || libraryPollPending) return;
+      libraryPollPending = true;
+      try { await refreshLocalLibrary(); }
+      finally { libraryPollPending = false; }
     }, 2000);
     const playerTimer = window.setInterval(() => {
       if (!nativeReady || !currentTrack || playerLoading) return;
@@ -746,11 +816,14 @@
     }, 250);
     return () => {
       clearInterval(clockTimer);
+      clearInterval(wakeTimer);
       clearInterval(networkTimer);
       clearInterval(transferTimer);
       clearInterval(libraryTimer);
       clearInterval(playerTimer);
       window.removeEventListener('resize', clampTransferPane);
+      window.removeEventListener('focus', foregrounded);
+      document.removeEventListener('visibilitychange', foregrounded);
       stopTransferResize();
       if (nativeReady && currentTrack) invoke<PlaybackStatus>('stop_audio').catch(() => {});
     };

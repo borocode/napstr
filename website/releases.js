@@ -32,14 +32,9 @@
 
   function matchAssets(assets) {
     const safeAssets = assets.filter(validAsset);
-    const dmgs = safeAssets.filter((asset) => /\.dmg$/i.test(asset.name));
-    const macArm = dmgs.find((asset) => /(aarch64|arm64|apple[-_ ]?silicon)/i.test(asset.name));
-    const macIntel = dmgs.find((asset) => /(x64|x86_64|amd64|intel)/i.test(asset.name));
 
     return {
       windows: safeAssets.find((asset) => /\.exe$/i.test(asset.name)),
-      'mac-arm': macArm || (dmgs.length === 1 ? dmgs[0] : null),
-      'mac-intel': macIntel || (dmgs.length === 1 ? dmgs[0] : null),
       linux: safeAssets.find((asset) => /\.appimage$/i.test(asset.name))
     };
   }
@@ -92,7 +87,7 @@
         .filter(([platform, asset]) => enableLinks(platform, asset))
         .map(([platform]) => platform);
 
-      if (available.length === 4) {
+      if (available.length === 2) {
         status.textContent = `Napstr ${version} downloads are ready.`;
       } else {
         status.textContent = `Napstr ${version} is published, but one or more installers are still uploading.`;

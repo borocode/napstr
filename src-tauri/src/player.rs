@@ -1,16 +1,16 @@
-use crate::{audio, hash_file, open_db, playable_audio_path, AppState};
+use crate::{audio, hash_file, open_connection, playable_audio_path, AppState};
 use rodio::{Decoder, DeviceSinkBuilder, MixerDeviceSink, Player, Source};
 use std::{
     fs::File,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 use tauri::State;
 
-#[derive(Default)]
 pub struct NativePlayer {
     inner: Mutex<NativePlayerState>,
+    stream_error: Arc<Mutex<Option<String>>>,
 }
 
 #[derive(Default)]
@@ -29,84 +29,160 @@ pub struct PlaybackStatus {
     duration: f64,
     playing: bool,
     ended: bool,
+    error: String,
 }
 
-impl NativePlayerState {
-    fn status(&self) -> PlaybackStatus {
-        let ended = self
-            .player
-            .as_ref()
-            .map(|player| player.empty())
-            .unwrap_or(false);
+impl Default for NativePlayer {
+    fn default() -> Self {
+        Self {
+            inner: Mutex::new(NativePlayerState::default()),
+            stream_error: Arc::new(Mutex::new(None)),
+        }
+    }
+}
+
+impl NativePlayer {
+    fn status_for(&self, native: &NativePlayerState) -> PlaybackStatus {
+        let error = self
+            .stream_error
+            .lock()
+            .ok()
+            .and_then(|error| error.clone())
+            .unwrap_or_default();
+        let ended = error.is_empty()
+            && native
+                .player
+                .as_ref()
+                .map(|player| player.empty())
+                .unwrap_or(false);
         PlaybackStatus {
-            file_id: self.file_id.clone().unwrap_or_default(),
-            current_time: self
+            file_id: native.file_id.clone().unwrap_or_default(),
+            current_time: native
                 .player
                 .as_ref()
                 .map(|player| player.get_pos().as_secs_f64())
                 .unwrap_or(0.0)
-                .min(self.duration),
-            duration: self.duration,
-            playing: self
-                .player
-                .as_ref()
-                .map(|player| !player.is_paused() && !player.empty())
-                .unwrap_or(false),
+                .min(native.duration),
+            duration: native.duration,
+            playing: error.is_empty()
+                && native
+                    .player
+                    .as_ref()
+                    .map(|player| !player.is_paused() && !player.empty())
+                    .unwrap_or(false),
             ended,
+            error,
+        }
+    }
+
+    fn open_output(&self) -> Result<MixerDeviceSink, String> {
+        if let Ok(mut error) = self.stream_error.lock() {
+            *error = None;
+        }
+        let stream_error = self.stream_error.clone();
+        let builder = match DeviceSinkBuilder::from_default_device() {
+            Ok(builder) => builder,
+            Err(primary_error) => {
+                let mut output = DeviceSinkBuilder::open_default_sink().map_err(|fallback_error| {
+                    format!(
+                        "could not find a usable system audio output: {primary_error}; fallback: {fallback_error}"
+                    )
+                })?;
+                output.log_on_drop(false);
+                return Ok(output);
+            }
+        }
+        .with_error_callback(move |error| {
+                if let Ok(mut current) = stream_error.lock() {
+                    *current = Some(format!("system audio stream failed: {error}"));
+                }
+            });
+        let mut output = match builder.open_sink_or_fallback() {
+            Ok(output) => output,
+            Err(primary_error) => DeviceSinkBuilder::open_default_sink().map_err(
+                |fallback_error| {
+                    format!(
+                        "could not open a usable system audio output: {primary_error}; fallback: {fallback_error}"
+                    )
+                },
+            )?,
+        };
+        output.log_on_drop(false);
+        Ok(output)
+    }
+
+    fn play(&self, db_path: &Path, file_id: String, volume: f32) -> Result<PlaybackStatus, String> {
+        let connection = open_connection(db_path)?;
+        let path = playable_audio_path(&connection, &file_id)?;
+        let path = validated_path(&file_id, &path)?;
+        let file = File::open(&path)
+            .map_err(|error| format!("could not open this track for playback: {error}"))?;
+        let decoder = Decoder::try_from(file)
+            .map_err(|error| format!("could not decode this validated audio file: {error}"))?;
+        let duration = decoder
+            .total_duration()
+            .map(|duration| duration.as_secs_f64())
+            .unwrap_or(0.0);
+
+        let mut native = self
+            .inner
+            .lock()
+            .map_err(|_| "audio player lock poisoned")?;
+
+        // Tear down the previous stream before opening the next one. This lets
+        // Windows reacquire WASAPI after device changes and lets every desktop
+        // recover from an audio handle invalidated by suspend/resume.
+        if let Some(previous) = native.player.take() {
+            previous.stop();
+        }
+        native.output.take();
+        let output = self.open_output()?;
+        let player = Player::connect_new(output.mixer());
+        player.set_volume(volume.clamp(0.0, 1.0));
+        player.append(decoder);
+        player.play();
+
+        native.output = Some(output);
+        native.player = Some(player);
+        native.file_id = Some(file_id);
+        native.duration = duration;
+        Ok(self.status_for(&native))
+    }
+
+    pub fn reset_after_sleep(&self) {
+        if let Ok(mut native) = self.inner.lock() {
+            if let Some(player) = native.player.take() {
+                player.stop();
+            }
+            native.output.take();
+            native.file_id = None;
+            native.duration = 0.0;
+        }
+        if let Ok(mut error) = self.stream_error.lock() {
+            *error = None;
         }
     }
 }
 
 #[tauri::command]
-pub fn play_audio(
+pub async fn play_audio(
     file_id: String,
     volume: f32,
     state: State<'_, AppState>,
 ) -> Result<PlaybackStatus, String> {
     validate_file_id(&file_id)?;
-    let connection = open_db(&state)?;
-    let path = playable_audio_path(&connection, &file_id)?;
-    let path = validated_path(&file_id, &path)?;
-    let file = File::open(&path)
-        .map_err(|error| format!("could not open this track for playback: {error}"))?;
-    let decoder = Decoder::try_from(file)
-        .map_err(|error| format!("could not decode this validated audio file: {error}"))?;
-    let duration = decoder
-        .total_duration()
-        .map(|duration| duration.as_secs_f64())
-        .unwrap_or(0.0);
-
-    let mut native = state
-        .player
-        .inner
+    if !volume.is_finite() {
+        return Err("invalid playback volume".into());
+    }
+    let db_path = state
+        .db_path
         .lock()
-        .map_err(|_| "audio player lock poisoned")?;
-
-    // Keep exactly one device stream for the lifetime of the app. Opening the
-    // next stream before dropping the previous one can leave the new stream
-    // silent on exclusive or compatibility audio devices.
-    if native.output.is_none() {
-        let mut output = DeviceSinkBuilder::open_default_sink()
-            .map_err(|error| format!("could not open the system audio output: {error}"))?;
-        output.log_on_drop(false);
-        native.output = Some(output);
-    }
-    if let Some(previous) = native.player.take() {
-        previous.stop();
-    }
-    let output = native
-        .output
-        .as_ref()
-        .ok_or_else(|| "the audio output was not initialised".to_string())?;
-    let player = Player::connect_new(output.mixer());
-    player.set_volume(volume.clamp(0.0, 1.0));
-    player.append(decoder);
-    player.play();
-
-    native.player = Some(player);
-    native.file_id = Some(file_id);
-    native.duration = duration;
-    Ok(native.status())
+        .map_err(|_| "database lock poisoned")?
+        .clone();
+    let player = state.player.clone();
+    tauri::async_runtime::spawn_blocking(move || player.play(&db_path, file_id, volume))
+        .await
+        .map_err(|error| format!("audio worker stopped unexpectedly: {error}"))?
 }
 
 #[tauri::command]
@@ -125,7 +201,7 @@ pub fn toggle_audio(state: State<'_, AppState>) -> Result<PlaybackStatus, String
     } else {
         player.pause();
     }
-    Ok(native.status())
+    Ok(state.player.status_for(&native))
 }
 
 #[tauri::command]
@@ -141,7 +217,7 @@ pub fn stop_audio(state: State<'_, AppState>) -> Result<PlaybackStatus, String> 
             .try_seek(Duration::ZERO)
             .map_err(|error| format!("could not rewind this track: {error}"))?;
     }
-    Ok(native.status())
+    Ok(state.player.status_for(&native))
 }
 
 #[tauri::command]
@@ -161,7 +237,7 @@ pub fn seek_audio(seconds: f64, state: State<'_, AppState>) -> Result<PlaybackSt
     player
         .try_seek(Duration::from_secs_f64(seconds.min(native.duration)))
         .map_err(|error| format!("could not seek in this track: {error}"))?;
-    Ok(native.status())
+    Ok(state.player.status_for(&native))
 }
 
 #[tauri::command]
@@ -177,7 +253,7 @@ pub fn set_audio_volume(volume: f32, state: State<'_, AppState>) -> Result<Playb
     if let Some(player) = native.player.as_ref() {
         player.set_volume(volume.clamp(0.0, 1.0));
     }
-    Ok(native.status())
+    Ok(state.player.status_for(&native))
 }
 
 #[tauri::command]
@@ -187,7 +263,7 @@ pub fn audio_status(state: State<'_, AppState>) -> Result<PlaybackStatus, String
         .inner
         .lock()
         .map_err(|_| "audio player lock poisoned")?;
-    Ok(native.status())
+    Ok(state.player.status_for(&native))
 }
 
 fn validate_file_id(file_id: &str) -> Result<(), String> {

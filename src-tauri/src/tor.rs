@@ -36,6 +36,7 @@ pub struct TorManager {
     resource_dir: PathBuf,
     runtime: Mutex<Option<RunningTor>>,
     starting: AtomicBool,
+    cancel_start: AtomicBool,
     bootstrap_progress: AtomicU8,
     last_error: RwLock<String>,
     last_diagnostics: Arc<RwLock<Vec<String>>>,
@@ -68,6 +69,7 @@ impl TorManager {
             resource_dir,
             runtime: Mutex::new(None),
             starting: AtomicBool::new(false),
+            cancel_start: AtomicBool::new(false),
             bootstrap_progress: AtomicU8::new(0),
             last_error: RwLock::new(String::new()),
             last_diagnostics: Arc::new(RwLock::new(Vec::new())),
@@ -76,6 +78,7 @@ impl TorManager {
 
     pub async fn start(&self) -> Result<u16, String> {
         let mut guard = self.runtime.lock().await;
+        self.cancel_start.store(false, Ordering::SeqCst);
         if let Some(runtime) = guard.as_mut() {
             if runtime
                 .child
@@ -147,6 +150,10 @@ impl TorManager {
             }
             let mut ready = None;
             for _ in 0..480 {
+                if self.cancel_start.load(Ordering::SeqCst) {
+                    let _ = child.start_kill();
+                    return Err("Tor startup was cancelled for network recovery".into());
+                }
                 if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
                     sleep(Duration::from_millis(50)).await;
                     let diagnostic = useful_diagnostic(&self.last_diagnostics.read().await);
@@ -232,11 +239,21 @@ impl TorManager {
     }
 
     pub async fn stop(&self) {
+        self.cancel_start.store(true, Ordering::SeqCst);
         if let Some(mut runtime) = self.runtime.lock().await.take() {
             let _ = runtime.child.start_kill();
-            let _ = runtime.child.wait().await;
+            let _ = timeout(Duration::from_secs(5), runtime.child.wait()).await;
             let _ = fs::remove_dir_all(runtime.data_dir).await;
         }
+    }
+
+    pub async fn restart(&self) -> Result<u16, String> {
+        // Keep status in "starting" throughout the handover so the regular
+        // health poll cannot launch a competing Tor process between stop/start.
+        self.starting.store(true, Ordering::SeqCst);
+        self.cancel_start.store(true, Ordering::SeqCst);
+        self.stop().await;
+        self.start().await
     }
 
     pub async fn status(&self) -> TorStatus {

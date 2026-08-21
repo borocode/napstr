@@ -59,14 +59,12 @@ cd src-tauri && cargo test
 
 The Rust tests cover deterministic file hashing, verified whole-file transfer, protocol framing, NIP-17/NIP-44/NIP-59 gift-wrap confidentiality, and rejection of incorrect transfer capabilities. An ignored live test exercises Tor bootstrap, `ADD_ONION`, SOCKS transfer, and teardown against the real Tor network; the release transport was also validated with the pinned Linux expert bundle.
 
-## Build AppImage, EXE, and DMG installers
+## Build AppImage, DEB, and EXE installers
 
 Release packages include a pinned official Tor Expert Bundle (version 15.0.20) whose SHA-256 is verified before packaging. The GitHub release workflow prepares the correct bundle and builds:
 
 - Linux x86-64: `.AppImage` and `.deb`
 - Windows x86-64: NSIS setup `.exe`
-- macOS Intel: `.dmg`
-- macOS Apple Silicon: `.dmg`
 
 Trigger [the release workflow](.github/workflows/release.yml) manually, or push a version tag such as `v0.1.0`. Tagged outputs are attached to a draft GitHub release.
 
@@ -76,7 +74,7 @@ Tauri packages must be produced on their target operating system. For a local pa
 npm run bundle
 ```
 
-Unsigned builds can trigger operating-system warnings. Public distribution requires Apple Developer ID signing/notarization and a Windows code-signing certificate.
+Unsigned builds can trigger operating-system warnings. Public distribution requires a Windows code-signing certificate.
 
 ## Implemented architecture
 

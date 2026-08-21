@@ -7,7 +7,10 @@ use std::{
     fs::{self, File},
     io::{BufReader, Read, Seek},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
 };
 use tauri::{Manager, State};
 use walkdir::WalkDir;
@@ -28,7 +31,8 @@ struct AppState {
     network: Arc<network::NetworkService>,
     tor: Arc<tor::TorManager>,
     watcher: Mutex<Option<FolderWatcher>>,
-    player: player::NativePlayer,
+    player: Arc<player::NativePlayer>,
+    recovering_after_sleep: Arc<AtomicBool>,
 }
 
 struct ShutdownServices {
@@ -915,6 +919,40 @@ async fn network_status(state: State<'_, AppState>) -> Result<network::NetworkSt
     Ok(status)
 }
 
+#[tauri::command]
+fn recover_after_sleep(state: State<'_, AppState>) -> Result<(), String> {
+    if state.recovering_after_sleep.swap(true, Ordering::SeqCst) {
+        return Ok(());
+    }
+
+    let player = state.player.clone();
+    let network = state.network.clone();
+    let tor = state.tor.clone();
+    let recovering = state.recovering_after_sleep.clone();
+    tauri::async_runtime::spawn(async move {
+        let player_reset = tauri::async_runtime::spawn_blocking(move || {
+            player.reset_after_sleep();
+        });
+        let network_recovery = async {
+            let mut result = Err("Nostr reconnection did not start".to_string());
+            for attempt in 0..3 {
+                result = network.restart().await;
+                if result.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(2 + attempt * 3)).await;
+            }
+            result
+        };
+        let (network_result, tor_result, _) =
+            tokio::join!(network_recovery, tor.restart(), player_reset);
+        let _ = network_result;
+        let _ = tor_result;
+        recovering.store(false, Ordering::SeqCst);
+    });
+    Ok(())
+}
+
 fn apply_tor_status(status: &mut network::NetworkStatus, tor: tor::TorStatus) {
     status.tor_running = tor.running;
     status.tor_starting = tor.starting;
@@ -1076,7 +1114,8 @@ pub fn run() {
                 network,
                 tor,
                 watcher: Mutex::new(watcher),
-                player: player::NativePlayer::default(),
+                player: Arc::new(player::NativePlayer::default()),
+                recovering_after_sleep: Arc::new(AtomicBool::new(false)),
             });
             Ok(())
         })
@@ -1099,6 +1138,7 @@ pub fn run() {
             cancel_transfer,
             start_network,
             network_status,
+            recover_after_sleep,
             publish_catalogue,
             publish_profile,
             network_search,

@@ -288,8 +288,6 @@ footer em { display: block; }
 .download-option .version { margin-bottom: 16px; font-size: 13px; line-height: 14px; }
 .download-link { display: inline-block; margin-top: -5px; font-size: 16px; font-weight: bold; }
 .release-link[aria-disabled="true"] { color: #666; cursor: wait; pointer-events: none; }
-.asset-separator { color: #777; }
-.download-option.linux { grid-column: 1 / -1; max-width: 205px; }
 
 .download-note {
   margin-top: 18px;

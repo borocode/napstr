@@ -11,12 +11,12 @@ use std::{
     path::PathBuf,
     str::FromStr,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
     time::Duration,
 };
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
 pub const CATALOGUE_KIND: u16 = 30421;
@@ -121,7 +121,9 @@ pub struct NetworkService {
     transfers: Arc<TransferService>,
     client: RwLock<Option<Client>>,
     keys: RwLock<Option<Keys>>,
+    start_lock: Mutex<()>,
     connected: AtomicBool,
+    generation: AtomicU64,
     last_error: RwLock<String>,
 }
 
@@ -132,7 +134,9 @@ impl NetworkService {
             transfers,
             client: RwLock::new(None),
             keys: RwLock::new(None),
+            start_lock: Mutex::new(()),
             connected: AtomicBool::new(false),
+            generation: AtomicU64::new(0),
             last_error: RwLock::new(String::new()),
         })
     }
@@ -142,6 +146,7 @@ impl NetworkService {
     }
 
     pub async fn start(self: &Arc<Self>) -> Result<NetworkStatus, String> {
+        let _start_guard = self.start_lock.lock().await;
         if self.connected.load(Ordering::SeqCst) {
             return self.status().await;
         }
@@ -184,6 +189,7 @@ impl NetworkService {
             .map_err(|error| format!("NIP-17 inbox subscription failed: {error}"))?;
         *self.client.write().await = Some(client.clone());
         *self.keys.write().await = Some(keys);
+        let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         self.connected.store(true, Ordering::SeqCst);
         *self.last_error.write().await = String::new();
 
@@ -224,17 +230,23 @@ impl NetworkService {
                 })
                 .await;
             if let Err(error) = result {
-                service.connected.store(false, Ordering::SeqCst);
-                *service.last_error.write().await = error.to_string();
+                if service.generation.load(Ordering::SeqCst) == generation {
+                    service.connected.store(false, Ordering::SeqCst);
+                    *service.last_error.write().await = error.to_string();
+                }
             }
         });
 
         self.publish_catalogue().await?;
         let heartbeat = self.clone();
         tokio::spawn(async move {
-            while heartbeat.connected.load(Ordering::SeqCst) {
+            while heartbeat.connected.load(Ordering::SeqCst)
+                && heartbeat.generation.load(Ordering::SeqCst) == generation
+            {
                 tokio::time::sleep(Duration::from_secs(240)).await;
-                if heartbeat.connected.load(Ordering::SeqCst) {
+                if heartbeat.connected.load(Ordering::SeqCst)
+                    && heartbeat.generation.load(Ordering::SeqCst) == generation
+                {
                     let _ = heartbeat.publish_availability().await;
                 }
             }
@@ -243,10 +255,22 @@ impl NetworkService {
     }
 
     pub async fn stop(&self) {
-        if let Some(client) = self.client.write().await.take() {
-            client.disconnect().await;
-        }
         self.connected.store(false, Ordering::SeqCst);
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        if let Some(client) = self.client.write().await.take() {
+            let _ = tokio::time::timeout(Duration::from_secs(3), client.disconnect()).await;
+        }
+    }
+
+    pub async fn restart(self: &Arc<Self>) -> Result<NetworkStatus, String> {
+        self.stop().await;
+        match self.start().await {
+            Ok(status) => Ok(status),
+            Err(error) => {
+                *self.last_error.write().await = error.clone();
+                Err(error)
+            }
+        }
     }
 
     pub async fn status(&self) -> Result<NetworkStatus, String> {
