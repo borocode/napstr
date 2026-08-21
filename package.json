@@ -9,6 +9,7 @@
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
     "tauri": "tauri",
     "desktop": "tauri dev",
+    "prebundle": "node scripts/prepare-tor-bundle.mjs",
     "bundle": "tauri build",
     "appimage:build": "bash scripts/build-appimage-local.sh build",
     "appimage:run": "bash scripts/build-appimage-local.sh launch",

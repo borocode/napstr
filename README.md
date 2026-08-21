@@ -28,24 +28,14 @@ brew install tor
 NAPSTR_TOR_PATH="$(command -v tor)" npm run desktop
 ```
 
-To create a package for the operating system you are building on, run:
+To create a package for your operating system with Tor included, run:
 
 ```bash
 npm run bundle
 ```
 
-Packaging with Tor included requires running `scripts/prepare-tor.sh` first,
-using the matching platform URL and checksum from the release workflow.
-
-## Verify
-
-```bash
-npm run check
-npm run build
-cd src-tauri && cargo test
-```
-
-The Rust tests cover deterministic file hashing, verified whole-file transfer, protocol framing, NIP-17/NIP-44/NIP-59 gift-wrap confidentiality, and rejection of incorrect transfer capabilities. An ignored live test exercises Tor bootstrap, `ADD_ONION`, SOCKS transfer, and teardown against the real Tor network; the release transport was also validated with the pinned Linux expert bundle.
+Napstr automatically downloads and verifies the pinned official Tor Expert
+Bundle for your platform before building.
 
 ## Build AppImage, DEB, and EXE installers
 
@@ -67,7 +57,7 @@ Unsigned builds can trigger operating-system warnings. Public distribution requi
 
 ## Implemented architecture
 
-- Napstr generates a Nostr identity and stores it in the operating-system keyring.
+- On first launch, Napstr creates a Nostr identity and securely stores its private key using your operating system's credential store.
 - Nostr publishes the searchable catalogue and live seeders; NIP-17 handles private download negotiation.
 - A bundled Tor process carries transfers without a direct-IP fallback.
 - One recursively watched folder contains both downloads and shared audio.
