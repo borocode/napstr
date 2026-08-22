@@ -1,16 +1,18 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, tick } from 'svelte';
+  import { getVersion } from '@tauri-apps/api/app';
   import { invoke } from '@tauri-apps/api/core';
+  import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import { getCurrentWindow } from '@tauri-apps/api/window';
   import { open } from '@tauri-apps/plugin-dialog';
-  import packageInfo from '../../package.json';
 
-  const appVersion = packageInfo.version;
+  let appVersion = '…';
   const SEARCH_PAGE_SIZE = 100;
   const VISIBLE_SEEDER_LIMIT = 100;
 
-  type View = 'Search' | 'Downloads' | 'Shared' | 'Profile' | 'Settings';
+  type View = 'Search' | 'Downloads' | 'Shared' | 'Profile' | 'Settings' | 'Trollbox';
   type PlayerMode = 'single' | 'folder' | 'all';
+  type PlayerOrigin = 'search' | 'downloads' | 'shared' | 'direct';
   type WindowResizeDirection = 'East' | 'North' | 'NorthEast' | 'NorthWest' | 'South' | 'SouthEast' | 'SouthWest' | 'West';
   type Result = {
     id: number;
@@ -27,6 +29,7 @@
     album?: string;
     license?: string;
     description?: string;
+    tags?: string;
   };
   type SourceDetail = { pubkey: string; npub: string; displayName: string; relay: string; about: string; picture: string; eventId: string };
   type Transfer = {
@@ -45,7 +48,8 @@
     { label: 'Downloads', icon: '⇩' },
     { label: 'Shared', icon: '▤' },
     { label: 'Profile', icon: '☺' },
-    { label: 'Settings', icon: '⚙' }
+    { label: 'Settings', icon: '⚙' },
+    { label: 'Trollbox', icon: '▣' }
   ];
 
   type NativeFile = { fileId: string; filename: string; path: string; folder: string; size: number; format: string; status: string; title: string; artist: string; album: string; mime: string; license: string; description: string; tags: string };
@@ -56,6 +60,9 @@
   type NetworkResult = { fileId: string; filename: string; title: string; artist: string; album: string; format: string; mime: string; size: number; license: string; description: string; tags: string; sources: SourceDetail[] };
   type PlayerTrack = { fileId: string; name: string; folder: string; artist: string; mime: string };
   type PlaybackStatus = { fileId: string; currentTime: number; duration: number; playing: boolean; ended: boolean; error: string };
+  type ReleaseStatus = { version: string; url: string };
+  type GitHubRelease = { tag_name?: unknown; html_url?: unknown };
+  type TrollboxMessage = { eventId: string; pubkey: string; npub: string; displayName: string; content: string; createdAt: number };
   type BlockConfirmation =
     | { kind: 'file'; fileId: string; label: string }
     | { kind: 'user'; pubkey: string; label: string };
@@ -95,10 +102,34 @@
   let identityNpub = '';
   let networkError = '';
   let networkConnectPending = false;
+  let newRelease: ReleaseStatus | null = null;
+  let trollboxMessages: TrollboxMessage[] = [];
+  let trollboxDraft = '';
+  let trollboxLoading = false;
+  let trollboxSending = false;
+  let trollboxError = '';
+  let trollboxPollPending = false;
+  let trollboxRefreshAgain = false;
+  let trollboxLog: HTMLDivElement;
+  let trackDiscussionFileId = '';
+  let trackDiscussionMessages: TrollboxMessage[] = [];
+  let trackDiscussionDraft = '';
+  let trackDiscussionLoading = false;
+  let trackDiscussionSending = false;
+  let trackDiscussionError = '';
+  let trackDiscussionPollPending = false;
+  let trackDiscussionRefreshAgain = false;
+  let trackDiscussionLog: HTMLDivElement;
+  let searchAction: 'search' | 'surprise' | null = null;
+  let rescanPending = false;
   let selectedSource = 0;
   let selectedShared: NativeFile | null = null;
+  let selectedTagFile: NativeFile | null = null;
+  let tagDraft = '';
+  let tagSaving = false;
   let libraryFolderView = '*';
   let playerMode: PlayerMode = 'single';
+  let playerOrigin: PlayerOrigin = 'direct';
   let playerQueue: PlayerTrack[] = [];
   let playerQueueIndex = -1;
   let currentTrack: PlayerTrack | null = null;
@@ -125,7 +156,7 @@
   function mapFiles(files: NativeFile[]): Result[] {
     return files.map((file, index) => ({
       id: index + 1, name: file.filename, format: file.format, size: readableSize(file.size), sources: 1,
-      speed: 'Local', length: '—', fileId: file.fileId, artist: file.artist, album: file.album, license: file.license, description: file.description
+      speed: 'Local', length: '—', fileId: file.fileId, artist: file.artist, album: file.album, license: file.license, description: file.description, tags: file.tags
     }));
   }
 
@@ -137,7 +168,7 @@
         id: index + 1, name: file.title || file.filename, format: file.format, size: readableSize(file.size),
         sources: file.sources.length, speed: local ? 'Local' : 'Tor', length: '—', fileId: file.fileId,
         sourceDetails: file.sources, remote: !local, artist: file.artist, album: file.album,
-        license: file.license, description: file.description
+        license: file.license, description: file.description, tags: file.tags
       };
     });
   }
@@ -151,6 +182,25 @@
     if (!match) return Number.POSITIVE_INFINITY;
     const units: Record<string, number> = { B: 1, KB: 1024, MB: 1024 ** 2, GB: 1024 ** 3, TB: 1024 ** 4 };
     return Number(match[1]) * units[(match[2] || 'B').toUpperCase()];
+  }
+
+  function eligibleNetworkMatches(matches: NetworkResult[]) {
+    return matches.filter((item) =>
+      item.sources.length >= minimumSources
+      && item.size <= maximumBytes()
+      && matchesType(item.mime, item.format)
+    );
+  }
+
+  function shuffled<T>(items: T[]) {
+    const copy = [...items];
+    for (let index = copy.length - 1; index > 0; index -= 1) {
+      const random = new Uint32Array(1);
+      window.crypto.getRandomValues(random);
+      const swapIndex = random[0] % (index + 1);
+      [copy[index], copy[swapIndex]] = [copy[swapIndex], copy[index]];
+    }
+    return copy;
   }
 
   function isActiveTransfer(transfer: Transfer) {
@@ -214,8 +264,7 @@
 
   function changeResultPage(nextPage: number) {
     resultPage = Math.max(0, Math.min(nextPage, resultPageCount() - 1));
-    selected = paginatedResults()[0] ?? null;
-    selectedSource = 0;
+    selectResult(paginatedResults()[0] ?? null);
   }
 
   function toPlayerTrack(file: NativeFile): PlayerTrack {
@@ -228,18 +277,85 @@
     };
   }
 
+  function selectTagFile(file: NativeFile) {
+    selectedTagFile = { ...file };
+    tagDraft = file.tags;
+  }
+
+  async function saveTags() {
+    if (!nativeReady || !selectedTagFile || tagSaving) return;
+    const fileId = selectedTagFile.fileId;
+    tagSaving = true;
+    try {
+      applySnapshot(await invoke<Snapshot>('save_file_tags', { fileId, tags: tagDraft }));
+      selectedTagFile = sharedFiles.find((file) => file.fileId === fileId) ?? null;
+      tagDraft = selectedTagFile?.tags ?? '';
+      activityMessage = 'Tags saved locally';
+      if (networkConnected) {
+        try {
+          await invoke('publish_catalogue');
+          activityMessage = 'Tags saved and published to Nostr';
+        } catch (error) {
+          activityMessage = `Tags saved locally · Nostr publication will retry later: ${String(error)}`;
+        }
+      }
+    } catch (error) {
+      activityMessage = `Could not save tags: ${String(error)}`;
+    } finally {
+      tagSaving = false;
+    }
+  }
+
   function sortedLibraryTracks() {
     return sharedFiles
       .map(toPlayerTrack)
       .sort((left, right) => left.folder.localeCompare(right.folder) || left.name.localeCompare(right.name));
   }
 
-  function queueForTrack(track: PlayerTrack, mode: PlayerMode) {
+  function contextualPlayerQueue(track: PlayerTrack, origin: PlayerOrigin) {
+    let queue: PlayerTrack[] = [];
+    if (origin === 'downloads') {
+      queue = sharedFiles.map(toPlayerTrack);
+    } else if (origin === 'search') {
+      queue = results
+        .filter((result) => isLocalFile(result.fileId))
+        .flatMap((result) => {
+          const file = sharedFiles.find((item) => item.fileId === result.fileId);
+          return file ? [toPlayerTrack(file)] : [];
+        });
+    } else if (origin === 'shared') {
+      queue = visibleSharedFiles().map(toPlayerTrack);
+    }
+    return queue.some((item) => item.fileId === track.fileId) ? queue : [track];
+  }
+
+  function queueForTrack(track: PlayerTrack, mode: PlayerMode, origin: PlayerOrigin = playerOrigin) {
     const library = sortedLibraryTracks();
     if (!library.some((item) => item.fileId === track.fileId)) return [track];
+    const contextualQueue = contextualPlayerQueue(track, origin);
+    if (origin !== 'direct') {
+      if (mode === 'folder') return contextualQueue.filter((item) => item.folder === track.folder);
+      return contextualQueue;
+    }
     if (mode === 'all') return library;
     if (mode === 'folder') return library.filter((item) => item.folder === track.folder);
     return [track];
+  }
+
+  function selectPlayingTrack(track: PlayerTrack) {
+    if (playerOrigin === 'search') {
+      const index = results.findIndex((item) => item.fileId === track.fileId);
+      if (index >= 0) {
+        resultPage = Math.floor(index / SEARCH_PAGE_SIZE);
+        selectResult(results[index]);
+      }
+    } else if (playerOrigin === 'downloads') {
+      const file = sharedFiles.find((item) => item.fileId === track.fileId);
+      if (file) selectTagFile(file);
+    } else if (playerOrigin === 'shared') {
+      const file = sharedFiles.find((item) => item.fileId === track.fileId);
+      if (file) selectedShared = { ...file };
+    }
   }
 
   function formatPlayerTime(seconds: number) {
@@ -254,6 +370,7 @@
     playerLoading = true;
     playerQueueIndex = index;
     currentTrack = track;
+    selectPlayingTrack(track);
     playerCurrentTime = 0;
     playerDuration = 0;
     playerEnded = false;
@@ -270,22 +387,24 @@
     }
   }
 
-  async function playAudio(fileId: string, name: string, mode: PlayerMode = playerMode) {
+  async function playAudio(fileId: string, name: string, mode: PlayerMode = playerMode, origin: PlayerOrigin = 'direct') {
     if (!nativeReady || !fileId) return;
     const indexed = sharedFiles.find((file) => file.fileId === fileId);
     const track = indexed
       ? toPlayerTrack(indexed)
       : { fileId, name, folder: '', artist: '', mime: '' };
+    playerOrigin = origin;
     playerMode = indexed ? mode : 'single';
-    playerQueue = queueForTrack(track, playerMode);
+    playerQueue = queueForTrack(track, playerMode, playerOrigin);
     const index = Math.max(0, playerQueue.findIndex((item) => item.fileId === fileId));
     await loadPlayerTrack(index);
   }
 
   async function togglePlayer() {
     if (!currentTrack) {
-      if (selectedShared) await playAudio(selectedShared.fileId, selectedShared.filename);
-      else if (selected && isLocalFile(selected.fileId)) await playAudio(selected.fileId, selected.name);
+      if (activeView === 'Downloads' && selectedTagFile) await playAudio(selectedTagFile.fileId, selectedTagFile.filename, playerMode, 'downloads');
+      else if (activeView === 'Shared' && selectedShared) await playAudio(selectedShared.fileId, selectedShared.filename, playerMode, 'shared');
+      else if (activeView === 'Search' && selected && isLocalFile(selected.fileId)) await playAudio(selected.fileId, selected.name, playerMode, 'search');
       else activityMessage = 'Select a local song to play';
       return;
     }
@@ -329,7 +448,7 @@
   function changePlayerMode() {
     window.localStorage.setItem('napstr-player-mode', playerMode);
     if (!currentTrack) return;
-    playerQueue = queueForTrack(currentTrack, playerMode);
+    playerQueue = queueForTrack(currentTrack, playerMode, playerOrigin);
     playerQueueIndex = Math.max(0, playerQueue.findIndex((item) => item.fileId === currentTrack?.fileId));
   }
 
@@ -400,6 +519,210 @@
     try { applySnapshot(await invoke<Snapshot>('get_snapshot')); } catch { nativeReady = false; }
   }
 
+  function parseSemver(value: string) {
+    const match = value.trim().match(/^v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/);
+    if (!match) return null;
+    return { numbers: match.slice(1, 4).map(Number), prerelease: match[4]?.split('.') ?? [] };
+  }
+
+  function compareSemver(leftValue: string, rightValue: string) {
+    const left = parseSemver(leftValue);
+    const right = parseSemver(rightValue);
+    if (!left || !right) return 0;
+    for (let index = 0; index < 3; index += 1) {
+      if (left.numbers[index] !== right.numbers[index]) return left.numbers[index] > right.numbers[index] ? 1 : -1;
+    }
+    if (!left.prerelease.length || !right.prerelease.length) {
+      return left.prerelease.length === right.prerelease.length ? 0 : left.prerelease.length ? -1 : 1;
+    }
+    const length = Math.max(left.prerelease.length, right.prerelease.length);
+    for (let index = 0; index < length; index += 1) {
+      const leftPart = left.prerelease[index];
+      const rightPart = right.prerelease[index];
+      if (leftPart === undefined || rightPart === undefined) return leftPart === undefined ? -1 : 1;
+      if (leftPart === rightPart) continue;
+      const leftNumber = /^\d+$/.test(leftPart) ? Number(leftPart) : null;
+      const rightNumber = /^\d+$/.test(rightPart) ? Number(rightPart) : null;
+      if (leftNumber !== null && rightNumber !== null) return leftNumber > rightNumber ? 1 : -1;
+      if (leftNumber !== null || rightNumber !== null) return leftNumber !== null ? -1 : 1;
+      return leftPart > rightPart ? 1 : -1;
+    }
+    return 0;
+  }
+
+  function validNapstrReleaseUrl(value: unknown): value is string {
+    return typeof value === 'string' && /^https:\/\/github\.com\/lnbits\/napstr\/releases\/tag\/[0-9A-Za-z._+-]{1,100}$/.test(value);
+  }
+
+  async function checkForNewRelease() {
+    const cacheKey = 'napstr-latest-release';
+    let cachedRelease: GitHubRelease | null = null;
+    let release: GitHubRelease | null = null;
+    try {
+      const cached = JSON.parse(window.localStorage.getItem(cacheKey) ?? 'null') as { checkedAt?: number; release?: GitHubRelease | null } | null;
+      cachedRelease = cached?.release ?? null;
+    } catch { /* ignore invalid old cache data */ }
+    try {
+      const response = await fetch('https://api.github.com/repos/lnbits/napstr/releases/latest', {
+        headers: { Accept: 'application/vnd.github+json' }
+      });
+      if (!response.ok) throw new Error(`GitHub returned ${response.status}`);
+      release = await response.json() as GitHubRelease;
+      window.localStorage.setItem(cacheKey, JSON.stringify({ checkedAt: Date.now(), release }));
+    } catch { release = cachedRelease; }
+    if (typeof release?.tag_name !== 'string' || !validNapstrReleaseUrl(release.html_url)) return;
+    if (compareSemver(release.tag_name, appVersion) > 0) {
+      newRelease = { version: release.tag_name.replace(/^v/, ''), url: release.html_url };
+    }
+  }
+
+  async function openNewRelease() {
+    if (!newRelease) return;
+    try {
+      await invoke('open_release_url', { url: newRelease.url });
+    } catch (error) {
+      activityMessage = `Could not open the release page: ${String(error)}`;
+    }
+  }
+
+  function chatNameColor(npub: string) {
+    const colours = ['#0000b8', '#006400', '#8b008b', '#a00020', '#005f73', '#7a3e00', '#4b0082', '#006b3c', '#9b1c00', '#0047ab', '#7030a0', '#007070'];
+    let hash = 2166136261;
+    for (let index = 0; index < npub.length; index += 1) {
+      hash ^= npub.charCodeAt(index);
+      hash = Math.imul(hash, 16777619);
+    }
+    return colours[(hash >>> 0) % colours.length];
+  }
+
+  async function refreshTrollbox() {
+    if (!nativeReady || !networkConnected) return;
+    if (trollboxPollPending) {
+      trollboxRefreshAgain = true;
+      return;
+    }
+    trollboxPollPending = true;
+    trollboxLoading = trollboxMessages.length === 0;
+    const stayAtBottom = !trollboxLog || trollboxLog.scrollHeight - trollboxLog.scrollTop - trollboxLog.clientHeight < 45;
+    try {
+      const messages = await invoke<TrollboxMessage[]>('get_trollbox_messages');
+      const changed = messages.length !== trollboxMessages.length || messages.at(-1)?.eventId !== trollboxMessages.at(-1)?.eventId;
+      trollboxMessages = messages;
+      trollboxError = '';
+      if (changed && stayAtBottom) {
+        await tick();
+        trollboxLog?.scrollTo({ top: trollboxLog.scrollHeight });
+      }
+    } catch (error) {
+      trollboxError = String(error);
+    } finally {
+      trollboxLoading = false;
+      trollboxPollPending = false;
+      if (trollboxRefreshAgain) {
+        trollboxRefreshAgain = false;
+        void refreshTrollbox();
+      }
+    }
+  }
+
+  function activateView(view: View) {
+    activeView = view;
+    if (view === 'Trollbox') void refreshTrollbox();
+  }
+
+  async function sendTrollboxMessage() {
+    const content = trollboxDraft.trim();
+    if (!content || trollboxSending || !networkConnected) return;
+    trollboxSending = true;
+    trollboxError = '';
+    try {
+      await invoke('send_trollbox_message', { content });
+      trollboxDraft = '';
+      await refreshTrollbox();
+    } catch (error) {
+      trollboxError = String(error);
+    } finally {
+      trollboxSending = false;
+    }
+  }
+
+  function blockTrollboxUser(message: TrollboxMessage) {
+    if (!nativeReady || message.npub === identityNpub) return;
+    blockConfirmation = { kind: 'user', pubkey: message.pubkey, label: message.displayName };
+  }
+
+  function selectResult(item: Result | null, forceSubscribe = false) {
+    const changed = selected?.fileId !== item?.fileId;
+    selected = item;
+    selectedSource = 0;
+    if (!item) {
+      trackDiscussionFileId = '';
+      trackDiscussionMessages = [];
+      trackDiscussionDraft = '';
+      trackDiscussionError = '';
+    } else if (changed || forceSubscribe) {
+      void refreshTrackDiscussion(item.fileId, true);
+    }
+  }
+
+  async function refreshTrackDiscussion(fileId = selected?.fileId ?? '', subscribe = false) {
+    if (!fileId || !nativeReady || !networkConnected) return;
+    if (trackDiscussionFileId !== fileId) {
+      trackDiscussionFileId = fileId;
+      trackDiscussionMessages = [];
+      trackDiscussionDraft = '';
+      trackDiscussionError = '';
+      subscribe = true;
+    }
+    if (trackDiscussionPollPending && !subscribe) {
+      trackDiscussionRefreshAgain = true;
+      return;
+    }
+    trackDiscussionPollPending = true;
+    trackDiscussionLoading = trackDiscussionMessages.length === 0;
+    const stayAtBottom = !trackDiscussionLog || trackDiscussionLog.scrollHeight - trackDiscussionLog.scrollTop - trackDiscussionLog.clientHeight < 35;
+    try {
+      const messages = await invoke<TrollboxMessage[]>('get_track_discussion_messages', { fileId, subscribe });
+      if (selected?.fileId !== fileId || trackDiscussionFileId !== fileId) return;
+      const changed = messages.length !== trackDiscussionMessages.length || messages.at(-1)?.eventId !== trackDiscussionMessages.at(-1)?.eventId;
+      trackDiscussionMessages = messages;
+      trackDiscussionError = '';
+      if (changed && stayAtBottom) {
+        await tick();
+        trackDiscussionLog?.scrollTo({ top: trackDiscussionLog.scrollHeight });
+      }
+    } catch (error) {
+      if (selected?.fileId === fileId) trackDiscussionError = String(error);
+    } finally {
+      if (selected?.fileId === fileId) {
+        trackDiscussionLoading = false;
+        trackDiscussionPollPending = false;
+        if (trackDiscussionRefreshAgain) {
+          trackDiscussionRefreshAgain = false;
+          void refreshTrackDiscussion(fileId);
+        }
+      }
+    }
+  }
+
+  async function sendTrackDiscussionMessage() {
+    const fileId = selected?.fileId;
+    const content = trackDiscussionDraft.trim();
+    if (!fileId || !content || trackDiscussionSending || !networkConnected) return;
+    trackDiscussionSending = true;
+    trackDiscussionError = '';
+    try {
+      await invoke('send_track_discussion_message', { fileId, content });
+      if (selected?.fileId !== fileId) return;
+      trackDiscussionDraft = '';
+      await refreshTrackDiscussion(fileId);
+    } catch (error) {
+      if (selected?.fileId === fileId) trackDiscussionError = String(error);
+    } finally {
+      trackDiscussionSending = false;
+    }
+  }
+
   async function refreshLocalLibrary() {
     try {
       const snapshot = await invoke<Snapshot>('get_snapshot');
@@ -408,6 +731,10 @@
       const removedCurrentTrack = currentTrack && !nextFiles.some((file) => file.fileId === currentTrack?.fileId);
       sharedFiles = nextFiles;
       if (selectedShared) selectedShared = nextFiles.find((file) => file.fileId === selectedShared?.fileId) ?? null;
+      if (selectedTagFile && !nextFiles.some((file) => file.fileId === selectedTagFile?.fileId)) {
+        selectedTagFile = null;
+        tagDraft = '';
+      }
       if (removedCurrentTrack) {
         invoke<PlaybackStatus>('stop_audio').catch(() => {});
         currentTrack = null;
@@ -482,35 +809,66 @@
   }
 
   async function search() {
-    searchedQuery = query.trim() || 'All audio';
-    if (networkConnected) {
-      try {
-        const matches = await invoke<NetworkResult[]>('network_search', { query: query.trim() });
-        const ranked = matches
-          .filter((item) => item.sources.length >= minimumSources && item.size <= maximumBytes() && matchesType(item.mime, item.format))
-          .sort((left, right) => right.sources.length - left.sources.length || left.filename.localeCompare(right.filename));
-        results = mapNetworkFiles(ranked);
-        resultsAreNetwork = true;
-        activityMessage = `${results.length} globally aggregated file ID(s), ranked by active seeders`;
-      } catch (error) { activityMessage = `Global search failed: ${String(error)}`; }
-    } else if (nativeReady) {
-      try {
-        const matches = await invoke<NativeFile[]>('search_catalog', { query: query.trim() });
-        results = mapFiles(matches.filter((item) => minimumSources <= 1 && item.size <= maximumBytes() && matchesType(item.mime, item.format)));
-        resultsAreNetwork = false;
-        activityMessage = `${results.length} local match(es) found`;
-      } catch (error) { activityMessage = `Search failed: ${String(error)}`; }
+    if (searchAction) return;
+    searchAction = 'search';
+    try {
+      searchedQuery = query.trim() || 'All audio';
+      if (networkConnected) {
+        try {
+          const matches = await invoke<NetworkResult[]>('network_search', { query: query.trim() });
+          const ranked = eligibleNetworkMatches(matches)
+            .sort((left, right) => right.sources.length - left.sources.length || left.filename.localeCompare(right.filename));
+          results = mapNetworkFiles(ranked);
+          resultsAreNetwork = true;
+          activityMessage = `${results.length} globally aggregated file ID(s), ranked by active seeders`;
+        } catch (error) { activityMessage = `Global search failed: ${String(error)}`; }
+      } else if (nativeReady) {
+        try {
+          const matches = await invoke<NativeFile[]>('search_catalog', { query: query.trim() });
+          results = mapFiles(matches.filter((item) => minimumSources <= 1 && item.size <= maximumBytes() && matchesType(item.mime, item.format)));
+          resultsAreNetwork = false;
+          activityMessage = `${results.length} local match(es) found`;
+        } catch (error) { activityMessage = `Search failed: ${String(error)}`; }
+      }
+      resultPage = 0;
+      selectResult(results[0] ?? null, true);
+    } finally {
+      searchAction = null;
     }
-    resultPage = 0;
-    selected = results[0] ?? null;
-    selectedSource = 0;
+  }
+
+  async function surpriseMe() {
+    if (searchAction) return;
+    if (!networkConnected) {
+      activityMessage = 'Connect to Nostr before asking for a surprise';
+      return;
+    }
+    searchAction = 'surprise';
+    searchedQuery = 'Surprise me';
+    activityMessage = 'Finding 50 random downloadable tracks…';
+    try {
+      const matches = await invoke<NetworkResult[]>('network_search', { query: '' });
+      const downloadable = eligibleNetworkMatches(matches)
+        .filter((item) => !isLocalFile(item.fileId) && item.sources.length > 0);
+      results = mapNetworkFiles(shuffled(downloadable).slice(0, 50));
+      resultsAreNetwork = true;
+      resultPage = 0;
+      selectResult(results[0] ?? null, true);
+      activityMessage = results.length
+        ? `${results.length} random downloadable track${results.length === 1 ? '' : 's'} found`
+        : 'No downloadable tracks are currently available';
+    } catch (error) {
+      activityMessage = `Surprise search failed: ${String(error)}`;
+    } finally {
+      searchAction = null;
+    }
   }
 
   async function startDownload() {
     const target = selected;
     if (!target) return;
     if (nativeReady && isLocalFile(target.fileId)) {
-      await playAudio(target.fileId, target.name);
+      await playAudio(target.fileId, target.name, playerMode, 'search');
       return;
     }
     const activeTransfer = transfers.find((item) => item.fileId === target.fileId && isActiveTransfer(item));
@@ -547,23 +905,23 @@
 
   async function playSelectedAudio() {
     if (!selected || !isLocalFile(selected.fileId)) return;
-    await playAudio(selected.fileId, selected.name);
+    await playAudio(selected.fileId, selected.name, playerMode, 'search');
   }
 
   async function playSelectedSharedAudio() {
     if (!selectedShared) return;
-    await playAudio(selectedShared.fileId, selectedShared.filename);
+    await playAudio(selectedShared.fileId, selectedShared.filename, playerMode, 'shared');
   }
 
   async function playSelectedFolder() {
     if (!selectedShared) return;
-    await playAudio(selectedShared.fileId, selectedShared.filename, 'folder');
+    await playAudio(selectedShared.fileId, selectedShared.filename, 'folder', 'shared');
   }
 
   async function playAllSongs() {
     const first = selectedShared ?? visibleSharedFiles()[0] ?? sharedFiles[0];
     if (!first) return;
-    await playAudio(first.fileId, first.filename, 'all');
+    await playAudio(first.fileId, first.filename, 'all', 'shared');
   }
 
   async function activateSelected() {
@@ -595,7 +953,12 @@
         activityMessage = 'Nostr publisher blocked locally';
       }
       blockConfirmation = null;
-      await search();
+      if (activeView === 'Trollbox') {
+        trollboxMessages = trollboxMessages.filter((message) => message.pubkey !== ('pubkey' in target ? target.pubkey : ''));
+        await refreshTrollbox();
+      } else {
+        await search();
+      }
     } catch (error) {
       activityMessage = `Could not block ${target.kind}: ${String(error)}`;
     } finally {
@@ -657,14 +1020,19 @@
   }
 
   async function rescanSharedFolder() {
-    if (!nativeReady) return;
+    if (!nativeReady || rescanPending) return;
+    rescanPending = true;
     activityMessage = 'Rescanning Napstr folder…';
     try {
       const report = await invoke<{ fileCount: number; totalBytes: number }>('rescan_napstr_folder');
       await refreshSnapshot();
       if (networkConnected) await invoke('publish_catalogue');
       activityMessage = `Indexed ${report.fileCount} file(s), ${readableSize(report.totalBytes)}`;
-    } catch (error) { activityMessage = `Rescan failed: ${String(error)}`; }
+    } catch (error) {
+      activityMessage = `Rescan failed: ${String(error)}`;
+    } finally {
+      rescanPending = false;
+    }
   }
 
   async function persistSettings() {
@@ -739,6 +1107,24 @@
     const clampTransferPane = () => setTransferPaneHeight(transferPaneHeight);
     window.addEventListener('resize', clampTransferPane);
     refreshSnapshot().then(connectNetwork);
+    void getVersion()
+      .then((version) => {
+        appVersion = version;
+        return checkForNewRelease();
+      })
+      .catch(() => {
+        appVersion = 'unknown';
+      });
+    let destroyed = false;
+    const chatUnlisteners: UnlistenFn[] = [];
+    void listen<string>('napstr-public-chat', ({ payload: topic }) => {
+      if (topic === 'napstr-trollbox') void refreshTrollbox();
+      const fileId = selected?.fileId?.toLowerCase();
+      if (fileId && topic === `napstr-${fileId}`) void refreshTrackDiscussion(fileId);
+    }).then((unlisten) => {
+      if (destroyed) unlisten();
+      else chatUnlisteners.push(unlisten);
+    });
     const updateClock = () => {
       clock = new Intl.DateTimeFormat('en-GB', { hour: '2-digit', minute: '2-digit' }).format(new Date());
     };
@@ -775,6 +1161,7 @@
         } else if (!wasConnected && status.connected) {
           activityMessage = 'Nostr reconnected · refreshing the catalogue';
           void search();
+          if (activeView === 'Trollbox') void refreshTrollbox();
         } else if (!status.connected && !networkConnectPending) {
           void connectNetwork();
         }
@@ -817,6 +1204,8 @@
       }).catch(() => {});
     }, 250);
     return () => {
+      destroyed = true;
+      chatUnlisteners.forEach((unlisten) => unlisten());
       clearInterval(clockTimer);
       clearInterval(wakeTimer);
       clearInterval(networkTimer);
@@ -859,12 +1248,18 @@
       </div>
       <div class="toolbar-separator"></div>
       {#each views as view}
-        <button class:active={activeView === view.label} class="tool-button" onclick={() => (activeView = view.label)}>
+        <button class:active={activeView === view.label} class="tool-button" onclick={() => activateView(view.label)}>
           <span class="tool-icon icon-{view.label.toLowerCase()}">{view.icon}</span>
           <span>{view.label}</span>
         </button>
       {/each}
       <div class="toolbar-spacer"></div>
+      {#if newRelease}
+        <button class="release-button" onclick={openNewRelease} title={`Open Napstr ${newRelease.version} on GitHub`}>
+          <span class="release-arrow">⇧</span>
+          <span><strong>New release</strong><small>{newRelease.version} available</small></span>
+        </button>
+      {/if}
       <button class="connection-box" onclick={connectNetwork} title={torError || networkError || 'Reconnect Nostr and Tor'}>
         <span class="connection-status"><i class:amber={!networkConnected} class="led"></i><strong>{networkConnected ? 'Nostr connected' : 'Connect Nostr'}</strong></span>
         <span class="connection-status"><i class:amber={!torRunning} class:error={Boolean(torError)} class="led"></i><strong>{torStatusLabel()}</strong></span>
@@ -909,10 +1304,17 @@
           <div class="panel-title"><span></span><b>Search the Napstr network</b><span></span></div>
           <form class="search-form" onsubmit={(e) => { e.preventDefault(); search(); }}>
             <label for="search-query">Search:</label>
-            <input id="search-query" bind:value={query} />
+            <input id="search-query" bind:value={query} placeholder="punk, rock, jazz, audiobook" />
             <label for="format">File type:</label>
             <select id="format" bind:value={format} disabled><option>Audio only</option></select>
-            <button class="classic-button primary" type="submit">Search</button>
+            <button class="classic-button primary search-button" type="submit" disabled={searchAction !== null} aria-busy={searchAction === 'search'}>
+              {#if searchAction === 'search'}<span class="search-spinner" aria-hidden="true"></span>{/if}
+              {searchAction === 'search' ? 'Searching' : 'Search'}
+            </button>
+            <button class="classic-button surprise-button" type="button" onclick={surpriseMe} disabled={searchAction !== null || !networkConnected} aria-busy={searchAction === 'surprise'}>
+              {#if searchAction === 'surprise'}<span class="search-spinner" aria-hidden="true"></span>{/if}
+              {searchAction === 'surprise' ? 'Choosing…' : 'Surprise me'}
+            </button>
           </form>
           <button class="advanced-toggle" onclick={() => (advanced = !advanced)}><span>{advanced ? '▼' : '▶'}</span> {advanced ? 'Hide' : 'Show'} advanced search options</button>
           {#if advanced}
@@ -928,7 +1330,7 @@
                 <thead><tr><th class="name-col">Name</th><th>Type</th><th class="number">Size</th><th class="number">Seeders</th><th>Line speed</th><th>Length</th></tr></thead>
                 <tbody>
                   {#each paginatedResults() as item}
-                    <tr class:selected={selected?.id === item.id} onclick={() => (selected = item)} ondblclick={activateSelected}>
+                    <tr class:selected={selected?.id === item.id} onclick={() => selectResult(item)} ondblclick={activateSelected}>
                       <td><span class="file-icon">▶</span>{item.name}</td><td>{item.format}</td><td class="number">{item.size}</td><td class="number"><span class="source-dot"></span>{item.sources}</td><td>{item.speed}</td><td>{item.length}</td>
                     </tr>
                   {/each}
@@ -949,7 +1351,7 @@
                 <div class="large-file-icon">▶</div>
                 <div><strong>{selected.name}</strong><span>{selected.format} · {selected.size} · {selected.length}</span><small>File ID: {selected.fileId}</small></div>
               </div>
-              {#if selected.artist || selected.album || selected.description}<div class="file-metadata"><b>{selected.artist || 'Unknown creator'}</b>{#if selected.album}<span> · {selected.album}</span>{/if}{#if selected.description}<p>{selected.description}</p>{/if}{#if selected.license}<small>License: {selected.license}</small>{/if}</div>{/if}
+              {#if selected.tags}<div class="file-metadata"><small>Tags: {selected.tags}</small></div>{/if}
               <fieldset><legend>Seeders</legend>
                 <div class="sources-list">
                   {#if !isLocalFile(selected.fileId)}
@@ -964,28 +1366,77 @@
               <div class="detail-actions">{#if !isLocalFile(selected.fileId)}<button class="classic-button primary" disabled={startingDownloads.has(selected.fileId)} onclick={startDownload}>{startingDownloads.has(selected.fileId) ? '… Requesting' : '⇩ Download'}</button><button class="classic-button" onclick={() => (sourceProfile = selected?.sourceDetails?.[selectedSource] ?? null)}>View profile</button>{:else}<button class="classic-button primary" onclick={playSelectedAudio}>▶ Play</button><button class="classic-button" onclick={openNapstrFolder}>Open folder</button>{/if}</div>
               {#if !isLocalFile(selected.fileId)}<div class="detail-actions moderation-actions"><button class="classic-button" onclick={blockSelectedFile}>Block file</button><button class="classic-button" onclick={blockSelectedUser}>Block user</button></div>{/if}
               {#if !isLocalFile(selected.fileId)}<p class="privacy-note"><span>♜</span> Transfer will use the seeder’s private, app-session Tor onion service.</p>{:else}<p class="privacy-note"><span>♬</span> Downloaded and verified · ready to play from your Napstr folder.</p>{/if}
+              <section class="track-discussion" aria-label={`Discussion for ${selected.name}`}>
+                <div class="track-discussion-title"><b>Track discussion</b><small>Public · Nostr</small></div>
+                <div class="track-discussion-log" bind:this={trackDiscussionLog} aria-live="polite">
+                  {#if trackDiscussionLoading}<p class="trollbox-notice">Loading comments…</p>{/if}
+                  {#if !trackDiscussionLoading && trackDiscussionMessages.length === 0 && !trackDiscussionError}<p class="trollbox-notice">No comments yet.</p>{/if}
+                  {#each trackDiscussionMessages as message (message.eventId)}
+                    <div class="trollbox-message"><button class="trollbox-name" style:color={chatNameColor(message.npub)} title={`${message.npub} · click to block`} disabled={message.npub === identityNpub} onclick={() => blockTrollboxUser(message)}>{message.displayName}:</button><span>{message.content}</span></div>
+                  {/each}
+                </div>
+                {#if trackDiscussionError}<div class="track-discussion-error">{trackDiscussionError}</div>{/if}
+                <div class="track-discussion-compose">
+                  <input bind:value={trackDiscussionDraft} maxlength="500" autocomplete="off" placeholder={networkConnected ? 'Comment on this track…' : 'Connect to Nostr to comment'} disabled={!networkConnected || trackDiscussionSending} aria-label="Track discussion comment" onkeydown={(event) => { if (event.key === 'Enter') { event.preventDefault(); void sendTrackDiscussionMessage(); } }} />
+                  <button class="classic-button primary" type="button" disabled={!networkConnected || trackDiscussionSending || !trackDiscussionDraft.trim()} onclick={() => void sendTrackDiscussionMessage()}>{trackDiscussionSending ? '…' : 'Send'}</button>
+                </div>
+              </section>
             {:else}<p class="empty-state">Select a result to see active seeders.</p>{/if}
           </aside>
         </div>
       {:else if activeView === 'Downloads'}
-        <section class="full-panel">
+        <section class="full-panel downloads-view">
           <div class="panel-title"><span></span><b>Download Manager</b><span></span></div>
           <div class="actionbar"><button class="classic-button" onclick={togglePause}>{paused ? '▶ Resume all' : 'Ⅱ Pause all'}</button><button class="classic-button" onclick={openNapstrFolder}>Open Napstr folder</button><button class="classic-button" onclick={clearFinishedTransfers} disabled={!transfers.some(isFinishedTransfer)}>Clear finished</button><div class="spacer"></div><span>{transfers.filter(isActiveTransfer).length} active · {transfers.filter(isCompleteTransfer).length} ready to play</span></div>
-          <table class="file-table download-table"><thead><tr><th>Download order</th><th>Progress</th><th>Size</th><th>Speed</th><th>Status</th><th></th></tr></thead><tbody>
-            {#each transfers as transfer}
-              <tr class:transfer-complete={isCompleteTransfer(transfer)} ondblclick={() => { if (isCompleteTransfer(transfer)) playAudio(transfer.fileId, transfer.name); }}><td><span class="download-arrow">{isCompleteTransfer(transfer) ? '▶' : '⇩'}</span>{transfer.name}</td><td><div class="progress"><span style={`width:${transfer.progress}%`}></span><b>{Math.round(transfer.progress)}%</b></div></td><td>{transfer.size}</td><td>{isCompleteTransfer(transfer) ? 'Local' : transfer.speed}</td><td>{isCompleteTransfer(transfer) ? 'Ready to play' : transfer.status}</td><td class="transfer-actions">{#if isCompleteTransfer(transfer)}<button class="classic-button transfer-play" onclick={(event) => { event.stopPropagation(); playAudio(transfer.fileId, transfer.name); }} title="Play verified audio">▶ Play</button>{/if}<button class="tiny-button" onclick={(event) => { event.stopPropagation(); removeTransfer(transfer.id); }} title="Remove from this list">×</button></td></tr>
-            {/each}
-          </tbody></table>
-          {#if transfers.length === 0}<p class="empty-state">There are no downloads in the queue.</p>{/if}
+          <div class="download-queue">
+            <table class="file-table download-table"><thead><tr><th>Download order</th><th>Progress</th><th>Size</th><th>Speed</th><th>Status</th><th></th></tr></thead><tbody>
+              {#each transfers as transfer}
+                <tr class:transfer-complete={isCompleteTransfer(transfer)} ondblclick={() => { if (isCompleteTransfer(transfer)) playAudio(transfer.fileId, transfer.name, playerMode, 'downloads'); }}><td><span class="download-arrow">{isCompleteTransfer(transfer) ? '▶' : '⇩'}</span>{transfer.name}</td><td><div class="progress"><span style={`width:${transfer.progress}%`}></span><b>{Math.round(transfer.progress)}%</b></div></td><td>{transfer.size}</td><td>{isCompleteTransfer(transfer) ? 'Local' : transfer.speed}</td><td>{isCompleteTransfer(transfer) ? 'Ready to play' : transfer.status}</td><td class="transfer-actions">{#if isCompleteTransfer(transfer)}<button class="classic-button transfer-play" onclick={(event) => { event.stopPropagation(); playAudio(transfer.fileId, transfer.name, playerMode, 'downloads'); }} title="Play verified audio">▶ Play</button>{/if}<button class="tiny-button" onclick={(event) => { event.stopPropagation(); removeTransfer(transfer.id); }} title="Remove from this list">×</button></td></tr>
+              {/each}
+            </tbody></table>
+            {#if transfers.length === 0}<p class="empty-state compact">There are no downloads in the queue.</p>{/if}
+          </div>
+          <div class="panel-title"><span></span><b>Track Tags</b><span></span></div>
+          <div class="tag-editor">
+            <b>{selectedTagFile?.filename ?? 'Select a local track below'}</b>
+            <input bind:value={tagDraft} disabled={!selectedTagFile || tagSaving} maxlength="256" placeholder="punk, live, audiobook" onkeydown={(event) => { if (event.key === 'Enter') saveTags(); }} />
+            <button class="classic-button primary" onclick={saveTags} disabled={!selectedTagFile || tagSaving}>{tagSaving ? 'Saving…' : 'Save tags'}</button>
+            <small>Comma-separated · published with your signed catalogue</small>
+          </div>
+          <div class="tag-library">
+            <table class="file-table tags-table"><thead><tr><th>Name</th><th>Folder</th><th>Tags</th></tr></thead><tbody>
+              {#each sharedFiles as file}
+                <tr class:selected={selectedTagFile?.fileId === file.fileId} onclick={() => selectTagFile(file)} ondblclick={() => playAudio(file.fileId, file.filename, playerMode, 'downloads')}><td><button type="button" class="file-icon file-play-button" title={`Play ${file.filename}`} aria-label={`Play ${file.filename}`} onclick={(event) => { event.stopPropagation(); selectTagFile(file); playAudio(file.fileId, file.filename, playerMode, 'downloads'); }}>▶</button>{file.filename}</td><td>{folderName(file.folder)}</td><td>{file.tags || '—'}</td></tr>
+              {/each}
+            </tbody></table>
+            {#if sharedFiles.length === 0}<p class="empty-state compact">Downloaded and shared tracks will appear here.</p>{/if}
+          </div>
         </section>
       {:else if activeView === 'Shared'}
         <section class="full-panel">
           <div class="panel-title"><span></span><b>My Shared Files</b><span></span></div>
-          <div class="actionbar"><button class="classic-button" onclick={rescanSharedFolder}>↻ Rescan</button><button class="classic-button" onclick={openNapstrFolder}>Open folder</button><button class="classic-button" onclick={playSelectedSharedAudio} disabled={!selectedShared}>▶ Play</button><button class="classic-button" onclick={playSelectedFolder} disabled={!selectedShared}>▶ Play folder</button><button class="classic-button primary" onclick={playAllSongs} disabled={!sharedFiles.length}>▶ Play all</button><div class="spacer"></div><span>Sharing {sharedFiles.length} files · {readableSize(indexedBytes)}</span></div>
+          <div class="actionbar"><button class="classic-button" onclick={rescanSharedFolder} disabled={rescanPending}>{rescanPending ? '… Rescanning' : '↻ Rescan'}</button><button class="classic-button" onclick={openNapstrFolder}>Open folder</button><button class="classic-button" onclick={playSelectedSharedAudio} disabled={!selectedShared}>▶ Play</button><button class="classic-button" onclick={playSelectedFolder} disabled={!selectedShared}>▶ Play folder</button><button class="classic-button primary" onclick={playAllSongs} disabled={!sharedFiles.length}>▶ Play all</button><div class="spacer"></div><span>Sharing {sharedFiles.length} files · {readableSize(indexedBytes)}</span></div>
           <div class="folder-path"><b>Napstr folder:</b><input value={napstrFolder || 'No folder selected'} readonly /><button class="classic-button" onclick={chooseNapstrFolder}>Browse…</button></div>
           <div class="library-filter"><label>View folder: <select bind:value={libraryFolderView}><option value="*">All folders</option>{#each libraryFolders() as folder}<option value={folder}>{folderName(folder)}</option>{/each}</select></label><span>{visibleSharedFiles().length} song{visibleSharedFiles().length === 1 ? '' : 's'} shown</span></div>
-          <table class="file-table shared-table"><thead><tr><th>Name</th><th>Folder</th><th>Size</th><th>Catalogue</th><th>Active peers</th></tr></thead><tbody>{#each visibleSharedFiles() as file}<tr class:selected={selectedShared?.fileId === file.fileId} onclick={() => (selectedShared = { ...file })} ondblclick={() => playAudio(file.fileId, file.name)}><td><span class="file-icon">▶</span>{file.name}</td><td>{folderName(file.folder)}</td><td>{file.readableSize}</td><td><span class:amber={!networkConnected} class="led"></span>{networkConnected ? 'Published' : 'Indexed'}</td><td>{file.peers}</td></tr>{/each}</tbody></table>
+          <table class="file-table shared-table"><thead><tr><th>Name</th><th>Folder</th><th>Size</th><th>Catalogue</th><th>Active peers</th></tr></thead><tbody>{#each visibleSharedFiles() as file}<tr class:selected={selectedShared?.fileId === file.fileId} onclick={() => (selectedShared = { ...file })} ondblclick={() => playAudio(file.fileId, file.name, playerMode, 'shared')}><td><span class="file-icon">▶</span>{file.name}</td><td>{folderName(file.folder)}</td><td>{file.readableSize}</td><td><span class:amber={!networkConnected} class="led"></span>{networkConnected ? 'Published' : 'Indexed'}</td><td>{file.peers}</td></tr>{/each}</tbody></table>
           <p class="privacy-note wide"><span>♜</span> Only validated MP3, FLAC, WAV, Ogg Vorbis, and Opus audio is indexed recursively. Subfolders become player folders; folder names remain local and are not published. Embedded cover artwork is allowed.</p>
+        </section>
+      {:else if activeView === 'Trollbox'}
+        <section class="full-panel trollbox-view">
+          <div class="panel-title"><span></span><b>Napstr Trollbox</b><span></span></div>
+          <div class="trollbox-status"><span><i class:amber={!networkConnected} class="led"></i> Public Nostr chat: <b>#napstr-trollbox</b></span><small>NIP-C7 messages are public and signed by your Napstr Nostr identity.</small></div>
+          <div class="trollbox-log" bind:this={trollboxLog} aria-live="polite" aria-label="Napstr public chat messages">
+            {#if trollboxLoading}<p class="trollbox-notice">Connecting to the trollbox…</p>{/if}
+            {#if !trollboxLoading && trollboxMessages.length === 0 && !trollboxError}<p class="trollbox-notice">No messages yet. Say hello.</p>{/if}
+            {#each trollboxMessages as message (message.eventId)}
+              <div class="trollbox-message"><button class="trollbox-name" style:color={chatNameColor(message.npub)} title={`${message.npub} · click to block`} disabled={message.npub === identityNpub} onclick={() => blockTrollboxUser(message)}>{message.displayName}:</button><span>{message.content}</span></div>
+            {/each}
+          </div>
+          {#if trollboxError}<div class="trollbox-error">{trollboxError}</div>{/if}
+          <div class="trollbox-compose">
+            <input bind:value={trollboxDraft} maxlength="500" autocomplete="off" placeholder={networkConnected ? 'Type a public message…' : 'Connect to Nostr to chat'} disabled={!networkConnected || trollboxSending} aria-label="Trollbox message" onkeydown={(event) => { if (event.key === 'Enter') { event.preventDefault(); void sendTrollboxMessage(); } }} />
+            <button class="classic-button primary" type="button" disabled={!networkConnected || trollboxSending || !trollboxDraft.trim()} onclick={() => void sendTrollboxMessage()}>{trollboxSending ? 'Sending…' : 'Send'}</button>
+          </div>
         </section>
       {:else if activeView === 'Profile'}
         <section class="full-panel profile-view">
@@ -1016,8 +1467,8 @@
       ></button>
       <div class="dock-title"><span></span><b>Transfer Manager</b><span></span><button class="dock-clear" onclick={clearFinishedTransfers} disabled={!transfers.some(isFinishedTransfer)}>Clear finished</button><button onclick={() => (activeView = 'Downloads')} title="Open Download Manager">□</button></div>
       <div class="mini-transfers">
-        {#each transfers.slice(0, 2) as transfer}
-          <div class:transfer-complete={isCompleteTransfer(transfer)} class="mini-row">{#if isCompleteTransfer(transfer)}<button class="mini-play" onclick={() => playAudio(transfer.fileId, transfer.name)} title="Play verified audio">▶</button>{:else}<span class="download-arrow">⇩</span>{/if}<span class="mini-name">{transfer.name}</span><div class="progress"><span style={`width:${transfer.progress}%`}></span></div><span>{transfer.size}</span><span>{isCompleteTransfer(transfer) ? 'Ready' : transfer.speed}</span></div>
+        {#each transfers as transfer}
+          <div class:transfer-complete={isCompleteTransfer(transfer)} class="mini-row">{#if isCompleteTransfer(transfer)}<button class="mini-play" onclick={() => playAudio(transfer.fileId, transfer.name, playerMode, 'downloads')} title="Play verified audio">▶</button>{:else}<span class="download-arrow">⇩</span>{/if}<span class="mini-name">{transfer.name}</span><div class="progress"><span style={`width:${transfer.progress}%`}></span></div><span>{transfer.size}</span><span>{isCompleteTransfer(transfer) ? 'Ready' : transfer.speed}</span></div>
         {/each}
       </div>
     </section>
@@ -1049,7 +1500,7 @@
     <div class="modal-backdrop" role="presentation" onclick={() => { if (!blockInProgress) blockConfirmation = null; }}>
       <dialog class="dialog confirm-dialog" open aria-label="Confirm block" onclick={(e) => e.stopPropagation()} onkeydown={(e) => { if (e.key === 'Escape' && !blockInProgress) blockConfirmation = null; }}>
         <header class="titlebar"><div class="title-left"><span class="app-icon">!</span><span>Confirm block</span></div><div class="window-controls"><button disabled={blockInProgress} onclick={() => (blockConfirmation = null)}>×</button></div></header>
-        <div class="dialog-body"><div class="confirm-icon">!</div><div><h3>Are you sure?</h3>{#if blockConfirmation.kind === 'file'}<p>Block <strong>{blockConfirmation.label}</strong>?</p><p>Every seeder offering these exact file bytes will be hidden.</p>{:else}<p>Block <strong>{blockConfirmation.label}</strong>?</p><p>Their catalogue entries and download requests will be ignored.</p>{/if}</div></div>
+        <div class="dialog-body"><div class="confirm-icon">!</div><div><h3>Are you sure?</h3>{#if blockConfirmation.kind === 'file'}<p>Block <strong>{blockConfirmation.label}</strong>?</p><p>Every seeder offering these exact file bytes will be hidden.</p>{:else}<p>Block <strong>{blockConfirmation.label}</strong>?</p><p>Their catalogue entries, public chat messages, and download requests will be ignored.</p>{/if}</div></div>
         <div class="dialog-actions"><button class="classic-button primary" disabled={blockInProgress} onclick={confirmBlock}>{blockInProgress ? 'Blocking…' : 'Block'}</button><button class="classic-button" disabled={blockInProgress} onclick={() => (blockConfirmation = null)}>Cancel</button></div>
       </dialog>
     </div>

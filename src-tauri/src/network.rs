@@ -16,11 +16,19 @@ use std::{
     },
     time::Duration,
 };
+use tauri::Emitter;
 use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
 pub const CATALOGUE_KIND: u16 = 30421;
 pub const AVAILABILITY_KIND: u16 = 30422;
+const TROLLBOX_HASHTAG: &str = "napstr-trollbox";
+const TROLLBOX_MESSAGE_KIND: u16 = 9;
+const TRACK_DISCUSSION_PREFIX: &str = "napstr-";
+const TRACK_DISCUSSION_SUBSCRIPTION: &str = "napstr-track-discussion";
+const PUBLIC_CHAT_EVENT: &str = "napstr-public-chat";
+const TROLLBOX_CACHE_LIMIT: usize = 200;
+const LIVE_NOSTR_EVENT_LIMIT: usize = 35_000;
 const MAX_SEEDER_CANDIDATES: usize = 3;
 
 pub fn validate_profile_picture(value: &str) -> Result<(), String> {
@@ -77,6 +85,17 @@ pub struct CatalogueResult {
     pub sources: Vec<CatalogueSource>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrollboxMessage {
+    pub event_id: String,
+    pub pubkey: String,
+    pub npub: String,
+    pub display_name: String,
+    pub content: String,
+    pub created_at: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CatalogueContent {
@@ -119,25 +138,37 @@ enum SignalMessage {
 pub struct NetworkService {
     db_path: PathBuf,
     transfers: Arc<TransferService>,
+    app_handle: tauri::AppHandle,
     client: RwLock<Option<Client>>,
     keys: RwLock<Option<Keys>>,
     start_lock: Mutex<()>,
+    trollbox_cache_lock: Mutex<()>,
+    track_discussion_subscription_lock: Mutex<()>,
     connected: AtomicBool,
     generation: AtomicU64,
     last_error: RwLock<String>,
+    trollbox_profiles: RwLock<HashMap<String, String>>,
 }
 
 impl NetworkService {
-    pub fn new(db_path: PathBuf, transfers: Arc<TransferService>) -> Arc<Self> {
+    pub fn new(
+        db_path: PathBuf,
+        transfers: Arc<TransferService>,
+        app_handle: tauri::AppHandle,
+    ) -> Arc<Self> {
         Arc::new(Self {
             db_path,
             transfers,
+            app_handle,
             client: RwLock::new(None),
             keys: RwLock::new(None),
             start_lock: Mutex::new(()),
+            trollbox_cache_lock: Mutex::new(()),
+            track_discussion_subscription_lock: Mutex::new(()),
             connected: AtomicBool::new(false),
             generation: AtomicU64::new(0),
             last_error: RwLock::new(String::new()),
+            trollbox_profiles: RwLock::new(HashMap::new()),
         })
     }
 
@@ -158,7 +189,10 @@ impl NetworkService {
         }
         drop(connection);
 
-        let client = Client::new(keys.clone());
+        let client = nostr_client(keys.clone());
+        // Chat history is an optional local acceleration layer and must never
+        // prevent the Nostr client itself from connecting.
+        let _ = self.hydrate_trollbox_cache(&client).await;
         client.automatic_authentication(true);
         for relay in &relays {
             client
@@ -187,6 +221,10 @@ impl NetworkService {
             .subscribe(inbox_filter, None)
             .await
             .map_err(|error| format!("NIP-17 inbox subscription failed: {error}"))?;
+        client
+            .subscribe(trollbox_filter(TROLLBOX_CACHE_LIMIT), None)
+            .await
+            .map_err(|error| format!("public trollbox subscription failed: {error}"))?;
         *self.client.write().await = Some(client.clone());
         *self.keys.write().await = Some(keys);
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
@@ -223,6 +261,16 @@ impl NetworkService {
                                             .await;
                                     }
                                 }
+                            } else if let Some(topic) = public_chat_topic(&event) {
+                                if topic == TROLLBOX_HASHTAG {
+                                    let cache_service = service.clone();
+                                    let cache_event = (*event).clone();
+                                    tokio::spawn(async move {
+                                        let _ =
+                                            cache_service.cache_trollbox_event(cache_event).await;
+                                    });
+                                }
+                                let _ = service.app_handle.emit(PUBLIC_CHAT_EVENT, topic);
                             }
                         }
                         Ok(false)
@@ -352,7 +400,7 @@ impl NetworkService {
                 .map_err(|error| error.to_string())?;
         }
         let mut published = 0;
-        for (file_id, filename, size, format, mime) in files {
+        for (file_id, filename, size, format, mime, catalogue_tags) in files {
             let content = CatalogueContent {
                 protocol: "napstr/1".into(),
                 file_id: file_id.clone(),
@@ -369,7 +417,7 @@ impl NetworkService {
                 size,
                 license: "unspecified".into(),
                 description: String::new(),
-                tags: String::new(),
+                tags: catalogue_tags,
             };
             let tags = vec![
                 Tag::parse(["d", file_id.as_str()]),
@@ -415,6 +463,268 @@ impl NetworkService {
             .map(Keys::public_key)
             .ok_or("Nostr identity is not loaded")?;
         self.publish_profile_with_client(&client, public_key).await
+    }
+
+    pub async fn trollbox_messages(&self) -> Result<Vec<TrollboxMessage>, String> {
+        let client = self
+            .client
+            .read()
+            .await
+            .clone()
+            .ok_or("Nostr is not connected")?;
+        self.public_chat_messages(
+            &client,
+            trollbox_filter(TROLLBOX_CACHE_LIMIT),
+            TROLLBOX_HASHTAG,
+        )
+        .await
+    }
+
+    pub async fn track_discussion_messages(
+        &self,
+        file_id: String,
+        subscribe: bool,
+    ) -> Result<Vec<TrollboxMessage>, String> {
+        let topic = track_discussion_topic(&file_id)?;
+        let client = self
+            .client
+            .read()
+            .await
+            .clone()
+            .ok_or("Nostr is not connected")?;
+        if subscribe {
+            // Track selection can change while a previous IPC request is still
+            // awaiting relays. Serialize replacement so the newest selection
+            // cannot be overwritten by an older in-flight subscription.
+            let _subscription_guard = self.track_discussion_subscription_lock.lock().await;
+            let subscription_id = SubscriptionId::new(TRACK_DISCUSSION_SUBSCRIPTION);
+            client.unsubscribe(&subscription_id).await;
+            client
+                .subscribe_with_id(subscription_id, public_chat_filter(&topic, 100), None)
+                .await
+                .map_err(|error| format!("track discussion subscription failed: {error}"))?;
+        }
+        self.public_chat_messages(&client, public_chat_filter(&topic, 100), &topic)
+            .await
+    }
+
+    async fn public_chat_messages(
+        &self,
+        client: &Client,
+        filter: Filter,
+        topic: &str,
+    ) -> Result<Vec<TrollboxMessage>, String> {
+        let events = client
+            .database()
+            .query(filter)
+            .await
+            .map_err(|error| format!("could not read the public chat cache: {error}"))?;
+        let blocked = blocked_pubkeys(&self.db_path)?;
+        let mut chat_events = events
+            .iter()
+            .filter(|event| {
+                event.kind == Kind::from(TROLLBOX_MESSAGE_KIND)
+                    && event
+                        .tags
+                        .iter()
+                        .any(|tag| tag.kind() == TagKind::t() && tag.content() == Some(topic))
+                    && !blocked.contains(&event.pubkey.to_hex())
+                    && !event.content.trim().is_empty()
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        chat_events.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+
+        let current_key = self
+            .keys
+            .read()
+            .await
+            .as_ref()
+            .map(Keys::public_key)
+            .ok_or("Nostr identity is not loaded")?;
+        let current_name =
+            super::get_setting(&super::open_connection(&self.db_path)?, "display_name")?;
+        self.trollbox_profiles
+            .write()
+            .await
+            .insert(current_key.to_hex(), safe_trollbox_name(&current_name));
+
+        let cached = self.trollbox_profiles.read().await.clone();
+        let missing = chat_events
+            .iter()
+            .map(|event| event.pubkey)
+            .filter(|pubkey| !cached.contains_key(&pubkey.to_hex()))
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .take(64)
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            let metadata_events = client
+                .fetch_events(
+                    Filter::new()
+                        .kind(Kind::Metadata)
+                        .authors(missing.iter().copied())
+                        .limit(missing.len()),
+                    Duration::from_secs(3),
+                )
+                .await
+                .ok();
+            let mut discovered = HashMap::new();
+            if let Some(events) = metadata_events {
+                for event in events.iter() {
+                    if let Ok(metadata) = Metadata::from_json(&event.content) {
+                        if let Some(name) = metadata.display_name.or(metadata.name) {
+                            discovered.insert(event.pubkey.to_hex(), safe_trollbox_name(&name));
+                        }
+                    }
+                }
+            }
+            let profiles = missing
+                .into_iter()
+                .map(|pubkey| {
+                    let pubkey = pubkey.to_hex();
+                    let name = discovered
+                        .remove(&pubkey)
+                        .unwrap_or_else(|| "napstr-user".into());
+                    (pubkey, name)
+                })
+                .collect::<Vec<_>>();
+            self.trollbox_profiles.write().await.extend(profiles);
+        }
+        let profiles = self.trollbox_profiles.read().await;
+        let mut messages = chat_events
+            .into_iter()
+            .map(|event| {
+                let pubkey = event.pubkey.to_hex();
+                Ok(TrollboxMessage {
+                    event_id: event.id.to_hex(),
+                    npub: event
+                        .pubkey
+                        .to_bech32()
+                        .map_err(|error| error.to_string())?,
+                    display_name: profiles
+                        .get(&pubkey)
+                        .cloned()
+                        .unwrap_or_else(|| "napstr-user".into()),
+                    pubkey,
+                    content: sanitise_public_chat_content(&event.content),
+                    created_at: event.created_at.as_secs(),
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        messages.retain(|message| !message.content.is_empty());
+        Ok(messages)
+    }
+
+    pub async fn send_trollbox_message(&self, content: String) -> Result<String, String> {
+        self.send_public_chat_message(
+            TROLLBOX_HASHTAG,
+            content,
+            "Public message in the Napstr trollbox",
+        )
+        .await
+    }
+
+    pub async fn send_track_discussion_message(
+        &self,
+        file_id: String,
+        content: String,
+    ) -> Result<String, String> {
+        let topic = track_discussion_topic(&file_id)?;
+        self.send_public_chat_message(
+            &topic,
+            content,
+            "Public message in a Napstr track discussion",
+        )
+        .await
+    }
+
+    async fn send_public_chat_message(
+        &self,
+        topic: &str,
+        content: String,
+        alt: &str,
+    ) -> Result<String, String> {
+        let content = content.trim();
+        let character_count = content.chars().count();
+        if character_count == 0 || character_count > 500 {
+            return Err("public chat messages must contain between 1 and 500 characters".into());
+        }
+        if content.chars().any(is_unsafe_public_chat_character) {
+            return Err(
+                "public chat messages must be a single line without control formatting".into(),
+            );
+        }
+        let client = self
+            .client
+            .read()
+            .await
+            .clone()
+            .ok_or("Nostr is not connected")?;
+        let tags = vec![
+            Tag::parse(["t", topic]),
+            Tag::parse(["client", "Napstr"]),
+            Tag::parse(["alt", alt]),
+        ]
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+        let event = client
+            .sign_event_builder(
+                EventBuilder::new(Kind::from(TROLLBOX_MESSAGE_KIND), content).tags(tags),
+            )
+            .await
+            .map_err(|error| format!("public chat signing failed: {error}"))?;
+        let output = client
+            .send_event(&event)
+            .await
+            .map_err(|error| format!("public chat send failed: {error}"))?;
+        if output.success.is_empty() {
+            let _ = client
+                .database()
+                .delete(Filter::new().id(*output.id()))
+                .await;
+            return Err(relay_failure(
+                "public chat send was rejected",
+                &output.failed,
+            ));
+        }
+        client
+            .database()
+            .save_event(&event)
+            .await
+            .map_err(|error| format!("could not save the sent public chat message: {error}"))?;
+        if topic == TROLLBOX_HASHTAG {
+            let _ = self.cache_trollbox_event(event.clone()).await;
+        }
+        let _ = self.app_handle.emit(PUBLIC_CHAT_EVENT, topic.to_string());
+        Ok(event.id.to_hex())
+    }
+
+    async fn hydrate_trollbox_cache(&self, client: &Client) -> Result<(), String> {
+        let db_path = self.db_path.clone();
+        let events = tokio::task::spawn_blocking(move || load_trollbox_cache(&db_path))
+            .await
+            .map_err(|error| format!("trollbox cache task failed: {error}"))??;
+        for event in events {
+            let _ = client.database().save_event(&event).await;
+        }
+        Ok(())
+    }
+
+    async fn cache_trollbox_event(&self, event: Event) -> Result<(), String> {
+        let _cache_guard = self.trollbox_cache_lock.lock().await;
+        let db_path = self.db_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut connection = super::open_connection(&db_path)?;
+            persist_trollbox_event(&mut connection, &event)
+        })
+        .await
+        .map_err(|error| format!("trollbox cache task failed: {error}"))?
     }
 
     async fn publish_profile_with_client(
@@ -554,7 +864,10 @@ impl NetworkService {
             {
                 continue;
             }
-            if !super::search_matches(query, &[&content.filename]) {
+            let Ok(catalogue_tags) = super::normalise_tags(&content.tags) else {
+                continue;
+            };
+            if !super::search_matches(query, &[&content.filename, &catalogue_tags]) {
                 continue;
             }
             let pubkey = event.pubkey.to_hex();
@@ -581,7 +894,7 @@ impl NetworkService {
             let catalogue_name = content.filename.clone();
             connection.execute(
                 "INSERT OR REPLACE INTO remote_catalogue (file_id,source_pubkey,filename,title,artist,album,format,mime,size,license,description,tags,event_id,seen_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
-                params![content.file_id, pubkey, catalogue_name, catalogue_name, "", "", content.format, content.mime, content.size as i64, "unspecified", "", "", event.id.to_hex(), Utc::now().to_rfc3339()],
+                params![content.file_id, pubkey, catalogue_name, catalogue_name, "", "", content.format, content.mime, content.size as i64, "unspecified", "", catalogue_tags, event.id.to_hex(), Utc::now().to_rfc3339()],
             ).map_err(|error| error.to_string())?;
             aggregated
                 .entry(content.file_id.clone())
@@ -592,6 +905,9 @@ impl NetworkService {
                         .any(|existing| existing.pubkey == source.pubkey)
                     {
                         item.sources.push(source.clone());
+                    }
+                    if item.tags.is_empty() {
+                        item.tags = catalogue_tags.clone();
                     }
                 })
                 .or_insert(CatalogueResult {
@@ -605,7 +921,7 @@ impl NetworkService {
                     size: content.size,
                     license: "unspecified".into(),
                     description: String::new(),
-                    tags: String::new(),
+                    tags: catalogue_tags,
                     sources: vec![source],
                 });
         }
@@ -920,6 +1236,194 @@ impl NetworkService {
     }
 }
 
+fn trollbox_filter(limit: usize) -> Filter {
+    public_chat_filter(TROLLBOX_HASHTAG, limit)
+}
+
+fn nostr_client(keys: Keys) -> Client {
+    let database = MemoryDatabase::with_opts(MemoryDatabaseOptions {
+        events: true,
+        max_events: Some(LIVE_NOSTR_EVENT_LIMIT),
+    });
+    Client::builder().signer(keys).database(database).build()
+}
+
+fn public_chat_filter(topic: &str, limit: usize) -> Filter {
+    Filter::new()
+        .kind(Kind::from(TROLLBOX_MESSAGE_KIND))
+        .hashtag(topic)
+        .limit(limit)
+}
+
+fn public_chat_topic(event: &Event) -> Option<String> {
+    if event.kind != Kind::from(TROLLBOX_MESSAGE_KIND) {
+        return None;
+    }
+    event.tags.iter().find_map(|tag| {
+        if tag.kind() != TagKind::t() {
+            return None;
+        }
+        let topic = tag.content()?;
+        if topic == TROLLBOX_HASHTAG {
+            return Some(topic.to_string());
+        }
+        let file_id = topic.strip_prefix(TRACK_DISCUSSION_PREFIX)?;
+        if file_id.len() == 64
+            && file_id
+                .chars()
+                .all(|character| character.is_ascii_hexdigit())
+        {
+            Some(topic.to_ascii_lowercase())
+        } else {
+            None
+        }
+    })
+}
+
+fn valid_cached_trollbox_event(event: &Event) -> bool {
+    event.verify().is_ok()
+        && public_chat_topic(event).as_deref() == Some(TROLLBOX_HASHTAG)
+        && !sanitise_public_chat_content(&event.content).is_empty()
+        && event.as_json().len() <= 64 * 1024
+}
+
+fn persist_trollbox_event(connection: &mut Connection, event: &Event) -> Result<(), String> {
+    if !valid_cached_trollbox_event(event) {
+        return Err("refusing to cache an invalid trollbox event".into());
+    }
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute(
+            "INSERT OR IGNORE INTO trollbox_events(event_id,pubkey,event_json,created_at)
+             VALUES(?1,?2,?3,?4)",
+            params![
+                event.id.to_hex(),
+                event.pubkey.to_hex(),
+                event.as_json(),
+                event.created_at.as_secs() as i64
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute(
+            "DELETE FROM trollbox_events WHERE event_id IN (
+               SELECT event_id FROM trollbox_events
+               ORDER BY created_at DESC,event_id DESC LIMIT -1 OFFSET ?1
+             )",
+            [TROLLBOX_CACHE_LIMIT as i64],
+        )
+        .map_err(|error| error.to_string())?;
+    transaction.commit().map_err(|error| error.to_string())
+}
+
+fn load_trollbox_cache(db_path: &PathBuf) -> Result<Vec<Event>, String> {
+    let connection = super::open_connection(db_path)?;
+    let rows = {
+        let mut statement = connection
+            .prepare(
+                "SELECT event_id,event_json FROM trollbox_events
+                 ORDER BY created_at DESC,event_id DESC LIMIT ?1",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([TROLLBOX_CACHE_LIMIT as i64], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        rows
+    };
+    let mut events = Vec::new();
+    for (event_id, json) in rows {
+        match Event::from_json(json)
+            .ok()
+            .filter(|event| event.id.to_hex() == event_id)
+            .filter(valid_cached_trollbox_event)
+        {
+            Some(event) => events.push(event),
+            None => {
+                let _ =
+                    connection.execute("DELETE FROM trollbox_events WHERE event_id=?1", [event_id]);
+            }
+        }
+    }
+    Ok(events)
+}
+
+fn track_discussion_topic(file_id: &str) -> Result<String, String> {
+    let file_id = file_id.trim().to_ascii_lowercase();
+    if file_id.len() != 64
+        || !file_id
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
+    {
+        return Err("track discussion requires a valid SHA-256 file ID".into());
+    }
+    Ok(format!("{TRACK_DISCUSSION_PREFIX}{file_id}"))
+}
+
+fn blocked_pubkeys(db_path: &PathBuf) -> Result<HashSet<String>, String> {
+    let connection = super::open_connection(db_path)?;
+    let mut statement = connection
+        .prepare("SELECT pubkey FROM blocked_pubkeys")
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|error| error.to_string())?;
+    rows.collect::<Result<HashSet<_>, _>>()
+        .map_err(|error| error.to_string())
+}
+
+fn safe_trollbox_name(value: &str) -> String {
+    let name = value.trim();
+    if name.is_empty() || name.chars().any(is_unsafe_public_chat_character) {
+        return "napstr-user".into();
+    }
+    name.chars().take(40).collect()
+}
+
+fn is_unsafe_public_chat_character(character: char) -> bool {
+    character.is_control()
+        || matches!(
+            character,
+            '\u{061c}'
+                | '\u{200b}'..='\u{200f}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2060}'..='\u{206f}'
+                | '\u{feff}'
+        )
+}
+
+fn sanitise_public_chat_content(value: &str) -> String {
+    value
+        .chars()
+        .filter_map(|character| {
+            if matches!(character, '\n' | '\r' | '\t') {
+                Some(' ')
+            } else if is_unsafe_public_chat_character(character) {
+                None
+            } else {
+                Some(character)
+            }
+        })
+        .take(500)
+        .collect::<String>()
+        .trim()
+        .to_owned()
+}
+
+fn relay_failure(label: &str, failures: &HashMap<RelayUrl, String>) -> String {
+    let details = failures
+        .values()
+        .next()
+        .map(String::as_str)
+        .unwrap_or("the relay did not accept the event");
+    format!("{label}: {details}")
+}
+
 pub fn initialise_network_schema(connection: &Connection) -> Result<(), String> {
     connection.execute_batch(
         "CREATE TABLE IF NOT EXISTS remote_catalogue (
@@ -938,14 +1442,21 @@ pub fn initialise_network_schema(connection: &Connection) -> Result<(), String> 
            PRIMARY KEY(request_id, source_pubkey),
            FOREIGN KEY(request_id) REFERENCES network_downloads(request_id) ON DELETE CASCADE
          );
-         CREATE TABLE IF NOT EXISTS published_catalogue (file_id TEXT PRIMARY KEY, published_at TEXT NOT NULL);"
+         CREATE TABLE IF NOT EXISTS published_catalogue (file_id TEXT PRIMARY KEY, published_at TEXT NOT NULL);
+         CREATE TABLE IF NOT EXISTS trollbox_events (
+           event_id TEXT PRIMARY KEY, pubkey TEXT NOT NULL, event_json TEXT NOT NULL, created_at INTEGER NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS trollbox_events_recent
+           ON trollbox_events(created_at DESC,event_id DESC);"
     ).map_err(|error| error.to_string())
     .and_then(|_| super::ensure_column(connection, "remote_catalogue", "description", "TEXT NOT NULL DEFAULT ''"))
     .and_then(|_| super::ensure_column(connection, "remote_catalogue", "tags", "TEXT NOT NULL DEFAULT ''"))
 }
 
 pub fn load_network_transfers(connection: &Connection) -> Result<Vec<super::Transfer>, String> {
-    let mut statement = connection.prepare("SELECT rowid,file_id,filename,size,progress,status,speed,destination FROM network_downloads ORDER BY updated_at DESC").map_err(|error| error.to_string())?;
+    // Keep the queue in creation order. `updated_at` changes with every
+    // progress update and made concurrently downloading rows jump around.
+    let mut statement = connection.prepare("SELECT rowid,file_id,filename,size,progress,status,speed,destination FROM network_downloads ORDER BY rowid DESC").map_err(|error| error.to_string())?;
     let rows = statement
         .query_map([], |row| {
             Ok(super::Transfer {
@@ -1022,12 +1533,12 @@ fn profile_fingerprint(
     hex::encode(digest.finalize())
 }
 
-type PublishFile = (String, String, u64, String, String);
+type PublishFile = (String, String, u64, String, String, String);
 
 fn load_publish_files(db_path: &PathBuf) -> Result<Vec<PublishFile>, String> {
     let connection = super::open_connection(db_path)?;
     let mut statement = connection.prepare(
-        "SELECT file_id, filename, size, format, mime, path
+        "SELECT file_id, filename, size, format, mime, path, tags
          FROM files WHERE NOT EXISTS(SELECT 1 FROM blocked_files WHERE blocked_files.file_id=files.file_id)
          ORDER BY filename"
     ).map_err(|error| error.to_string())?;
@@ -1040,12 +1551,13 @@ fn load_publish_files(db_path: &PathBuf) -> Result<Vec<PublishFile>, String> {
                 row.get::<_, String>(3)?,
                 row.get::<_, String>(4)?,
                 row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
             ))
         })
         .map_err(|error| error.to_string())?;
     let mut files = Vec::new();
     for row in rows {
-        let (file_id, filename, size, format, mime, path) =
+        let (file_id, filename, size, format, mime, path, tags) =
             row.map_err(|error| error.to_string())?;
         let Ok(validated) = crate::audio::validate_audio(std::path::Path::new(&path)) else {
             continue;
@@ -1053,7 +1565,7 @@ fn load_publish_files(db_path: &PathBuf) -> Result<Vec<PublishFile>, String> {
         if validated.format != format || validated.mime != mime {
             continue;
         }
-        files.push((file_id, filename, size, format, mime));
+        files.push((file_id, filename, size, format, mime, tags));
     }
     Ok(files)
 }
@@ -1130,6 +1642,87 @@ fn mime_for_format(format: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trollbox_uses_a_separate_public_chat_kind_and_indexed_topic() {
+        let filter = serde_json::to_value(trollbox_filter(TROLLBOX_CACHE_LIMIT)).unwrap();
+        assert_eq!(filter["kinds"], serde_json::json!([9]));
+        assert_eq!(filter["#t"], serde_json::json!(["napstr-trollbox"]));
+        assert_eq!(filter["limit"], serde_json::json!(TROLLBOX_CACHE_LIMIT));
+        assert_eq!(safe_trollbox_name("  Alice  "), "Alice");
+        assert_eq!(safe_trollbox_name("bad\nname"), "napstr-user");
+        assert_eq!(safe_trollbox_name("Alice\u{202e}resu"), "napstr-user");
+        assert_eq!(
+            sanitise_public_chat_content("hello\nworld\u{202e}"),
+            "hello world"
+        );
+        assert_eq!(sanitise_public_chat_content(&"x".repeat(501)).len(), 500);
+        let event = EventBuilder::new(Kind::from(TROLLBOX_MESSAGE_KIND), "hello")
+            .tag(Tag::hashtag(TROLLBOX_HASHTAG))
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        assert_eq!(public_chat_topic(&event).as_deref(), Some(TROLLBOX_HASHTAG));
+    }
+
+    #[tokio::test]
+    async fn public_chat_events_are_queryable_without_a_relay_echo() {
+        let keys = Keys::generate();
+        let client = nostr_client(keys.clone());
+        let event = EventBuilder::new(Kind::from(TROLLBOX_MESSAGE_KIND), "hello")
+            .tag(Tag::hashtag(TROLLBOX_HASHTAG))
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        let status = client.database().save_event(&event).await.unwrap();
+        assert!(status.is_success());
+        let events = client
+            .database()
+            .query(trollbox_filter(TROLLBOX_CACHE_LIMIT))
+            .await
+            .unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events.first().map(|event| event.id), Some(event.id));
+    }
+
+    #[test]
+    fn trollbox_cache_retains_only_the_newest_200_verified_events() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        initialise_network_schema(&connection).unwrap();
+        let keys = Keys::generate();
+        for index in 0..205 {
+            let event = EventBuilder::new(
+                Kind::from(TROLLBOX_MESSAGE_KIND),
+                format!("message {index}"),
+            )
+            .tag(Tag::hashtag(TROLLBOX_HASHTAG))
+            .custom_created_at(Timestamp::from(index))
+            .sign_with_keys(&keys)
+            .unwrap();
+            persist_trollbox_event(&mut connection, &event).unwrap();
+        }
+        let count: i64 = connection
+            .query_row("SELECT count(*) FROM trollbox_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, TROLLBOX_CACHE_LIMIT as i64);
+        let oldest: i64 = connection
+            .query_row("SELECT min(created_at) FROM trollbox_events", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(oldest, 5);
+    }
+
+    #[test]
+    fn track_discussions_use_the_sha256_as_an_indexed_public_chat_topic() {
+        let file_id = "ab".repeat(32);
+        let topic = track_discussion_topic(&file_id).unwrap();
+        assert_eq!(topic, format!("napstr-{file_id}"));
+        let filter = serde_json::to_value(public_chat_filter(&topic, 100)).unwrap();
+        assert_eq!(filter["kinds"], serde_json::json!([9]));
+        assert_eq!(filter["#t"], serde_json::json!([topic]));
+        assert!(track_discussion_topic("not-a-sha256").is_err());
+    }
 
     #[test]
     fn test_profiles_use_separate_keyring_accounts() {

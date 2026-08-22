@@ -6,6 +6,11 @@ Napstr uses Nostr for discovery and Tor for private file sharing.
 
 https://napstr.net
 
+## Build your own Napstr!
+
+See the complete [Napstr protocol specification](PROTOCOL.md) for everything
+needed to build an interoperable client.
+
 ## Build from source
 
 Install [Node.js](https://nodejs.org/), [Rust](https://rustup.rs/), and the
@@ -40,7 +45,7 @@ Bundle for your platform before building.
 ## Implemented architecture
 
 - On first launch, Napstr creates a Nostr identity and securely stores its private key using your operating system's credential store.
-- Nostr publishes the searchable catalogue and live seeders; NIP-17 handles private download negotiation.
+- Nostr publishes the searchable catalogue, live seeders, NIP-C7 trollbox, and per-track discussions; NIP-17 handles private download negotiation.
 - A bundled Tor process carries transfers without a direct-IP fallback.
 - One recursively watched folder contains both downloads and shared audio.
 - Files are audio-validated and identified by SHA-256. Downloads use a responsive seeder, verify the complete hash, and are available in the built-in player.

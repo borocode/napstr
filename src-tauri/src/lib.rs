@@ -1,9 +1,10 @@
 use chrono::Utc;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::{HashMap, HashSet},
     fs::{self, File},
     io::{BufReader, Read, Seek},
     path::{Path, PathBuf},
@@ -11,6 +12,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
     },
+    time::UNIX_EPOCH,
 };
 use tauri::{Manager, State};
 use walkdir::WalkDir;
@@ -116,7 +118,7 @@ fn open_db(state: &State<'_, AppState>) -> Result<Connection, String> {
 fn open_connection(path: &Path) -> Result<Connection, String> {
     let connection = Connection::open(path).map_err(|error| error.to_string())?;
     connection
-        .busy_timeout(std::time::Duration::from_secs(5))
+        .busy_timeout(std::time::Duration::from_secs(15))
         .map_err(|error| error.to_string())?;
     Ok(connection)
 }
@@ -136,7 +138,8 @@ fn initialise_database(path: &Path, app_data: &Path) -> Result<(), String> {
            indexed_at TEXT NOT NULL,
            title TEXT NOT NULL DEFAULT '', artist TEXT NOT NULL DEFAULT '', album TEXT NOT NULL DEFAULT '',
            mime TEXT NOT NULL DEFAULT 'application/octet-stream', license TEXT NOT NULL DEFAULT 'unspecified',
-           description TEXT NOT NULL DEFAULT '', tags TEXT NOT NULL DEFAULT '', folder TEXT NOT NULL DEFAULT ''
+           description TEXT NOT NULL DEFAULT '', tags TEXT NOT NULL DEFAULT '', folder TEXT NOT NULL DEFAULT '',
+           modified_ns INTEGER NOT NULL DEFAULT 0
          );
          CREATE TABLE IF NOT EXISTS transfers (
            id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -170,6 +173,7 @@ fn initialise_database(path: &Path, app_data: &Path) -> Result<(), String> {
         ("description", "TEXT NOT NULL DEFAULT ''"),
         ("tags", "TEXT NOT NULL DEFAULT ''"),
         ("folder", "TEXT NOT NULL DEFAULT ''"),
+        ("modified_ns", "INTEGER NOT NULL DEFAULT 0"),
     ] {
         ensure_column(&connection, "files", column, declaration)?;
     }
@@ -277,7 +281,7 @@ fn library_folder(root: &Path, file: &Path) -> String {
 fn load_files(connection: &Connection, query: Option<&str>) -> Result<Vec<SharedFile>, String> {
     let mut statement = connection
         .prepare(
-            "SELECT file_id, filename, path, size, format, mime, folder FROM files
+            "SELECT file_id, filename, path, size, format, mime, folder, tags FROM files
          WHERE format IN ('MP3','FLAC','WAV','OGG','OPUS')
            AND NOT EXISTS(SELECT 1 FROM blocked_files WHERE blocked_files.file_id=files.file_id)
          ORDER BY filename",
@@ -301,7 +305,7 @@ fn load_files(connection: &Connection, query: Option<&str>) -> Result<Vec<Shared
                 mime: row.get(5)?,
                 license: "unspecified".into(),
                 description: String::new(),
-                tags: String::new(),
+                tags: row.get(7)?,
             })
         })
         .map_err(|error| error.to_string())?;
@@ -311,7 +315,7 @@ fn load_files(connection: &Connection, query: Option<&str>) -> Result<Vec<Shared
     let query = query.unwrap_or_default();
     Ok(files
         .into_iter()
-        .filter(|file| search_matches(query, &[&file.filename]))
+        .filter(|file| search_matches(query, &[&file.filename, &file.tags]))
         .collect())
 }
 
@@ -450,6 +454,21 @@ fn hash_file(path: &Path) -> Result<(String, u64), String> {
     hash_open_file(&file)
 }
 
+fn modified_ns(metadata: &fs::Metadata) -> i64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| {
+            duration
+                .as_secs()
+                .saturating_mul(1_000_000_000)
+                .saturating_add(u64::from(duration.subsec_nanos()))
+                .min(i64::MAX as u64) as i64
+        })
+        .unwrap_or(0)
+}
+
 pub(crate) fn upsert_verified_file(
     connection: &Connection,
     folder_root: &Path,
@@ -463,12 +482,16 @@ pub(crate) fn upsert_verified_file(
         .and_then(|name| name.to_str())
         .unwrap_or("Unnamed file");
     let relative_folder = library_folder(folder_root, path);
+    let modified = fs::metadata(path)
+        .map(|metadata| modified_ns(&metadata))
+        .unwrap_or(0);
     connection
         .execute(
-            "INSERT INTO files (file_id, filename, path, size, format, indexed_at, mime, folder)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            "INSERT INTO files (file_id, filename, path, size, format, indexed_at, mime, folder, modified_ns)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT(file_id) DO UPDATE SET filename=excluded.filename,path=excluded.path,size=excluded.size,
-             format=excluded.format,mime=excluded.mime,folder=excluded.folder,indexed_at=excluded.indexed_at",
+             format=excluded.format,mime=excluded.mime,folder=excluded.folder,indexed_at=excluded.indexed_at,
+             modified_ns=excluded.modified_ns",
             params![
                 file_id,
                 filename,
@@ -477,7 +500,8 @@ pub(crate) fn upsert_verified_file(
                 audio.format,
                 Utc::now().to_rfc3339(),
                 audio.mime,
-                relative_folder
+                relative_folder,
+                modified
             ],
         )
         .map_err(|error| error.to_string())?;
@@ -488,15 +512,35 @@ fn index_path(connection: &mut Connection, folder: &Path) -> Result<IndexReport,
     if !folder.is_dir() {
         return Err("The selected Napstr folder does not exist or is not a directory".into());
     }
-    let transaction = connection
-        .transaction()
-        .map_err(|error| error.to_string())?;
-    transaction.execute_batch("DROP TABLE IF EXISTS temp.napstr_seen; CREATE TEMP TABLE napstr_seen(file_id TEXT PRIMARY KEY);").map_err(|error| error.to_string())?;
     let mut report = IndexReport {
         file_count: 0,
         total_bytes: 0,
         errors: Vec::new(),
     };
+    let mut verified = Vec::new();
+    let existing = {
+        let mut statement = connection
+            .prepare("SELECT path,file_id,size,modified_ns FROM files")
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    (
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)? as u64,
+                        row.get::<_, i64>(3)?,
+                    ),
+                ))
+            })
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<HashMap<_, _>, _>>()
+            .map_err(|error| error.to_string())?
+    };
+
+    // Audio validation and SHA-256 hashing can take a while. Do all filesystem
+    // work before opening a write transaction so downloads and progress
+    // updates are not blocked for the duration of a rescan.
     for entry in WalkDir::new(folder)
         .follow_links(false)
         .into_iter()
@@ -511,35 +555,72 @@ fn index_path(connection: &mut Connection, folder: &Path) -> Result<IndexReport,
         })
     {
         let path = entry.path();
+        let metadata = match fs::metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                report.errors.push(format!("{}: {error}", path.display()));
+                continue;
+            }
+        };
+        let path_key = path.to_string_lossy();
+        let current_modified_ns = modified_ns(&metadata);
+        if current_modified_ns != 0 {
+            if let Some((file_id, size, stored_modified_ns)) = existing.get(path_key.as_ref()) {
+                if *size == metadata.len() && *stored_modified_ns == current_modified_ns {
+                    verified.push((path.to_path_buf(), None, file_id.clone(), *size));
+                    continue;
+                }
+            }
+        }
         match audio::validate_audio(path)
             .and_then(|audio| hash_file(path).map(|hash| (audio, hash)))
         {
             Ok((audio, (file_id, size))) => {
-                let blocked: bool = transaction
-                    .query_row(
-                        "SELECT EXISTS(SELECT 1 FROM blocked_files WHERE file_id=?1)",
-                        [&file_id],
-                        |row| row.get(0),
-                    )
-                    .map_err(|error| error.to_string())?;
-                if blocked {
-                    report
-                        .errors
-                        .push(format!("{}: this file hash is blocked", path.display()));
-                    continue;
+                let unchanged_during_hash = fs::metadata(path)
+                    .map(|after| after.len() == size && modified_ns(&after) == current_modified_ns)
+                    .unwrap_or(false);
+                if unchanged_during_hash {
+                    verified.push((path.to_path_buf(), Some(audio), file_id, size));
+                } else {
+                    report.errors.push(format!(
+                        "{}: file changed while it was being indexed",
+                        path.display()
+                    ));
                 }
-                upsert_verified_file(&transaction, folder, path, &file_id, size, audio)?;
-                transaction
-                    .execute(
-                        "INSERT OR IGNORE INTO napstr_seen(file_id) VALUES (?1)",
-                        [file_id],
-                    )
-                    .map_err(|error| error.to_string())?;
-                report.file_count += 1;
-                report.total_bytes += size;
             }
             Err(error) => report.errors.push(format!("{}: {}", path.display(), error)),
         }
+    }
+
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| error.to_string())?;
+    transaction.execute_batch("DROP TABLE IF EXISTS temp.napstr_seen; CREATE TEMP TABLE napstr_seen(file_id TEXT PRIMARY KEY);").map_err(|error| error.to_string())?;
+    for (path, audio, file_id, size) in verified {
+        let blocked: bool = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM blocked_files WHERE file_id=?1)",
+                [&file_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if blocked {
+            report
+                .errors
+                .push(format!("{}: this file hash is blocked", path.display()));
+            continue;
+        }
+        if let Some(audio) = audio {
+            upsert_verified_file(&transaction, folder, &path, &file_id, size, audio)?;
+        }
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO napstr_seen(file_id) VALUES (?1)",
+                [file_id],
+            )
+            .map_err(|error| error.to_string())?;
+        report.file_count += 1;
+        report.total_bytes += size;
     }
     transaction
         .execute(
@@ -853,6 +934,25 @@ fn open_with_system(path: &Path, description: &str) -> Result<(), String> {
     }
 }
 
+fn is_trusted_release_url(url: &str) -> bool {
+    let Some(tag) = url.strip_prefix("https://github.com/lnbits/napstr/releases/tag/") else {
+        return false;
+    };
+    !tag.is_empty()
+        && tag.len() <= 100
+        && tag
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+' | b'_'))
+}
+
+#[tauri::command]
+fn open_release_url(url: String) -> Result<(), String> {
+    if !is_trusted_release_url(&url) {
+        return Err("refused to open an untrusted release URL".into());
+    }
+    open_with_system(Path::new(&url), "Napstr release")
+}
+
 #[tauri::command]
 fn open_napstr_folder(state: State<'_, AppState>) -> Result<(), String> {
     let folder = PathBuf::from(get_setting(&open_db(&state)?, "shared_folder")?);
@@ -892,6 +992,56 @@ fn validate_length(label: &str, value: &str, maximum: usize) -> Result<(), Strin
     } else {
         Ok(())
     }
+}
+
+pub(crate) fn normalise_tags(value: &str) -> Result<String, String> {
+    validate_length("tags", value, 256)?;
+    let mut seen = HashSet::new();
+    let mut tags = Vec::new();
+    for value in value
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        validate_length("each tag", value, 32)?;
+        if value.chars().any(char::is_control) {
+            return Err("tags cannot contain control characters".into());
+        }
+        let key = value.to_lowercase();
+        if seen.insert(key) {
+            tags.push(value);
+        }
+    }
+    if tags.len() > 12 {
+        return Err("a track can have at most 12 tags".into());
+    }
+    Ok(tags.join(", "))
+}
+
+#[tauri::command]
+fn save_file_tags(
+    file_id: String,
+    tags: String,
+    state: State<'_, AppState>,
+) -> Result<AppSnapshot, String> {
+    if !hex::decode(&file_id)
+        .map(|bytes| bytes.len() == 32)
+        .unwrap_or(false)
+    {
+        return Err("invalid SHA-256 file ID".into());
+    }
+    let tags = normalise_tags(&tags)?;
+    let connection = open_db(&state)?;
+    let changed = connection
+        .execute(
+            "UPDATE files SET tags=?1 WHERE file_id=?2",
+            params![tags, file_id],
+        )
+        .map_err(|error| error.to_string())?;
+    if changed != 1 {
+        return Err("track is no longer in the Napstr folder".into());
+    }
+    snapshot(&connection)
 }
 
 #[tauri::command]
@@ -979,6 +1129,45 @@ async fn network_search(
 }
 
 #[tauri::command]
+async fn get_trollbox_messages(
+    state: State<'_, AppState>,
+) -> Result<Vec<network::TrollboxMessage>, String> {
+    state.network.trollbox_messages().await
+}
+
+#[tauri::command]
+async fn send_trollbox_message(
+    content: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    state.network.send_trollbox_message(content).await
+}
+
+#[tauri::command]
+async fn get_track_discussion_messages(
+    file_id: String,
+    subscribe: bool,
+    state: State<'_, AppState>,
+) -> Result<Vec<network::TrollboxMessage>, String> {
+    state
+        .network
+        .track_discussion_messages(file_id, subscribe)
+        .await
+}
+
+#[tauri::command]
+async fn send_track_discussion_message(
+    file_id: String,
+    content: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    state
+        .network
+        .send_track_discussion_message(file_id, content)
+        .await
+}
+
+#[tauri::command]
 async fn request_network_download(
     file_id: String,
     source_pubkeys: Vec<String>,
@@ -1027,6 +1216,9 @@ fn block_user(pubkey: String, state: State<'_, AppState>) -> Result<(), String> 
             "DELETE FROM remote_catalogue WHERE source_pubkey=?1",
             [&pubkey],
         )
+        .map_err(|error| error.to_string())?;
+    connection
+        .execute("DELETE FROM trollbox_events WHERE pubkey=?1", [&pubkey])
         .map_err(|error| error.to_string())?;
     Ok(())
 }
@@ -1086,7 +1278,8 @@ pub fn run() {
             initialise_database(&db_path, &app_data)?;
             let tor = Arc::new(tor::TorManager::new(app_data, resource_dir));
             let transfers = Arc::new(transfer::TransferService::new(db_path.clone(), tor.clone()));
-            let network = network::NetworkService::new(db_path.clone(), transfers);
+            let network =
+                network::NetworkService::new(db_path.clone(), transfers, app.handle().clone());
             *setup_shutdown_services
                 .lock()
                 .map_err(|_| "shutdown service lock was poisoned")? = Some(ShutdownServices {
@@ -1124,10 +1317,12 @@ pub fn run() {
             search_catalog,
             set_napstr_folder,
             rescan_napstr_folder,
+            save_file_tags,
             save_settings,
             remove_transfer,
             get_transfers,
             open_napstr_folder,
+            open_release_url,
             player::play_audio,
             player::toggle_audio,
             player::stop_audio,
@@ -1142,6 +1337,10 @@ pub fn run() {
             publish_catalogue,
             publish_profile,
             network_search,
+            get_trollbox_messages,
+            send_trollbox_message,
+            get_track_discussion_messages,
+            send_track_discussion_message,
             request_network_download,
             block_file,
             block_user,
@@ -1173,6 +1372,22 @@ mod tests {
 
     fn test_directory(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("napstr-{name}-{}", std::process::id()))
+    }
+
+    #[test]
+    fn release_links_are_limited_to_this_repository() {
+        assert!(is_trusted_release_url(
+            "https://github.com/lnbits/napstr/releases/tag/v0.2.3"
+        ));
+        assert!(is_trusted_release_url(
+            "https://github.com/lnbits/napstr/releases/tag/v0.3.0-beta.1"
+        ));
+        assert!(!is_trusted_release_url(
+            "https://github.com/another/repository/releases/tag/v0.2.3"
+        ));
+        assert!(!is_trusted_release_url(
+            "https://github.com/lnbits/napstr/releases/tag/v0.2.3?redirect=bad"
+        ));
     }
 
     #[test]
@@ -1211,6 +1426,17 @@ mod tests {
         let indexed = load_files(&connection, None).unwrap();
         assert_eq!(indexed.len(), 1);
         assert_eq!(indexed[0].folder, "artist/album");
+        connection
+            .execute(
+                "UPDATE files SET tags='punk, favourite' WHERE file_id=?1",
+                [&indexed[0].file_id],
+            )
+            .unwrap();
+        let report = index_path(&mut connection, &directory).unwrap();
+        assert_eq!(report.file_count, 1);
+        let tagged = load_files(&connection, Some("FAVOURITE")).unwrap();
+        assert_eq!(tagged.len(), 1);
+        assert_eq!(tagged[0].tags, "punk, favourite");
         fs::remove_file(&audio).unwrap();
         let report = index_path(&mut connection, &directory).unwrap();
         assert_eq!(report.file_count, 0);
@@ -1227,6 +1453,21 @@ mod tests {
         assert!(search_matches("sandman metallica", &fields));
         assert!(search_matches("metalica", &fields));
         assert!(!search_matches("metallica mario", &fields));
+    }
+
+    #[test]
+    fn normalises_and_limits_track_tags() {
+        assert_eq!(
+            normalise_tags(" punk, Live ,PUNK, audiobook ").unwrap(),
+            "punk, Live, audiobook"
+        );
+        assert!(normalise_tags("bad\ntag").is_err());
+        let too_many = (0..13)
+            .map(|index| format!("tag{index}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(normalise_tags(&too_many).is_err());
+        assert!(normalise_tags(&"x".repeat(33)).is_err());
     }
 
     #[test]
