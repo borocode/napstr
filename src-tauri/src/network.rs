@@ -12,7 +12,7 @@ use std::{
     str::FromStr,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc,
+        Arc, Mutex as StdMutex,
     },
     time::Duration,
 };
@@ -30,6 +30,7 @@ const PUBLIC_CHAT_EVENT: &str = "napstr-public-chat";
 const TROLLBOX_CACHE_LIMIT: usize = 200;
 const LIVE_NOSTR_EVENT_LIMIT: usize = 35_000;
 const MAX_SEEDER_CANDIDATES: usize = 3;
+const CATALOGUE_EVENT_PACE: Duration = Duration::from_millis(75);
 
 pub fn validate_profile_picture(value: &str) -> Result<(), String> {
     if value.trim().is_empty() {
@@ -142,6 +143,12 @@ pub struct NetworkService {
     client: RwLock<Option<Client>>,
     keys: RwLock<Option<Keys>>,
     start_lock: Mutex<()>,
+    catalogue_publish_lock: Mutex<()>,
+    catalogue_publish_requested: AtomicBool,
+    catalogue_availability_requested: AtomicBool,
+    catalogue_reconcile_requested: AtomicBool,
+    catalogue_pending_ids: StdMutex<HashSet<String>>,
+    catalogue_publish_worker_running: AtomicBool,
     trollbox_cache_lock: Mutex<()>,
     track_discussion_subscription_lock: Mutex<()>,
     connected: AtomicBool,
@@ -163,6 +170,12 @@ impl NetworkService {
             client: RwLock::new(None),
             keys: RwLock::new(None),
             start_lock: Mutex::new(()),
+            catalogue_publish_lock: Mutex::new(()),
+            catalogue_publish_requested: AtomicBool::new(false),
+            catalogue_availability_requested: AtomicBool::new(false),
+            catalogue_reconcile_requested: AtomicBool::new(false),
+            catalogue_pending_ids: StdMutex::new(HashSet::new()),
+            catalogue_publish_worker_running: AtomicBool::new(false),
             trollbox_cache_lock: Mutex::new(()),
             track_discussion_subscription_lock: Mutex::new(()),
             connected: AtomicBool::new(false),
@@ -174,6 +187,98 @@ impl NetworkService {
 
     pub fn transfers(&self) -> &Arc<TransferService> {
         &self.transfers
+    }
+
+    pub fn queue_catalogue_publish(self: &Arc<Self>, force_availability: bool) {
+        self.catalogue_reconcile_requested
+            .store(true, Ordering::SeqCst);
+        self.queue_catalogue_work(std::iter::empty(), force_availability);
+    }
+
+    pub fn queue_catalogue_files(self: &Arc<Self>, file_ids: impl IntoIterator<Item = String>) {
+        self.queue_catalogue_work(file_ids, false);
+    }
+
+    fn queue_catalogue_work(
+        self: &Arc<Self>,
+        file_ids: impl IntoIterator<Item = String>,
+        force_availability: bool,
+    ) {
+        if let Ok(mut pending) = self.catalogue_pending_ids.lock() {
+            pending.extend(file_ids);
+        } else {
+            self.catalogue_reconcile_requested
+                .store(true, Ordering::SeqCst);
+        }
+        self.catalogue_publish_requested
+            .store(true, Ordering::SeqCst);
+        if force_availability {
+            self.catalogue_availability_requested
+                .store(true, Ordering::SeqCst);
+        }
+        if !self.connected.load(Ordering::SeqCst)
+            || self
+                .catalogue_publish_worker_running
+                .swap(true, Ordering::SeqCst)
+        {
+            return;
+        }
+        let service = self.clone();
+        tauri::async_runtime::spawn(async move {
+            let mut retry_delay = 1u64;
+            while service.connected.load(Ordering::SeqCst)
+                && service
+                    .catalogue_publish_requested
+                    .swap(false, Ordering::SeqCst)
+            {
+                let force_availability = service
+                    .catalogue_availability_requested
+                    .swap(false, Ordering::SeqCst);
+                let reconcile = service
+                    .catalogue_reconcile_requested
+                    .swap(false, Ordering::SeqCst);
+                let pending_ids = service
+                    .catalogue_pending_ids
+                    .lock()
+                    .map(|mut pending| pending.drain().collect::<HashSet<_>>())
+                    .unwrap_or_default();
+                match service
+                    .publish_catalogue_once(&pending_ids, reconcile, force_availability)
+                    .await
+                {
+                    Ok(_) => {
+                        retry_delay = 1;
+                        tokio::time::sleep(Duration::from_millis(150)).await;
+                    }
+                    Err(_) => {
+                        if let Ok(mut pending) = service.catalogue_pending_ids.lock() {
+                            pending.extend(pending_ids);
+                        }
+                        if reconcile {
+                            service
+                                .catalogue_reconcile_requested
+                                .store(true, Ordering::SeqCst);
+                        }
+                        service
+                            .catalogue_publish_requested
+                            .store(true, Ordering::SeqCst);
+                        service
+                            .catalogue_availability_requested
+                            .store(true, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_secs(retry_delay)).await;
+                        retry_delay = (retry_delay * 2).min(30);
+                    }
+                }
+            }
+            service
+                .catalogue_publish_worker_running
+                .store(false, Ordering::SeqCst);
+            if service.connected.load(Ordering::SeqCst)
+                && service.catalogue_publish_requested.load(Ordering::SeqCst)
+            {
+                service.queue_catalogue_work(std::iter::empty(), false);
+            }
+        });
     }
 
     pub async fn start(self: &Arc<Self>) -> Result<NetworkStatus, String> {
@@ -285,7 +390,7 @@ impl NetworkService {
             }
         });
 
-        self.publish_catalogue().await?;
+        self.queue_catalogue_publish(true);
         let heartbeat = self.clone();
         tokio::spawn(async move {
             while heartbeat.connected.load(Ordering::SeqCst)
@@ -355,25 +460,48 @@ impl NetworkService {
         })
     }
 
-    pub async fn publish_catalogue(&self) -> Result<usize, String> {
+    async fn publish_catalogue_once(
+        &self,
+        pending_ids: &HashSet<String>,
+        reconcile: bool,
+        force_availability: bool,
+    ) -> Result<usize, String> {
+        let _publish_guard = self.catalogue_publish_lock.lock().await;
         let client = self
             .client
             .read()
             .await
             .clone()
             .ok_or("Nostr is not connected")?;
-        let files = load_publish_files(&self.db_path)?;
+        let db_path = self.db_path.clone();
+        let pending_ids = pending_ids.clone();
+        let (files, published_fingerprints) = tauri::async_runtime::spawn_blocking(move || {
+            let files = if reconcile {
+                load_publish_files(&db_path)?
+            } else {
+                load_publish_files_by_id(&db_path, &pending_ids)?
+            };
+            Ok::<_, String>((files, load_published_fingerprints(&db_path)?))
+        })
+        .await
+        .map_err(|error| format!("catalogue preparation task failed: {error}"))??;
         if !files.is_empty() {
             let transfers = self.transfers.clone();
             tokio::spawn(async move {
                 let _ = transfers.warm_for_sharing().await;
             });
         }
+        let publication_db = super::open_connection(&self.db_path)?;
         let current_ids: HashSet<String> = files.iter().map(|file| file.0.clone()).collect();
-        let stale = load_published_ids(&self.db_path)?
-            .into_iter()
-            .filter(|id| !current_ids.contains(id))
-            .collect::<Vec<_>>();
+        let stale = if reconcile {
+            published_fingerprints
+                .keys()
+                .filter(|id| !current_ids.contains(*id))
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         for file_id in stale {
             let tags = vec![
                 Tag::parse(["d", file_id.as_str()]),
@@ -392,14 +520,16 @@ impl NetworkService {
                 )
                 .await
                 .map_err(|error| format!("catalogue withdrawal failed: {error}"))?;
-            super::open_connection(&self.db_path)?
+            publication_db
                 .execute(
                     "DELETE FROM published_catalogue WHERE file_id=?1",
                     [&file_id],
                 )
                 .map_err(|error| error.to_string())?;
+            tokio::time::sleep(CATALOGUE_EVENT_PACE).await;
         }
         let mut published = 0;
+        let mut published_ids = Vec::new();
         for (file_id, filename, size, format, mime, catalogue_tags) in files {
             let content = CatalogueContent {
                 protocol: "napstr/1".into(),
@@ -419,6 +549,24 @@ impl NetworkService {
                 description: String::new(),
                 tags: catalogue_tags,
             };
+            let content_json =
+                serde_json::to_string(&content).map_err(|error| error.to_string())?;
+            let fingerprint = hex::encode(Sha256::digest(content_json.as_bytes()));
+            if published_fingerprints.get(&file_id) == Some(&fingerprint) {
+                continue;
+            }
+            if published_fingerprints
+                .get(&file_id)
+                .is_some_and(|existing| existing.is_empty())
+            {
+                publication_db
+                    .execute(
+                        "UPDATE published_catalogue SET fingerprint=?1 WHERE file_id=?2",
+                        params![fingerprint, file_id],
+                    )
+                    .map_err(|error| error.to_string())?;
+                continue;
+            }
             let tags = vec![
                 Tag::parse(["d", file_id.as_str()]),
                 Tag::parse(["t", "napstr"]),
@@ -433,18 +581,21 @@ impl NetworkService {
             .map_err(|error| error.to_string())?;
             client
                 .send_event_builder(
-                    EventBuilder::new(
-                        Kind::from(CATALOGUE_KIND),
-                        serde_json::to_string(&content).map_err(|error| error.to_string())?,
-                    )
-                    .tags(tags),
+                    EventBuilder::new(Kind::from(CATALOGUE_KIND), content_json).tags(tags),
                 )
                 .await
                 .map_err(|error| format!("catalogue publication failed for {filename}: {error}"))?;
-            super::open_connection(&self.db_path)?.execute("INSERT OR REPLACE INTO published_catalogue(file_id,published_at) VALUES (?1,?2)", params![file_id, Utc::now().to_rfc3339()]).map_err(|error| error.to_string())?;
+            publication_db.execute("INSERT OR REPLACE INTO published_catalogue(file_id,published_at,fingerprint) VALUES (?1,?2,?3)", params![file_id, Utc::now().to_rfc3339(), fingerprint]).map_err(|error| error.to_string())?;
             published += 1;
+            published_ids.push(file_id);
+            tokio::time::sleep(CATALOGUE_EVENT_PACE).await;
         }
-        self.publish_availability().await?;
+        if force_availability {
+            self.publish_availability().await?;
+        } else if !published_ids.is_empty() {
+            self.publish_availability_delta(&client, &published_ids)
+                .await?;
+        }
         Ok(published)
     }
 
@@ -772,10 +923,17 @@ impl NetworkService {
             .await
             .clone()
             .ok_or("Nostr is not connected")?;
-        let ids = load_publish_files(&self.db_path)?
-            .into_iter()
-            .map(|file| file.0)
-            .collect::<Vec<_>>();
+        let db_path = self.db_path.clone();
+        let ids = tauri::async_runtime::spawn_blocking(move || {
+            Ok::<_, String>(
+                load_publish_files(&db_path)?
+                    .into_iter()
+                    .map(|file| file.0)
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .await
+        .map_err(|error| format!("availability preparation task failed: {error}"))??;
         let expiration = (Utc::now().timestamp() + 10 * 60).to_string();
         let batches: Vec<&[String]> = if ids.is_empty() {
             vec![&[]]
@@ -802,6 +960,39 @@ impl NetworkService {
                 )
                 .await
                 .map_err(|error| format!("availability heartbeat failed: {error}"))?;
+            tokio::time::sleep(CATALOGUE_EVENT_PACE).await;
+        }
+        Ok(())
+    }
+
+    async fn publish_availability_delta(
+        &self,
+        client: &Client,
+        ids: &[String],
+    ) -> Result<(), String> {
+        let expiration = (Utc::now().timestamp() + 10 * 60).to_string();
+        let delta_id = Uuid::new_v4().to_string();
+        for (index, batch) in ids.chunks(400).enumerate() {
+            let batch_id = format!("availability-delta-{delta_id}-{index:04}");
+            let tags = vec![
+                Tag::parse(["d", batch_id.as_str()]),
+                Tag::parse(["t", "napstr-availability"]),
+                Tag::parse(["expiration", expiration.as_str()]),
+            ]
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+            client
+                .send_event_builder(
+                    EventBuilder::new(
+                        Kind::from(AVAILABILITY_KIND),
+                        serde_json::to_string(batch).map_err(|error| error.to_string())?,
+                    )
+                    .tags(tags),
+                )
+                .await
+                .map_err(|error| format!("incremental availability failed: {error}"))?;
+            tokio::time::sleep(CATALOGUE_EVENT_PACE).await;
         }
         Ok(())
     }
@@ -1442,7 +1633,9 @@ pub fn initialise_network_schema(connection: &Connection) -> Result<(), String> 
            PRIMARY KEY(request_id, source_pubkey),
            FOREIGN KEY(request_id) REFERENCES network_downloads(request_id) ON DELETE CASCADE
          );
-         CREATE TABLE IF NOT EXISTS published_catalogue (file_id TEXT PRIMARY KEY, published_at TEXT NOT NULL);
+         CREATE TABLE IF NOT EXISTS published_catalogue (
+           file_id TEXT PRIMARY KEY, published_at TEXT NOT NULL, fingerprint TEXT NOT NULL DEFAULT ''
+         );
          CREATE TABLE IF NOT EXISTS trollbox_events (
            event_id TEXT PRIMARY KEY, pubkey TEXT NOT NULL, event_json TEXT NOT NULL, created_at INTEGER NOT NULL
          );
@@ -1451,6 +1644,7 @@ pub fn initialise_network_schema(connection: &Connection) -> Result<(), String> 
     ).map_err(|error| error.to_string())
     .and_then(|_| super::ensure_column(connection, "remote_catalogue", "description", "TEXT NOT NULL DEFAULT ''"))
     .and_then(|_| super::ensure_column(connection, "remote_catalogue", "tags", "TEXT NOT NULL DEFAULT ''"))
+    .and_then(|_| super::ensure_column(connection, "published_catalogue", "fingerprint", "TEXT NOT NULL DEFAULT ''"))
 }
 
 pub fn load_network_transfers(connection: &Connection) -> Result<Vec<super::Transfer>, String> {
@@ -1534,53 +1728,90 @@ fn profile_fingerprint(
 }
 
 type PublishFile = (String, String, u64, String, String, String);
+type PublishFileRecord = (String, String, u64, String, String, String, String, i64);
+
+fn publish_file_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PublishFileRecord> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get::<_, i64>(2)? as u64,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+    ))
+}
+
+fn current_publish_file(record: PublishFileRecord) -> Option<PublishFile> {
+    let (file_id, filename, size, format, mime, path, tags, indexed_modified_ns) = record;
+    let metadata = std::fs::metadata(path).ok()?;
+    if metadata.len() != size || super::modified_ns(&metadata) != indexed_modified_ns {
+        return None;
+    }
+    Some((file_id, filename, size, format, mime, tags))
+}
 
 fn load_publish_files(db_path: &PathBuf) -> Result<Vec<PublishFile>, String> {
     let connection = super::open_connection(db_path)?;
     let mut statement = connection.prepare(
-        "SELECT file_id, filename, size, format, mime, path, tags
+        "SELECT file_id, filename, size, format, mime, path, tags, modified_ns
          FROM files WHERE NOT EXISTS(SELECT 1 FROM blocked_files WHERE blocked_files.file_id=files.file_id)
-         ORDER BY filename"
+         ORDER BY filename,file_id"
     ).map_err(|error| error.to_string())?;
     let rows = statement
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)? as u64,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, String>(6)?,
-            ))
-        })
+        .query_map([], publish_file_from_row)
         .map_err(|error| error.to_string())?;
     let mut files = Vec::new();
     for row in rows {
-        let (file_id, filename, size, format, mime, path, tags) =
-            row.map_err(|error| error.to_string())?;
-        let Ok(validated) = crate::audio::validate_audio(std::path::Path::new(&path)) else {
-            continue;
-        };
-        if validated.format != format || validated.mime != mime {
-            continue;
+        if let Some(file) = current_publish_file(row.map_err(|error| error.to_string())?) {
+            files.push(file);
         }
-        files.push((file_id, filename, size, format, mime, tags));
     }
     Ok(files)
 }
 
-fn load_published_ids(db_path: &PathBuf) -> Result<Vec<String>, String> {
+fn load_publish_files_by_id(
+    db_path: &PathBuf,
+    file_ids: &HashSet<String>,
+) -> Result<Vec<PublishFile>, String> {
+    if file_ids.is_empty() {
+        return Ok(Vec::new());
+    }
     let connection = super::open_connection(db_path)?;
     let mut statement = connection
-        .prepare("SELECT file_id FROM published_catalogue")
+        .prepare(
+            "SELECT file_id, filename, size, format, mime, path, tags, modified_ns
+             FROM files
+             WHERE file_id=?1
+               AND NOT EXISTS(SELECT 1 FROM blocked_files WHERE blocked_files.file_id=files.file_id)",
+        )
         .map_err(|error| error.to_string())?;
-    let ids = statement
-        .query_map([], |row| row.get(0))
+    let mut files = Vec::with_capacity(file_ids.len());
+    for file_id in file_ids {
+        let record = statement
+            .query_row([file_id], publish_file_from_row)
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if let Some(file) = record.and_then(current_publish_file) {
+            files.push(file);
+        }
+    }
+    files.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0)));
+    Ok(files)
+}
+
+fn load_published_fingerprints(db_path: &PathBuf) -> Result<HashMap<String, String>, String> {
+    let connection = super::open_connection(db_path)?;
+    let mut statement = connection
+        .prepare("SELECT file_id,fingerprint FROM published_catalogue")
+        .map_err(|error| error.to_string())?;
+    let entries = statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
         .map_err(|error| error.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())?;
-    Ok(ids)
+    Ok(entries.into_iter().collect())
 }
 
 fn relay_urls(value: &str) -> Vec<String> {
@@ -1683,6 +1914,30 @@ mod tests {
 
         assert_eq!(events.len(), 1);
         assert_eq!(events.first().map(|event| event.id), Some(event.id));
+    }
+
+    #[test]
+    fn catalogue_schema_migrates_publication_fingerprints() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE published_catalogue (
+                   file_id TEXT PRIMARY KEY, published_at TEXT NOT NULL
+                 );
+                 INSERT INTO published_catalogue(file_id,published_at) VALUES('abc','now');",
+            )
+            .unwrap();
+
+        initialise_network_schema(&connection).unwrap();
+
+        let fingerprint: String = connection
+            .query_row(
+                "SELECT fingerprint FROM published_catalogue WHERE file_id='abc'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(fingerprint.is_empty());
     }
 
     #[test]

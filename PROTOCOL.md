@@ -229,6 +229,13 @@ The reference client publishes immediately after its catalogue and every four
 minutes while connected. With no shared files it publishes an empty first
 group, allowing its previous first group to be replaced.
 
+While a large folder is still being indexed, the reference client may also
+publish short-lived incremental availability groups. Their `d` tag is
+`availability-delta-<uuid>-<four-digit group index>`. Each contains at most 400
+newly verified file IDs and uses the same tag, content, and 10-minute expiration
+rules as a regular heartbeat. A later full heartbeat covers the complete
+library; consumers treat both forms identically when building active pairs.
+
 Consumers query kind `30422` by the `napstr-availability` tag, discard expired
 events, and build active `(author public key, fileId)` pairs. An author is a live
 seeder for a catalogue entry only when its unexpired availability event contains

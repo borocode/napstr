@@ -1,6 +1,6 @@
 use chrono::Utc;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use rusqlite::{params, Connection, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -14,7 +14,7 @@ use std::{
     },
     time::UNIX_EPOCH,
 };
-use tauri::{Manager, State};
+use tauri::{Emitter, Manager, State};
 use walkdir::WalkDir;
 
 mod audio;
@@ -25,6 +25,12 @@ mod tor;
 mod transfer;
 
 const HASH_BUFFER_SIZE: usize = 256 * 1024;
+const MAX_INDEX_ERRORS: usize = 100;
+const INDEX_PROGRESS_INTERVAL: usize = 25;
+const INDEX_COMMIT_BATCH_SIZE: usize = 50;
+const LIBRARY_CHANGED_EVENT: &str = "napstr-library-changed";
+const INDEX_BATCH_EVENT: &str = "napstr-index-batch";
+const INDEX_PROGRESS_EVENT: &str = "napstr-index-progress";
 const DEFAULT_NOSTR_RELAYS: &str = "wss://relay.damus.io,wss://nos.lol,wss://relay.nostr.com,wss://relay.primal.net,wss://relay.snort.social,wss://nostr.mom";
 const LEGACY_DEFAULT_NOSTR_RELAYS: &str = "wss://relay.damus.io,wss://nos.lol";
 
@@ -33,6 +39,9 @@ struct AppState {
     network: Arc<network::NetworkService>,
     tor: Arc<tor::TorManager>,
     watcher: Mutex<Option<FolderWatcher>>,
+    scan_lock: Arc<Mutex<()>>,
+    scan_cancel: Arc<AtomicBool>,
+    app_handle: tauri::AppHandle,
     player: Arc<player::NativePlayer>,
     recovering_after_sleep: Arc<AtomicBool>,
 }
@@ -98,13 +107,34 @@ struct AppSnapshot {
     native: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct IndexReport {
     file_count: usize,
     total_bytes: u64,
     errors: Vec<String>,
+    error_count: usize,
+    changed_files: usize,
 }
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct IndexProgress {
+    scanning: bool,
+    processed_files: usize,
+    indexed_files: usize,
+    message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct IndexBatch {
+    files: Vec<SharedFile>,
+    file_count: usize,
+    total_bytes: u64,
+}
+
+type VerifiedIndexFile = (PathBuf, Option<audio::AudioInfo>, String, u64);
 
 fn open_db(state: &State<'_, AppState>) -> Result<Connection, String> {
     let path = state
@@ -278,6 +308,27 @@ fn library_folder(root: &Path, file: &Path) -> String {
         .unwrap_or_default()
 }
 
+fn shared_file_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SharedFile> {
+    let path: String = row.get(2)?;
+    let filename: String = row.get(1)?;
+    Ok(SharedFile {
+        file_id: row.get(0)?,
+        filename: filename.clone(),
+        folder: row.get(6)?,
+        path,
+        size: row.get::<_, i64>(3)? as u64,
+        format: row.get(4)?,
+        status: "Published".into(),
+        title: filename,
+        artist: String::new(),
+        album: String::new(),
+        mime: row.get(5)?,
+        license: "unspecified".into(),
+        description: String::new(),
+        tags: row.get(7)?,
+    })
+}
+
 fn load_files(connection: &Connection, query: Option<&str>) -> Result<Vec<SharedFile>, String> {
     let mut statement = connection
         .prepare(
@@ -288,26 +339,7 @@ fn load_files(connection: &Connection, query: Option<&str>) -> Result<Vec<Shared
         )
         .map_err(|error| error.to_string())?;
     let rows = statement
-        .query_map([], |row| {
-            let path: String = row.get(2)?;
-            let filename: String = row.get(1)?;
-            Ok(SharedFile {
-                file_id: row.get(0)?,
-                filename: filename.clone(),
-                folder: row.get(6)?,
-                path,
-                size: row.get::<_, i64>(3)? as u64,
-                format: row.get(4)?,
-                status: "Published".into(),
-                title: filename,
-                artist: String::new(),
-                album: String::new(),
-                mime: row.get(5)?,
-                license: "unspecified".into(),
-                description: String::new(),
-                tags: row.get(7)?,
-            })
-        })
+        .query_map([], shared_file_from_row)
         .map_err(|error| error.to_string())?;
     let files = rows
         .collect::<Result<Vec<_>, _>>()
@@ -317,6 +349,31 @@ fn load_files(connection: &Connection, query: Option<&str>) -> Result<Vec<Shared
         .into_iter()
         .filter(|file| search_matches(query, &[&file.filename, &file.tags]))
         .collect())
+}
+
+fn load_files_by_id(
+    connection: &Connection,
+    file_ids: &[String],
+) -> Result<Vec<SharedFile>, String> {
+    let mut statement = connection
+        .prepare(
+            "SELECT file_id, filename, path, size, format, mime, folder, tags FROM files
+             WHERE file_id=?1
+               AND format IN ('MP3','FLAC','WAV','OGG','OPUS')
+               AND NOT EXISTS(SELECT 1 FROM blocked_files WHERE blocked_files.file_id=files.file_id)",
+        )
+        .map_err(|error| error.to_string())?;
+    let mut files = Vec::with_capacity(file_ids.len());
+    for file_id in file_ids {
+        if let Some(file) = statement
+            .query_row([file_id], shared_file_from_row)
+            .optional()
+            .map_err(|error| error.to_string())?
+        {
+            files.push(file);
+        }
+    }
+    Ok(files)
 }
 
 fn search_matches(query: &str, fields: &[&str]) -> bool {
@@ -508,7 +565,95 @@ pub(crate) fn upsert_verified_file(
     Ok(())
 }
 
-fn index_path(connection: &mut Connection, folder: &Path) -> Result<IndexReport, String> {
+fn supported_audio_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "mp3" | "flac" | "wav" | "ogg" | "opus"
+            )
+        })
+}
+
+fn record_index_error(report: &mut IndexReport, message: String) {
+    report.error_count += 1;
+    if report.errors.len() < MAX_INDEX_ERRORS {
+        report.errors.push(message);
+    }
+}
+
+fn validate_and_hash_index_file(
+    path: &Path,
+    expected_modified_ns: i64,
+) -> Result<VerifiedIndexFile, String> {
+    let audio = audio::validate_audio(path)?;
+    let (file_id, size) = hash_file(path)?;
+    let unchanged_during_hash = fs::metadata(path)
+        .map(|after| after.len() == size && modified_ns(&after) == expected_modified_ns)
+        .unwrap_or(false);
+    if !unchanged_during_hash {
+        return Err("file changed while it was being indexed".into());
+    }
+    Ok((path.to_path_buf(), Some(audio), file_id, size))
+}
+
+fn commit_index_batch(
+    connection: &mut Connection,
+    folder: &Path,
+    batch: &mut Vec<VerifiedIndexFile>,
+    report: &mut IndexReport,
+) -> Result<Vec<SharedFile>, String> {
+    if batch.is_empty() {
+        return Ok(Vec::new());
+    }
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Deferred)
+        .map_err(|error| error.to_string())?;
+    let mut changed_ids = Vec::new();
+    let mut changed_ids_seen = HashSet::new();
+    for (path, audio, file_id, size) in batch.drain(..) {
+        let blocked: bool = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM blocked_files WHERE file_id=?1)",
+                [&file_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if blocked {
+            record_index_error(
+                report,
+                format!("{}: this file hash is blocked", path.display()),
+            );
+            continue;
+        }
+        if let Some(audio) = audio {
+            upsert_verified_file(&transaction, folder, &path, &file_id, size, audio)?;
+            report.changed_files += 1;
+            if changed_ids_seen.insert(file_id.clone()) {
+                changed_ids.push(file_id.clone());
+            }
+        }
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO napstr_seen(file_id) VALUES (?1)",
+                [&file_id],
+            )
+            .map_err(|error| error.to_string())?;
+        report.file_count += 1;
+        report.total_bytes += size;
+    }
+    transaction.commit().map_err(|error| error.to_string())?;
+    load_files_by_id(connection, &changed_ids)
+}
+
+fn index_path_with_progress(
+    connection: &mut Connection,
+    folder: &Path,
+    cancelled: &AtomicBool,
+    mut progress: impl FnMut(usize, usize),
+    mut batch_committed: impl FnMut(IndexBatch),
+) -> Result<IndexReport, String> {
     if !folder.is_dir() {
         return Err("The selected Napstr folder does not exist or is not a directory".into());
     }
@@ -516,8 +661,11 @@ fn index_path(connection: &mut Connection, folder: &Path) -> Result<IndexReport,
         file_count: 0,
         total_bytes: 0,
         errors: Vec::new(),
+        error_count: 0,
+        changed_files: 0,
     };
-    let mut verified = Vec::new();
+    let mut verified = Vec::with_capacity(INDEX_COMMIT_BATCH_SIZE);
+    let mut processed_files = 0usize;
     let existing = {
         let mut statement = connection
             .prepare("SELECT path,file_id,size,modified_ns FROM files")
@@ -538,91 +686,89 @@ fn index_path(connection: &mut Connection, folder: &Path) -> Result<IndexReport,
             .map_err(|error| error.to_string())?
     };
 
-    // Audio validation and SHA-256 hashing can take a while. Do all filesystem
-    // work before opening a write transaction so downloads and progress
-    // updates are not blocked for the duration of a rescan.
+    connection
+        .execute_batch(
+            "DROP TABLE IF EXISTS temp.napstr_seen;
+             CREATE TEMP TABLE napstr_seen(file_id TEXT PRIMARY KEY);",
+        )
+        .map_err(|error| error.to_string())?;
+
+    // Audio validation and SHA-256 hashing stay outside write transactions.
+    // Small commits make verified tracks visible without holding the database
+    // while the rest of a large collection is scanned.
     for entry in WalkDir::new(folder)
         .follow_links(false)
         .into_iter()
         .filter_map(Result::ok)
-        .filter(|entry| {
-            entry.file_type().is_file()
-                && entry
-                    .path()
-                    .extension()
-                    .and_then(|value| value.to_str())
-                    .is_none_or(|extension| !extension.eq_ignore_ascii_case("part"))
-        })
+        .filter(|entry| entry.file_type().is_file() && supported_audio_path(entry.path()))
     {
+        if cancelled.load(Ordering::Relaxed) {
+            let _ = connection.execute("DROP TABLE IF EXISTS temp.napstr_seen", []);
+            return Err("Indexing cancelled".into());
+        }
+        processed_files += 1;
         let path = entry.path();
         let metadata = match fs::metadata(path) {
             Ok(metadata) => metadata,
             Err(error) => {
-                report.errors.push(format!("{}: {error}", path.display()));
+                record_index_error(&mut report, format!("{}: {error}", path.display()));
                 continue;
             }
         };
         let path_key = path.to_string_lossy();
         let current_modified_ns = modified_ns(&metadata);
-        if current_modified_ns != 0 {
-            if let Some((file_id, size, stored_modified_ns)) = existing.get(path_key.as_ref()) {
-                if *size == metadata.len() && *stored_modified_ns == current_modified_ns {
-                    verified.push((path.to_path_buf(), None, file_id.clone(), *size));
-                    continue;
+        let unchanged = current_modified_ns != 0
+            && existing
+                .get(path_key.as_ref())
+                .is_some_and(|(_, size, stored_modified_ns)| {
+                    *size == metadata.len() && *stored_modified_ns == current_modified_ns
+                });
+        if unchanged {
+            let (file_id, size, _) = existing
+                .get(path_key.as_ref())
+                .expect("unchanged index entry disappeared");
+            verified.push((path.to_path_buf(), None, file_id.clone(), *size));
+        } else {
+            match validate_and_hash_index_file(path, current_modified_ns) {
+                Ok(file) => verified.push(file),
+                Err(error) => {
+                    record_index_error(&mut report, format!("{}: {}", path.display(), error))
                 }
             }
         }
-        match audio::validate_audio(path)
-            .and_then(|audio| hash_file(path).map(|hash| (audio, hash)))
-        {
-            Ok((audio, (file_id, size))) => {
-                let unchanged_during_hash = fs::metadata(path)
-                    .map(|after| after.len() == size && modified_ns(&after) == current_modified_ns)
-                    .unwrap_or(false);
-                if unchanged_during_hash {
-                    verified.push((path.to_path_buf(), Some(audio), file_id, size));
-                } else {
-                    report.errors.push(format!(
-                        "{}: file changed while it was being indexed",
-                        path.display()
-                    ));
-                }
+        if verified.len() >= INDEX_COMMIT_BATCH_SIZE {
+            let files = commit_index_batch(connection, folder, &mut verified, &mut report)?;
+            if !files.is_empty() {
+                batch_committed(IndexBatch {
+                    files,
+                    file_count: report.file_count,
+                    total_bytes: report.total_bytes,
+                });
             }
-            Err(error) => report.errors.push(format!("{}: {}", path.display(), error)),
+        }
+        if processed_files % INDEX_PROGRESS_INTERVAL == 0 {
+            progress(processed_files, report.file_count + verified.len());
         }
     }
+
+    if cancelled.load(Ordering::Relaxed) {
+        let _ = connection.execute("DROP TABLE IF EXISTS temp.napstr_seen", []);
+        return Err("Indexing cancelled".into());
+    }
+    let files = commit_index_batch(connection, folder, &mut verified, &mut report)?;
+    if !files.is_empty() {
+        batch_committed(IndexBatch {
+            files,
+            file_count: report.file_count,
+            total_bytes: report.total_bytes,
+        });
+    }
+    progress(processed_files, report.file_count);
 
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|error| error.to_string())?;
-    transaction.execute_batch("DROP TABLE IF EXISTS temp.napstr_seen; CREATE TEMP TABLE napstr_seen(file_id TEXT PRIMARY KEY);").map_err(|error| error.to_string())?;
-    for (path, audio, file_id, size) in verified {
-        let blocked: bool = transaction
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM blocked_files WHERE file_id=?1)",
-                [&file_id],
-                |row| row.get(0),
-            )
-            .map_err(|error| error.to_string())?;
-        if blocked {
-            report
-                .errors
-                .push(format!("{}: this file hash is blocked", path.display()));
-            continue;
-        }
-        if let Some(audio) = audio {
-            upsert_verified_file(&transaction, folder, &path, &file_id, size, audio)?;
-        }
-        transaction
-            .execute(
-                "INSERT OR IGNORE INTO napstr_seen(file_id) VALUES (?1)",
-                [file_id],
-            )
-            .map_err(|error| error.to_string())?;
-        report.file_count += 1;
-        report.total_bytes += size;
-    }
-    transaction
+    report.changed_files += transaction
         .execute(
             "DELETE FROM files WHERE file_id NOT IN (SELECT file_id FROM napstr_seen)",
             [],
@@ -635,10 +781,100 @@ fn index_path(connection: &mut Connection, folder: &Path) -> Result<IndexReport,
     Ok(report)
 }
 
+#[cfg(test)]
+fn index_path(connection: &mut Connection, folder: &Path) -> Result<IndexReport, String> {
+    index_path_with_progress(
+        connection,
+        folder,
+        &AtomicBool::new(false),
+        |_, _| {},
+        |_| {},
+    )
+}
+
+fn run_index_job(
+    db_path: &Path,
+    folder: &Path,
+    scan_lock: &Mutex<()>,
+    scan_cancel: &AtomicBool,
+    app_handle: &tauri::AppHandle,
+    network: &Arc<network::NetworkService>,
+) -> Result<IndexReport, String> {
+    let _scan_guard = scan_lock.lock().map_err(|_| "library scan lock poisoned")?;
+    scan_cancel.store(false, Ordering::SeqCst);
+    let _ = app_handle.emit(
+        INDEX_PROGRESS_EVENT,
+        IndexProgress {
+            scanning: true,
+            processed_files: 0,
+            indexed_files: 0,
+            message: "Scanning the Napstr folder…".into(),
+        },
+    );
+    let mut connection = open_connection(db_path)?;
+    let result = index_path_with_progress(
+        &mut connection,
+        folder,
+        scan_cancel,
+        |processed_files, indexed_files| {
+            let _ = app_handle.emit(
+                INDEX_PROGRESS_EVENT,
+                IndexProgress {
+                    scanning: true,
+                    processed_files,
+                    indexed_files,
+                    message: format!("Checking audio files… {processed_files}"),
+                },
+            );
+        },
+        |batch| {
+            let file_ids = batch
+                .files
+                .iter()
+                .map(|file| file.file_id.clone())
+                .collect::<Vec<_>>();
+            let _ = app_handle.emit(INDEX_BATCH_EVENT, batch);
+            network.queue_catalogue_files(file_ids);
+        },
+    );
+    match &result {
+        Ok(report) => {
+            if report.changed_files > 0 {
+                let _ = app_handle.emit(LIBRARY_CHANGED_EVENT, report.clone());
+                network.queue_catalogue_publish(false);
+            }
+            let _ = app_handle.emit(
+                INDEX_PROGRESS_EVENT,
+                IndexProgress {
+                    scanning: false,
+                    processed_files: report.file_count + report.error_count,
+                    indexed_files: report.file_count,
+                    message: format!("Indexed {} audio file(s)", report.file_count),
+                },
+            );
+        }
+        Err(error) => {
+            let _ = app_handle.emit(
+                INDEX_PROGRESS_EVENT,
+                IndexProgress {
+                    scanning: false,
+                    processed_files: 0,
+                    indexed_files: 0,
+                    message: error.clone(),
+                },
+            );
+        }
+    }
+    result
+}
+
 fn start_folder_watcher(
     folder: PathBuf,
     db_path: PathBuf,
     network: Arc<network::NetworkService>,
+    scan_lock: Arc<Mutex<()>>,
+    scan_cancel: Arc<AtomicBool>,
+    app_handle: tauri::AppHandle,
 ) -> Result<FolderWatcher, String> {
     let (event_tx, event_rx) = std::sync::mpsc::channel::<notify::Result<notify::Event>>();
     let mut watcher = notify::recommended_watcher(move |event| {
@@ -658,15 +894,14 @@ fn start_folder_watcher(
                 }
                 std::thread::sleep(std::time::Duration::from_millis(750));
                 while event_rx.try_recv().is_ok() {}
-                let Ok(mut connection) = open_connection(&db_path) else {
-                    continue;
-                };
-                if index_path(&mut connection, &folder).is_ok() {
-                    let network = network.clone();
-                    tauri::async_runtime::spawn(async move {
-                        let _ = network.publish_catalogue().await;
-                    });
-                }
+                let _ = run_index_job(
+                    &db_path,
+                    &folder,
+                    &scan_lock,
+                    &scan_cancel,
+                    &app_handle,
+                    &network,
+                );
             }
         })
         .map_err(|error| error.to_string())?;
@@ -684,16 +919,27 @@ fn search_catalog(query: String, state: State<'_, AppState>) -> Result<Vec<Share
 }
 
 #[tauri::command]
-fn set_napstr_folder(path: String, state: State<'_, AppState>) -> Result<IndexReport, String> {
+async fn set_napstr_folder(
+    path: String,
+    state: State<'_, AppState>,
+) -> Result<IndexReport, String> {
     let folder = PathBuf::from(&path);
-    let mut connection = open_db(&state)?;
-    let report = index_path(&mut connection, &folder)?;
+    if !folder.is_dir() {
+        return Err("The selected Napstr folder does not exist or is not a directory".into());
+    }
+    let connection = open_db(&state)?;
     connection
         .execute(
             "INSERT OR REPLACE INTO settings (key, value) VALUES ('shared_folder', ?1)",
             [&path],
         )
         .map_err(|error| error.to_string())?;
+    connection
+        .execute("DELETE FROM files", [])
+        .map_err(|error| error.to_string())?;
+    drop(connection);
+    let _ = state.app_handle.emit(LIBRARY_CHANGED_EVENT, ());
+    state.network.queue_catalogue_publish(false);
     let db_path = state
         .db_path
         .lock()
@@ -704,17 +950,61 @@ fn set_napstr_folder(path: String, state: State<'_, AppState>) -> Result<IndexRe
         .lock()
         .map_err(|_| "folder watcher lock poisoned")? = Some(start_folder_watcher(
         folder,
-        db_path,
+        db_path.clone(),
         state.network.clone(),
+        state.scan_lock.clone(),
+        state.scan_cancel.clone(),
+        state.app_handle.clone(),
     )?);
-    Ok(report)
+    let scan_lock = state.scan_lock.clone();
+    let scan_cancel = state.scan_cancel.clone();
+    let app_handle = state.app_handle.clone();
+    let network = state.network.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        run_index_job(
+            &db_path,
+            Path::new(&path),
+            &scan_lock,
+            &scan_cancel,
+            &app_handle,
+            &network,
+        )
+    })
+    .await
+    .map_err(|error| format!("library scan task failed: {error}"))?
 }
 
 #[tauri::command]
-fn rescan_napstr_folder(state: State<'_, AppState>) -> Result<IndexReport, String> {
-    let mut connection = open_db(&state)?;
+async fn rescan_napstr_folder(state: State<'_, AppState>) -> Result<IndexReport, String> {
+    let connection = open_db(&state)?;
     let folder = PathBuf::from(get_setting(&connection, "shared_folder")?);
-    index_path(&mut connection, &folder)
+    drop(connection);
+    let db_path = state
+        .db_path
+        .lock()
+        .map_err(|_| "database lock poisoned")?
+        .clone();
+    let scan_lock = state.scan_lock.clone();
+    let scan_cancel = state.scan_cancel.clone();
+    let app_handle = state.app_handle.clone();
+    let network = state.network.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        run_index_job(
+            &db_path,
+            &folder,
+            &scan_lock,
+            &scan_cancel,
+            &app_handle,
+            &network,
+        )
+    })
+    .await
+    .map_err(|error| format!("library scan task failed: {error}"))?
+}
+
+#[tauri::command]
+fn cancel_library_scan(state: State<'_, AppState>) {
+    state.scan_cancel.store(true, Ordering::SeqCst);
 }
 
 #[tauri::command]
@@ -1112,7 +1402,8 @@ fn apply_tor_status(status: &mut network::NetworkStatus, tor: tor::TorStatus) {
 
 #[tauri::command]
 async fn publish_catalogue(state: State<'_, AppState>) -> Result<usize, String> {
-    state.network.publish_catalogue().await
+    state.network.queue_catalogue_publish(false);
+    Ok(0)
 }
 
 #[tauri::command]
@@ -1197,9 +1488,7 @@ async fn block_file(file_id: String, state: State<'_, AppState>) -> Result<(), S
         .execute("DELETE FROM remote_catalogue WHERE file_id=?1", [&file_id])
         .map_err(|error| error.to_string())?;
     drop(connection);
-    if state.network.status().await?.connected {
-        state.network.publish_catalogue().await?;
-    }
+    state.network.queue_catalogue_publish(false);
     Ok(())
 }
 
@@ -1280,6 +1569,8 @@ pub fn run() {
             let transfers = Arc::new(transfer::TransferService::new(db_path.clone(), tor.clone()));
             let network =
                 network::NetworkService::new(db_path.clone(), transfers, app.handle().clone());
+            let scan_lock = Arc::new(Mutex::new(()));
+            let scan_cancel = Arc::new(AtomicBool::new(false));
             *setup_shutdown_services
                 .lock()
                 .map_err(|_| "shutdown service lock was poisoned")? = Some(ShutdownServices {
@@ -1290,6 +1581,7 @@ pub fn run() {
                 .ok()
                 .and_then(|connection| get_setting(&connection, "shared_folder").ok())
                 .map(PathBuf::from);
+            let startup_folder = existing_folder.clone();
             let watcher = existing_folder.and_then(|folder| {
                 if !folder.is_dir() {
                     if let Ok(connection) = open_connection(&db_path) {
@@ -1297,19 +1589,45 @@ pub fn run() {
                     }
                     return None;
                 }
-                if let Ok(mut connection) = open_connection(&db_path) {
-                    let _ = index_path(&mut connection, &folder);
-                }
-                start_folder_watcher(folder, db_path.clone(), network.clone()).ok()
+                start_folder_watcher(
+                    folder,
+                    db_path.clone(),
+                    network.clone(),
+                    scan_lock.clone(),
+                    scan_cancel.clone(),
+                    app.handle().clone(),
+                )
+                .ok()
             });
             app.manage(AppState {
                 db_path: Mutex::new(db_path),
-                network,
+                network: network.clone(),
                 tor,
                 watcher: Mutex::new(watcher),
+                scan_lock: scan_lock.clone(),
+                scan_cancel: scan_cancel.clone(),
+                app_handle: app.handle().clone(),
                 player: Arc::new(player::NativePlayer::default()),
                 recovering_after_sleep: Arc::new(AtomicBool::new(false)),
             });
+            if let Some(folder) = startup_folder.filter(|folder| folder.is_dir()) {
+                let startup_db_path = app
+                    .path()
+                    .app_data_dir()
+                    .map_err(|error| error.to_string())?
+                    .join("napstr.sqlite3");
+                let startup_handle = app.handle().clone();
+                tauri::async_runtime::spawn_blocking(move || {
+                    let _ = run_index_job(
+                        &startup_db_path,
+                        &folder,
+                        &scan_lock,
+                        &scan_cancel,
+                        &startup_handle,
+                        &network,
+                    );
+                });
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -1317,6 +1635,7 @@ pub fn run() {
             search_catalog,
             set_napstr_folder,
             rescan_napstr_folder,
+            cancel_library_scan,
             save_file_tags,
             save_settings,
             remove_transfer,
@@ -1422,7 +1741,9 @@ mod tests {
         let mut connection = open_connection(&db_path).unwrap();
         let report = index_path(&mut connection, &directory).unwrap();
         assert_eq!(report.file_count, 1);
-        assert!(report.errors.len() >= 2);
+        assert_eq!(report.error_count, 1);
+        assert_eq!(report.errors.len(), 1);
+        assert_eq!(report.changed_files, 1);
         let indexed = load_files(&connection, None).unwrap();
         assert_eq!(indexed.len(), 1);
         assert_eq!(indexed[0].folder, "artist/album");
@@ -1434,13 +1755,132 @@ mod tests {
             .unwrap();
         let report = index_path(&mut connection, &directory).unwrap();
         assert_eq!(report.file_count, 1);
+        assert_eq!(report.changed_files, 0);
         let tagged = load_files(&connection, Some("FAVOURITE")).unwrap();
         assert_eq!(tagged.len(), 1);
         assert_eq!(tagged[0].tags, "punk, favourite");
         fs::remove_file(&audio).unwrap();
         let report = index_path(&mut connection, &directory).unwrap();
         assert_eq!(report.file_count, 0);
+        assert_eq!(report.changed_files, 1);
         assert!(load_files(&connection, None).unwrap().is_empty());
+        drop(connection);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn indexing_skips_unrelated_files_and_bounds_error_details() {
+        let directory = test_directory("bounded-index-errors-test");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("cover.jpg"), b"not audio").unwrap();
+        for index in 0..(MAX_INDEX_ERRORS + 5) {
+            fs::write(directory.join(format!("invalid-{index}.mp3")), b"not audio").unwrap();
+        }
+        let db_path = directory.join("napstr.sqlite3");
+        initialise_database(&db_path, &directory).unwrap();
+        let mut connection = open_connection(&db_path).unwrap();
+
+        let report = index_path(&mut connection, &directory).unwrap();
+
+        assert_eq!(report.file_count, 0);
+        assert_eq!(report.error_count, MAX_INDEX_ERRORS + 5);
+        assert_eq!(report.errors.len(), MAX_INDEX_ERRORS);
+        drop(connection);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn indexing_can_be_cancelled_before_database_changes() {
+        let directory = test_directory("cancel-index-test");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("track.mp3"), b"not audio").unwrap();
+        let db_path = directory.join("napstr.sqlite3");
+        initialise_database(&db_path, &directory).unwrap();
+        let mut connection = open_connection(&db_path).unwrap();
+        let cancelled = AtomicBool::new(true);
+
+        let result =
+            index_path_with_progress(&mut connection, &directory, &cancelled, |_, _| {}, |_| {});
+
+        assert_eq!(result.unwrap_err(), "Indexing cancelled");
+        assert!(load_files(&connection, None).unwrap().is_empty());
+        drop(connection);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn indexing_commits_verified_files_in_bounded_batches() {
+        let directory = test_directory("progressive-index-test");
+        fs::create_dir_all(&directory).unwrap();
+        for index in 0..(INDEX_COMMIT_BATCH_SIZE + 1) {
+            let mut bytes = b"RIFF".to_vec();
+            bytes.extend_from_slice(&40u32.to_le_bytes());
+            bytes.extend_from_slice(b"WAVEfmt \x10\0\0\0\x01\0\x01\0\x44\xac\0\0\x88\x58\x01\0\x02\0\x10\0data\x04\0\0\0");
+            bytes.extend_from_slice(&(index as u32).to_le_bytes());
+            fs::write(directory.join(format!("track-{index:03}.wav")), bytes).unwrap();
+        }
+        let db_path = directory.join("napstr.sqlite3");
+        initialise_database(&db_path, &directory).unwrap();
+        let mut connection = open_connection(&db_path).unwrap();
+        let mut committed_batches = Vec::new();
+        let mut independently_visible = Vec::new();
+
+        let report = index_path_with_progress(
+            &mut connection,
+            &directory,
+            &AtomicBool::new(false),
+            |_, _| {},
+            |batch| {
+                committed_batches.push(batch.files.len());
+                let observer = open_connection(&db_path).unwrap();
+                independently_visible.push(load_files(&observer, None).unwrap().len());
+            },
+        )
+        .unwrap();
+
+        assert_eq!(report.file_count, INDEX_COMMIT_BATCH_SIZE + 1);
+        assert_eq!(committed_batches, vec![INDEX_COMMIT_BATCH_SIZE, 1]);
+        assert_eq!(
+            independently_visible,
+            vec![INDEX_COMMIT_BATCH_SIZE, INDEX_COMMIT_BATCH_SIZE + 1]
+        );
+        assert_eq!(
+            load_files(&connection, None).unwrap().len(),
+            INDEX_COMMIT_BATCH_SIZE + 1
+        );
+        drop(connection);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn cancelling_after_a_batch_keeps_only_verified_commits() {
+        let directory = test_directory("progressive-cancel-test");
+        fs::create_dir_all(&directory).unwrap();
+        for index in 0..(INDEX_COMMIT_BATCH_SIZE + 1) {
+            let mut bytes = b"RIFF".to_vec();
+            bytes.extend_from_slice(&40u32.to_le_bytes());
+            bytes.extend_from_slice(b"WAVEfmt \x10\0\0\0\x01\0\x01\0\x44\xac\0\0\x88\x58\x01\0\x02\0\x10\0data\x04\0\0\0");
+            bytes.extend_from_slice(&(index as u32).to_le_bytes());
+            fs::write(directory.join(format!("track-{index:03}.wav")), bytes).unwrap();
+        }
+        let db_path = directory.join("napstr.sqlite3");
+        initialise_database(&db_path, &directory).unwrap();
+        let mut connection = open_connection(&db_path).unwrap();
+        let cancelled = AtomicBool::new(false);
+
+        let result = index_path_with_progress(
+            &mut connection,
+            &directory,
+            &cancelled,
+            |_, _| {},
+            |_| cancelled.store(true, Ordering::SeqCst),
+        );
+
+        assert_eq!(result.unwrap_err(), "Indexing cancelled");
+        assert_eq!(
+            load_files(&connection, None).unwrap().len(),
+            INDEX_COMMIT_BATCH_SIZE
+        );
         drop(connection);
         fs::remove_dir_all(directory).unwrap();
     }
