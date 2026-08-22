@@ -16,7 +16,7 @@ use std::{
     },
     time::Duration,
 };
-use tauri::Emitter;
+use crate::events::EventEmitter;
 use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
@@ -138,7 +138,7 @@ enum SignalMessage {
 pub struct NetworkService {
     db_path: PathBuf,
     transfers: Arc<TransferService>,
-    app_handle: tauri::AppHandle,
+    event_emitter: Arc<dyn EventEmitter>,
     client: RwLock<Option<Client>>,
     keys: RwLock<Option<Keys>>,
     start_lock: Mutex<()>,
@@ -154,12 +154,12 @@ impl NetworkService {
     pub fn new(
         db_path: PathBuf,
         transfers: Arc<TransferService>,
-        app_handle: tauri::AppHandle,
+        event_emitter: Arc<dyn EventEmitter>,
     ) -> Arc<Self> {
         Arc::new(Self {
             db_path,
             transfers,
-            app_handle,
+            event_emitter,
             client: RwLock::new(None),
             keys: RwLock::new(None),
             start_lock: Mutex::new(()),
@@ -270,7 +270,7 @@ impl NetworkService {
                                             cache_service.cache_trollbox_event(cache_event).await;
                                     });
                                 }
-                                let _ = service.app_handle.emit(PUBLIC_CHAT_EVENT, topic);
+                                let _ = service.event_emitter.emit_event(PUBLIC_CHAT_EVENT, &topic);
                             }
                         }
                         Ok(false)
@@ -701,7 +701,7 @@ impl NetworkService {
         if topic == TROLLBOX_HASHTAG {
             let _ = self.cache_trollbox_event(event.clone()).await;
         }
-        let _ = self.app_handle.emit(PUBLIC_CHAT_EVENT, topic.to_string());
+        let _ = self.event_emitter.emit_event(PUBLIC_CHAT_EVENT, topic);
         Ok(event.id.to_hex())
     }
 

@@ -1,10 +1,7 @@
 <script lang="ts">
   import { onMount, tick } from 'svelte';
-  import { getVersion } from '@tauri-apps/api/app';
-  import { invoke } from '@tauri-apps/api/core';
-  import { listen, type UnlistenFn } from '@tauri-apps/api/event';
-  import { getCurrentWindow } from '@tauri-apps/api/window';
-  import { open } from '@tauri-apps/plugin-dialog';
+  import { isTauri, apiInvoke as invoke, apiListen as listen, apiGetVersion as getVersion, type UnlistenFn } from '$lib/api';
+  import { webAudio } from '$lib/webAudio';
 
   let appVersion = '…';
   const SEARCH_PAGE_SIZE = 100;
@@ -375,7 +372,10 @@
     playerDuration = 0;
     playerEnded = false;
     try {
-      applyPlaybackStatus(await invoke<PlaybackStatus>('play_audio', { fileId: track.fileId, volume: playerVolume }));
+      const status = isTauri
+        ? await invoke<PlaybackStatus>('play_audio', { fileId: track.fileId, volume: playerVolume })
+        : (webAudio.setVolume(playerVolume), webAudio.play(track.fileId), webAudio.getStatus());
+      applyPlaybackStatus(status);
       if (!lastPlayerError) activityMessage = `Playing ${track.name}${track.folder ? ` · ${track.folder}` : ''}`;
     } catch (error) {
       playerPlaying = false;
@@ -412,13 +412,21 @@
       await loadPlayerTrack(playerQueueIndex);
       return;
     }
-    try { applyPlaybackStatus(await invoke<PlaybackStatus>('toggle_audio')); }
-    catch (error) { activityMessage = `Playback failed: ${String(error)}`; }
+    try {
+      const status = isTauri
+        ? await invoke<PlaybackStatus>('toggle_audio')
+        : (webAudio.getStatus().playing ? webAudio.pause() : webAudio.resume(), webAudio.getStatus());
+      applyPlaybackStatus(status);
+    } catch (error) { activityMessage = `Playback failed: ${String(error)}`; }
   }
 
   async function stopPlayer() {
-    try { applyPlaybackStatus(await invoke<PlaybackStatus>('stop_audio')); }
-    catch (error) { activityMessage = `Could not stop playback: ${String(error)}`; return; }
+    try {
+      const status = isTauri
+        ? await invoke<PlaybackStatus>('stop_audio')
+        : (webAudio.stop(), webAudio.getStatus());
+      applyPlaybackStatus(status);
+    } catch (error) { activityMessage = `Could not stop playback: ${String(error)}`; return; }
     playerEnded = false;
     if (currentTrack) activityMessage = `Stopped ${currentTrack.name}`;
   }
@@ -430,8 +438,12 @@
 
   async function previousPlayerTrack() {
     if (playerCurrentTime > 3 || playerQueueIndex <= 0) {
-      try { applyPlaybackStatus(await invoke<PlaybackStatus>('seek_audio', { seconds: 0 })); }
-      catch (error) { activityMessage = `Could not rewind playback: ${String(error)}`; }
+      try {
+        const status = isTauri
+          ? await invoke<PlaybackStatus>('seek_audio', { seconds: 0 })
+          : (webAudio.seek(0), webAudio.getStatus());
+        applyPlaybackStatus(status);
+      } catch (error) { activityMessage = `Could not rewind playback: ${String(error)}`; }
       return;
     }
     await loadPlayerTrack(playerQueueIndex - 1);
@@ -453,15 +465,23 @@
   }
 
   async function seekPlayer(event: Event) {
+    const seconds = Number((event.currentTarget as HTMLInputElement).value);
     try {
-      applyPlaybackStatus(await invoke<PlaybackStatus>('seek_audio', { seconds: Number((event.currentTarget as HTMLInputElement).value) }));
+      const status = isTauri
+        ? await invoke<PlaybackStatus>('seek_audio', { seconds })
+        : (webAudio.seek(seconds), webAudio.getStatus());
+      applyPlaybackStatus(status);
       playerEnded = false;
     } catch (error) { activityMessage = `Could not seek in this track: ${String(error)}`; }
   }
 
   function changePlayerVolume(event: Event) {
     playerVolume = Number((event.currentTarget as HTMLInputElement).value);
-    if (currentTrack) invoke<PlaybackStatus>('set_audio_volume', { volume: playerVolume }).catch(() => {});
+    if (isTauri) {
+      if (currentTrack) invoke<PlaybackStatus>('set_audio_volume', { volume: playerVolume }).catch(() => {});
+    } else {
+      webAudio.setVolume(playerVolume);
+    }
     window.localStorage.setItem('napstr-player-volume', String(playerVolume));
   }
 
@@ -1001,10 +1021,17 @@
   }
 
   async function chooseNapstrFolder() {
-    if (!nativeReady) { activityMessage = 'Folder selection is available in the packaged desktop app'; return; }
+    if (!nativeReady) { activityMessage = 'Folder selection is available in the packaged desktop app or web interface'; return; }
     try {
-      const selectedPath = await open({ directory: true, multiple: false, title: 'Choose the folder Napstr uses for downloads and sharing', defaultPath: napstrFolder || undefined });
-      if (!selectedPath || Array.isArray(selectedPath)) return;
+      let selectedPath: string | null = null;
+      if (isTauri) {
+        const { open } = await import('@tauri-apps/plugin-dialog');
+        const result = await open({ directory: true, multiple: false, title: 'Choose the folder Napstr uses for downloads and sharing', defaultPath: napstrFolder || undefined });
+        if (typeof result === 'string') selectedPath = result;
+      } else {
+        selectedPath = window.prompt('Enter folder path to share on server:', napstrFolder || '/music');
+      }
+      if (!selectedPath) return;
       activityMessage = 'Indexing files and calculating SHA-256 hashes…';
       const report = await invoke<{ fileCount: number; totalBytes: number; errors: string[] }>('set_napstr_folder', { path: selectedPath });
       await refreshSnapshot();
@@ -1045,14 +1072,17 @@
   }
 
   const windowCommand = async (command: 'minimise_window' | 'toggle_maximise' | 'close_window') => {
-    if (nativeReady) await invoke(command);
+    if (nativeReady && isTauri) await invoke(command);
   };
 
-  function beginWindowResize(event: PointerEvent, direction: WindowResizeDirection) {
+  async function beginWindowResize(event: PointerEvent, direction: WindowResizeDirection) {
     if (event.button !== 0) return;
     event.preventDefault();
     event.stopPropagation();
-    getCurrentWindow().startResizeDragging(direction).catch(() => {});
+    if (isTauri) {
+      const { getCurrentWindow } = await import('@tauri-apps/api/window');
+      getCurrentWindow().startResizeDragging(direction).catch(() => {});
+    }
   }
 
   function transferPaneMaximum() {
@@ -1096,8 +1126,7 @@
   }
 
   onMount(() => {
-    desktopRuntime = '__TAURI_INTERNALS__' in window;
-    if (!desktopRuntime) return;
+    desktopRuntime = true;
     const savedPlayerMode = window.localStorage.getItem('napstr-player-mode');
     if (savedPlayerMode === 'single' || savedPlayerMode === 'folder' || savedPlayerMode === 'all') playerMode = savedPlayerMode;
     const savedPlayerVolume = Number(window.localStorage.getItem('napstr-player-volume'));
@@ -1197,7 +1226,10 @@
     }, 2000);
     const playerTimer = window.setInterval(() => {
       if (!nativeReady || !currentTrack || playerLoading) return;
-      invoke<PlaybackStatus>('audio_status').then((status) => {
+      const getStatus = isTauri
+        ? invoke<PlaybackStatus>('audio_status')
+        : Promise.resolve(webAudio.getStatus());
+      getStatus.then((status) => {
         const naturallyEnded = status.fileId === currentTrack?.fileId && status.ended && !playerEnded;
         applyPlaybackStatus(status);
         if (naturallyEnded) void playerTrackEnded();
@@ -1216,7 +1248,10 @@
       window.removeEventListener('focus', foregrounded);
       document.removeEventListener('visibilitychange', foregrounded);
       stopTransferResize();
-      if (nativeReady && currentTrack) invoke<PlaybackStatus>('stop_audio').catch(() => {});
+      if (nativeReady && currentTrack) {
+        if (isTauri) invoke<PlaybackStatus>('stop_audio').catch(() => {});
+        else webAudio.stop();
+      }
     };
   });
 </script>

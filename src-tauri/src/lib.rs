@@ -17,93 +17,95 @@ use std::{
 use tauri::{Manager, State};
 use walkdir::WalkDir;
 
-mod audio;
-mod network;
-mod player;
-mod protocol;
-mod tor;
-mod transfer;
+pub mod audio;
+pub mod events;
+pub mod network;
+pub mod player;
+pub mod protocol;
+pub mod server;
+pub mod tor;
+pub mod transfer;
 
 const HASH_BUFFER_SIZE: usize = 256 * 1024;
 const DEFAULT_NOSTR_RELAYS: &str = "wss://relay.damus.io,wss://nos.lol,wss://relay.nostr.com,wss://relay.primal.net,wss://relay.snort.social,wss://nostr.mom";
 const LEGACY_DEFAULT_NOSTR_RELAYS: &str = "wss://relay.damus.io,wss://nos.lol";
 
-struct AppState {
-    db_path: Mutex<PathBuf>,
-    network: Arc<network::NetworkService>,
-    tor: Arc<tor::TorManager>,
-    watcher: Mutex<Option<FolderWatcher>>,
-    player: Arc<player::NativePlayer>,
-    recovering_after_sleep: Arc<AtomicBool>,
+pub struct AppState {
+    pub db_path: Mutex<PathBuf>,
+    pub network: Arc<network::NetworkService>,
+    pub tor: Arc<tor::TorManager>,
+    pub watcher: Mutex<Option<FolderWatcher>>,
+    pub player: Arc<player::NativePlayer>,
+    pub recovering_after_sleep: Arc<AtomicBool>,
 }
 
-struct ShutdownServices {
-    network: Arc<network::NetworkService>,
-    tor: Arc<tor::TorManager>,
+pub struct ShutdownServices {
+    pub network: Arc<network::NetworkService>,
+    pub tor: Arc<tor::TorManager>,
 }
 
-struct FolderWatcher {
-    _watcher: RecommendedWatcher,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct SharedFile {
-    file_id: String,
-    filename: String,
-    path: String,
-    folder: String,
-    size: u64,
-    format: String,
-    status: String,
-    title: String,
-    artist: String,
-    album: String,
-    mime: String,
-    license: String,
-    description: String,
-    tags: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct Transfer {
-    id: i64,
-    file_id: String,
-    filename: String,
-    size: u64,
-    progress: f64,
-    status: String,
-    speed: String,
-    destination: String,
+pub struct FolderWatcher {
+    pub _watcher: RecommendedWatcher,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct Settings {
-    napstr_folder: String,
-    nostr_relays: String,
-    display_name: String,
-    profile_about: String,
-    profile_picture: String,
+pub struct SharedFile {
+    pub file_id: String,
+    pub filename: String,
+    pub path: String,
+    pub folder: String,
+    pub size: u64,
+    pub format: String,
+    pub status: String,
+    pub title: String,
+    pub artist: String,
+    pub album: String,
+    pub mime: String,
+    pub license: String,
+    pub description: String,
+    pub tags: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct AppSnapshot {
-    files: Vec<SharedFile>,
-    transfers: Vec<Transfer>,
-    settings: Settings,
-    indexed_bytes: u64,
-    native: bool,
+pub struct Transfer {
+    pub id: i64,
+    pub file_id: String,
+    pub filename: String,
+    pub size: u64,
+    pub progress: f64,
+    pub status: String,
+    pub speed: String,
+    pub destination: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct IndexReport {
-    file_count: usize,
-    total_bytes: u64,
-    errors: Vec<String>,
+pub struct Settings {
+    pub napstr_folder: String,
+    pub nostr_relays: String,
+    pub display_name: String,
+    pub profile_about: String,
+    pub profile_picture: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppSnapshot {
+    pub files: Vec<SharedFile>,
+    pub transfers: Vec<Transfer>,
+    pub settings: Settings,
+    pub indexed_bytes: u64,
+    pub native: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IndexReport {
+    pub file_count: usize,
+    pub total_bytes: u64,
+    pub errors: Vec<String>,
 }
 
 fn open_db(state: &State<'_, AppState>) -> Result<Connection, String> {
@@ -115,7 +117,7 @@ fn open_db(state: &State<'_, AppState>) -> Result<Connection, String> {
     open_connection(&path)
 }
 
-fn open_connection(path: &Path) -> Result<Connection, String> {
+pub fn open_connection(path: &Path) -> Result<Connection, String> {
     let connection = Connection::open(path).map_err(|error| error.to_string())?;
     connection
         .busy_timeout(std::time::Duration::from_secs(15))
@@ -123,7 +125,7 @@ fn open_connection(path: &Path) -> Result<Connection, String> {
     Ok(connection)
 }
 
-fn initialise_database(path: &Path, app_data: &Path) -> Result<(), String> {
+pub fn initialise_database(path: &Path, app_data: &Path) -> Result<(), String> {
     fs::create_dir_all(app_data).map_err(|error| error.to_string())?;
     let connection = open_connection(path)?;
     connection.execute_batch(
@@ -244,7 +246,7 @@ fn initialise_database(path: &Path, app_data: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn get_setting(connection: &Connection, key: &str) -> Result<String, String> {
+pub fn get_setting(connection: &Connection, key: &str) -> Result<String, String> {
     connection
         .query_row("SELECT value FROM settings WHERE key = ?1", [key], |row| {
             row.get(0)
@@ -278,7 +280,7 @@ fn library_folder(root: &Path, file: &Path) -> String {
         .unwrap_or_default()
 }
 
-fn load_files(connection: &Connection, query: Option<&str>) -> Result<Vec<SharedFile>, String> {
+pub fn load_files(connection: &Connection, query: Option<&str>) -> Result<Vec<SharedFile>, String> {
     let mut statement = connection
         .prepare(
             "SELECT file_id, filename, path, size, format, mime, folder, tags FROM files
@@ -369,7 +371,7 @@ fn edit_distance_at_most(left: &str, right: &str, limit: usize) -> bool {
     previous[right.len()] <= limit
 }
 
-fn load_transfers(connection: &Connection) -> Result<Vec<Transfer>, String> {
+pub fn load_transfers(connection: &Connection) -> Result<Vec<Transfer>, String> {
     let mut statement = connection.prepare("SELECT id, file_id, filename, size, progress, status, speed, destination FROM transfers ORDER BY id DESC").map_err(|error| error.to_string())?;
     let rows = statement
         .query_map([], |row| {
@@ -392,7 +394,7 @@ fn load_transfers(connection: &Connection) -> Result<Vec<Transfer>, String> {
     Ok(transfers)
 }
 
-fn snapshot(connection: &Connection) -> Result<AppSnapshot, String> {
+pub fn snapshot(connection: &Connection) -> Result<AppSnapshot, String> {
     let files = load_files(connection, None)?;
     let indexed_bytes = files.iter().map(|file| file.size).sum();
     Ok(AppSnapshot {
@@ -508,7 +510,7 @@ pub(crate) fn upsert_verified_file(
     Ok(())
 }
 
-fn index_path(connection: &mut Connection, folder: &Path) -> Result<IndexReport, String> {
+pub fn index_path(connection: &mut Connection, folder: &Path) -> Result<IndexReport, String> {
     if !folder.is_dir() {
         return Err("The selected Napstr folder does not exist or is not a directory".into());
     }
@@ -635,7 +637,7 @@ fn index_path(connection: &mut Connection, folder: &Path) -> Result<IndexReport,
     Ok(report)
 }
 
-fn start_folder_watcher(
+pub fn start_folder_watcher(
     folder: PathBuf,
     db_path: PathBuf,
     network: Arc<network::NetworkService>,
@@ -960,7 +962,7 @@ fn open_napstr_folder(state: State<'_, AppState>) -> Result<(), String> {
     open_with_system(&folder, "Napstr folder")
 }
 
-fn playable_audio_path(connection: &Connection, file_id: &str) -> Result<PathBuf, String> {
+pub fn playable_audio_path(connection: &Connection, file_id: &str) -> Result<PathBuf, String> {
     let blocked: bool = connection
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM blocked_files WHERE file_id=?1)",
@@ -986,7 +988,7 @@ fn playable_audio_path(connection: &Connection, file_id: &str) -> Result<PathBuf
     Err("audio is not present in the indexed Napstr folder".into())
 }
 
-fn validate_length(label: &str, value: &str, maximum: usize) -> Result<(), String> {
+pub fn validate_length(label: &str, value: &str, maximum: usize) -> Result<(), String> {
     if value.chars().count() > maximum {
         Err(format!("{label} is longer than {maximum} characters"))
     } else {
@@ -1278,8 +1280,11 @@ pub fn run() {
             initialise_database(&db_path, &app_data)?;
             let tor = Arc::new(tor::TorManager::new(app_data, resource_dir));
             let transfers = Arc::new(transfer::TransferService::new(db_path.clone(), tor.clone()));
-            let network =
-                network::NetworkService::new(db_path.clone(), transfers, app.handle().clone());
+            let network = network::NetworkService::new(
+                db_path.clone(),
+                transfers,
+                Arc::new(events::TauriEmitter::new(app.handle().clone())),
+            );
             *setup_shutdown_services
                 .lock()
                 .map_err(|_| "shutdown service lock was poisoned")? = Some(ShutdownServices {
