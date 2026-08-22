@@ -468,7 +468,9 @@
   async function stopPlayer() {
     try { applyPlaybackStatus(await invoke<PlaybackStatus>('stop_audio')); }
     catch (error) { activityMessage = `Could not stop playback: ${String(error)}`; return; }
-    playerEnded = false;
+    // The native output stream is deliberately released on Stop. Treat the
+    // track as reloadable so pressing Play opens it again from the beginning.
+    playerEnded = true;
     if (currentTrack) activityMessage = `Stopped ${currentTrack.name}`;
   }
 
