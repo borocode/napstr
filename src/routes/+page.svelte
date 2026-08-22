@@ -6,6 +6,8 @@
   import packageInfo from '../../package.json';
 
   const appVersion = packageInfo.version;
+  const SEARCH_PAGE_SIZE = 100;
+  const VISIBLE_SEEDER_LIMIT = 100;
 
   type View = 'Search' | 'Downloads' | 'Shared' | 'Profile' | 'Settings';
   type PlayerMode = 'single' | 'folder' | 'all';
@@ -60,6 +62,7 @@
 
   let activeView: View = 'Search';
   let results: Result[] = [];
+  let resultPage = 0;
   let query = '';
   let format = 'Audio only';
   let minimumSources = 1;
@@ -192,6 +195,27 @@
     return libraryFolderView === '*'
       ? sharedFiles
       : sharedFiles.filter((file) => file.folder === libraryFolderView);
+  }
+
+  function resultPageCount() {
+    return Math.max(1, Math.ceil(results.length / SEARCH_PAGE_SIZE));
+  }
+
+  function paginatedResults() {
+    const start = resultPage * SEARCH_PAGE_SIZE;
+    return results.slice(start, start + SEARCH_PAGE_SIZE);
+  }
+
+  function resultRange() {
+    if (!results.length) return '0';
+    const start = resultPage * SEARCH_PAGE_SIZE + 1;
+    return `${start}–${Math.min(start + SEARCH_PAGE_SIZE - 1, results.length)}`;
+  }
+
+  function changeResultPage(nextPage: number) {
+    resultPage = Math.max(0, Math.min(nextPage, resultPageCount() - 1));
+    selected = paginatedResults()[0] ?? null;
+    selectedSource = 0;
   }
 
   function toPlayerTrack(file: NativeFile): PlayerTrack {
@@ -349,7 +373,8 @@
     } else {
       results = results.filter((result) => isLocalFile(result.fileId));
     }
-    selected = (selectedFileId ? results.find((result) => result.fileId === selectedFileId) : null) ?? results[0] ?? null;
+    resultPage = Math.min(resultPage, resultPageCount() - 1);
+    selected = (selectedFileId ? results.find((result) => result.fileId === selectedFileId) : null) ?? paginatedResults()[0] ?? null;
   }
 
   function applySnapshot(snapshot: Snapshot) {
@@ -363,6 +388,7 @@
     sharedFiles = snapshot.files.map((file) => ({ ...file, name: file.filename, readableSize: readableSize(file.size), peers: 0 }));
     if (selectedShared) selectedShared = snapshot.files.find((file) => file.fileId === selectedShared?.fileId) ?? null;
     results = mapFiles(snapshot.files);
+    resultPage = 0;
     resultsAreNetwork = false;
     selected = results[0] ?? null;
     searchedQuery = 'local catalogue';
@@ -475,6 +501,7 @@
         activityMessage = `${results.length} local match(es) found`;
       } catch (error) { activityMessage = `Search failed: ${String(error)}`; }
     }
+    resultPage = 0;
     selected = results[0] ?? null;
     selectedSource = 0;
   }
@@ -900,7 +927,7 @@
               <table class="file-table">
                 <thead><tr><th class="name-col">Name</th><th>Type</th><th class="number">Size</th><th class="number">Seeders</th><th>Line speed</th><th>Length</th></tr></thead>
                 <tbody>
-                  {#each results as item}
+                  {#each paginatedResults() as item}
                     <tr class:selected={selected?.id === item.id} onclick={() => (selected = item)} ondblclick={activateSelected}>
                       <td><span class="file-icon">▶</span>{item.name}</td><td>{item.format}</td><td class="number">{item.size}</td><td class="number"><span class="source-dot"></span>{item.sources}</td><td>{item.speed}</td><td>{item.length}</td>
                     </tr>
@@ -908,7 +935,11 @@
                 </tbody>
               </table>
             </div>
-            <div class="scrollbar horizontal"><button>◀</button><div><span style="width: 66%"></span></div><button>▶</button></div>
+            <div class="results-pager">
+              <button onclick={() => changeResultPage(resultPage - 1)} disabled={resultPage === 0}>◀ Previous</button>
+              <span>{resultRange()} of {results.length} · Page {resultPage + 1} of {resultPageCount()}</span>
+              <button onclick={() => changeResultPage(resultPage + 1)} disabled={resultPage + 1 >= resultPageCount()}>Next ▶</button>
+            </div>
           </section>
 
           <aside class="details-pane">
@@ -922,7 +953,7 @@
               <fieldset><legend>Seeders</legend>
                 <div class="sources-list">
                   {#if !isLocalFile(selected.fileId)}
-                    {#each selected.sourceDetails ?? [] as source, index}
+                    {#each (selected.sourceDetails ?? []).slice(0, VISIBLE_SEEDER_LIMIT) as source, index}
                       <button class:selected-source={selectedSource === index} class="source-row" onclick={() => (selectedSource = index)}><span class="user-icon">☺</span><b>{source.displayName}</b><small>{source.npub.slice(0, 12)}…</small><span class="online"><i></i> Seeding</span></button>
                     {/each}
                   {:else}
