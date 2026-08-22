@@ -20,8 +20,8 @@ RUN apt-get update && apt-get install -y \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-COPY src-tauri/Cargo.toml src-tauri/Cargo.lock* ./
-COPY src-tauri/src ./src
+COPY src-tauri ./src-tauri
+WORKDIR /usr/src/napstr/src-tauri
 
 RUN cargo build --release --bin napstr-daemon
 
@@ -44,7 +44,7 @@ WORKDIR /app
 COPY --from=frontend-builder /app/build /app/build
 
 # Copy compiled backend daemon binary
-COPY --from=rust-builder /usr/src/napstr/target/release/napstr-daemon /usr/local/bin/napstr-daemon
+COPY --from=rust-builder /usr/src/napstr/src-tauri/target/release/napstr-daemon /usr/local/bin/napstr-daemon
 
 ENV PORT=30421 \
     HOST=0.0.0.0 \
