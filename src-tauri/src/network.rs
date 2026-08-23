@@ -1479,20 +1479,54 @@ fn load_or_create_identity() -> Result<Keys, String> {
     if let Ok(nsec) = std::env::var("NAPSTR_NSEC") {
         return Keys::parse(&nsec).map_err(|error| error.to_string());
     }
-    let account = profile_keyring_account(std::env::var("NAPSTR_PROFILE").ok().as_deref())?;
-    let entry = Entry::new("social.napstr.desktop", &account).map_err(|error| error.to_string())?;
-    if let Ok(secret) = entry.get_password() {
-        return Keys::parse(&secret).map_err(|error| error.to_string());
+
+    let data_dir_opt = std::env::var("DATA_DIR")
+        .or_else(|_| std::env::var("NAPSTR_DATA_DIR"))
+        .ok()
+        .map(std::path::PathBuf::from);
+
+    if let Some(ref data_dir) = data_dir_opt {
+        let key_file = data_dir.join("identity.key");
+        if let Ok(content) = std::fs::read_to_string(&key_file) {
+            let trimmed = content.trim();
+            if !trimmed.is_empty() {
+                if let Ok(keys) = Keys::parse(trimmed) {
+                    return Ok(keys);
+                }
+            }
+        }
     }
-    let keys = Keys::generate();
-    let nsec = keys
-        .secret_key()
-        .to_bech32()
-        .map_err(|error| error.to_string())?;
-    entry.set_password(&nsec).map_err(|error| {
-        format!("could not store Nostr identity in the operating-system keyring: {error}")
-    })?;
-    Ok(keys)
+
+    if let Ok(account) = profile_keyring_account(std::env::var("NAPSTR_PROFILE").ok().as_deref()) {
+        if let Ok(entry) = Entry::new("social.napstr.desktop", &account) {
+            if let Ok(secret) = entry.get_password() {
+                if let Ok(keys) = Keys::parse(&secret) {
+                    return Ok(keys);
+                }
+            }
+            let keys = Keys::generate();
+            if let Ok(nsec) = keys.secret_key().to_bech32() {
+                if entry.set_password(&nsec).is_ok() {
+                    return Ok(keys);
+                }
+            }
+        }
+    }
+
+    if let Some(ref data_dir) = data_dir_opt {
+        let _ = std::fs::create_dir_all(data_dir);
+        let key_file = data_dir.join("identity.key");
+        let keys = Keys::generate();
+        let nsec = keys
+            .secret_key()
+            .to_bech32()
+            .map_err(|error| error.to_string())?;
+        std::fs::write(&key_file, &nsec)
+            .map_err(|error| format!("failed to write identity key to {}: {}", key_file.display(), error))?;
+        return Ok(keys);
+    }
+
+    Ok(Keys::generate())
 }
 
 fn profile_keyring_account(profile: Option<&str>) -> Result<String, String> {
