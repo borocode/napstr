@@ -12,7 +12,7 @@ env:
 
 jobs:
   build-and-push:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
@@ -23,12 +23,6 @@ jobs:
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
-
-      - name: Ensure multi-platform builder exists
-        run: |
-          docker buildx inspect mybuilder >/dev/null 2>&1 || \
-            docker buildx create --name mybuilder --driver docker-container
-          docker buildx inspect mybuilder --bootstrap
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -55,8 +49,9 @@ jobs:
         with:
           context: .
           file: ./Dockerfile.umbrel
-          builder: mybuilder
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
