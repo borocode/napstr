@@ -1,7 +1,8 @@
 use crate::{
-    get_setting, index_path, load_files, load_transfers,
+    get_setting, index_path_headless, load_files, load_transfers,
     network::{self, NetworkService},
     normalise_tags, open_connection, playable_audio_path, snapshot,
+    start_folder_watcher_headless,
     tor::TorManager,
     validate_length, AppSnapshot, FolderWatcher, IndexReport, Settings, SharedFile, Transfer,
 };
@@ -192,7 +193,7 @@ async fn handle_set_napstr_folder(
 ) -> Result<Json<IndexReport>, (StatusCode, String)> {
     let folder = PathBuf::from(&payload.path);
     let mut conn = state.open_db().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    let report = index_path(&mut conn, &folder)
+    let report = index_path_headless(&mut conn, &folder)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     conn.execute(
         "INSERT OR REPLACE INTO settings (key, value) VALUES ('shared_folder', ?1)",
@@ -209,7 +210,7 @@ async fn handle_set_napstr_folder(
         .watcher
         .lock()
         .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "watcher lock poisoned".into()))? =
-        crate::start_folder_watcher(folder, db_path, state.network.clone()).ok();
+        crate::start_folder_watcher_headless(folder, db_path, state.network.clone()).ok();
 
     Ok(Json(report))
 }
@@ -221,7 +222,7 @@ async fn handle_rescan_napstr_folder(
     let folder_str = get_setting(&conn, "shared_folder")
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     let folder = PathBuf::from(folder_str);
-    let report = index_path(&mut conn, &folder)
+    let report = index_path_headless(&mut conn, &folder)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     Ok(Json(report))
 }
@@ -351,12 +352,9 @@ async fn handle_network_search(
 async fn handle_publish_catalogue(
     State(state): State<SharedServerState>,
 ) -> Result<Json<usize>, (StatusCode, String)> {
-    let count = state
-        .network
-        .publish_catalogue()
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    Ok(Json(count))
+    // 0.1.4: catalogue publishing is queued/backgrounded (returns no count).
+    state.network.queue_catalogue_publish(false);
+    Ok(Json(0))
 }
 
 async fn handle_publish_profile(
@@ -455,7 +453,7 @@ async fn handle_block_file(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     drop(conn);
     if state.network.status().await.map(|s| s.connected).unwrap_or(false) {
-        let _ = state.network.publish_catalogue().await;
+        let _ = state.network.queue_catalogue_publish(false);
     }
     Ok(Json(()))
 }

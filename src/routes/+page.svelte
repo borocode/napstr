@@ -5,6 +5,7 @@
 
   let appVersion = '…';
   const SEARCH_PAGE_SIZE = 100;
+  const LOCAL_PAGE_SIZE = 100;
   const VISIBLE_SEEDER_LIMIT = 100;
 
   type View = 'Search' | 'Downloads' | 'Shared' | 'Profile' | 'Settings' | 'Trollbox';
@@ -60,6 +61,8 @@
   type ReleaseStatus = { version: string; url: string };
   type GitHubRelease = { tag_name?: unknown; html_url?: unknown };
   type TrollboxMessage = { eventId: string; pubkey: string; npub: string; displayName: string; content: string; createdAt: number };
+  type IndexProgress = { scanning: boolean; processedFiles: number; indexedFiles: number; message: string };
+  type IndexBatch = { files: NativeFile[]; fileCount: number; totalBytes: number };
   type BlockConfirmation =
     | { kind: 'file'; fileId: string; label: string }
     | { kind: 'user'; pubkey: string; label: string };
@@ -119,6 +122,9 @@
   let trackDiscussionLog: HTMLDivElement;
   let searchAction: 'search' | 'surprise' | null = null;
   let rescanPending = false;
+  let indexing = false;
+  let downloadLibraryPage = 0;
+  let sharedLibraryPage = 0;
   let selectedSource = 0;
   let selectedShared: NativeFile | null = null;
   let selectedTagFile: NativeFile | null = null;
@@ -142,6 +148,7 @@
   let transfers: Transfer[] = [];
 
   let sharedFiles: Array<NativeFile & { name: string; readableSize: string; peers: number }> = [];
+  let localFileIds = new Set<string>();
 
   const readableSize = (bytes: number) => {
     if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(1)} GB`;
@@ -158,7 +165,6 @@
   }
 
   function mapNetworkFiles(files: NetworkResult[]): Result[] {
-    const localFileIds = new Set(sharedFiles.map((file) => file.fileId));
     return files.map((file, index) => {
       const local = localFileIds.has(file.fileId);
       return {
@@ -226,7 +232,7 @@
   }
 
   function isLocalFile(fileId: string) {
-    return sharedFiles.some((file) => file.fileId === fileId);
+    return localFileIds.has(fileId);
   }
 
   function folderName(folder: string) {
@@ -242,6 +248,42 @@
     return libraryFolderView === '*'
       ? sharedFiles
       : sharedFiles.filter((file) => file.folder === libraryFolderView);
+  }
+
+  function localPageCount(files: NativeFile[]) {
+    return Math.max(1, Math.ceil(files.length / LOCAL_PAGE_SIZE));
+  }
+
+  function paginatedTagFiles() {
+    const start = downloadLibraryPage * LOCAL_PAGE_SIZE;
+    return sharedFiles.slice(start, start + LOCAL_PAGE_SIZE);
+  }
+
+  function paginatedSharedFiles() {
+    const files = visibleSharedFiles();
+    const start = sharedLibraryPage * LOCAL_PAGE_SIZE;
+    return files.slice(start, start + LOCAL_PAGE_SIZE);
+  }
+
+  function localPageRange(page: number, total: number) {
+    if (!total) return '0';
+    const start = page * LOCAL_PAGE_SIZE + 1;
+    return `${start}–${Math.min(start + LOCAL_PAGE_SIZE - 1, total)}`;
+  }
+
+  function changeDownloadLibraryPage(nextPage: number) {
+    downloadLibraryPage = Math.max(0, Math.min(nextPage, localPageCount(sharedFiles) - 1));
+  }
+
+  function changeSharedLibraryPage(nextPage: number) {
+    const files = visibleSharedFiles();
+    sharedLibraryPage = Math.max(0, Math.min(nextPage, localPageCount(files) - 1));
+    selectedShared = paginatedSharedFiles()[0] ?? null;
+  }
+
+  function changeLibraryFolder() {
+    sharedLibraryPage = 0;
+    selectedShared = visibleSharedFiles()[0] ?? null;
   }
 
   function resultPageCount() {
@@ -291,7 +333,7 @@
       if (networkConnected) {
         try {
           await invoke('publish_catalogue');
-          activityMessage = 'Tags saved and published to Nostr';
+          activityMessage = 'Tags saved and queued for Nostr publication';
         } catch (error) {
           activityMessage = `Tags saved locally · Nostr publication will retry later: ${String(error)}`;
         }
@@ -347,11 +389,18 @@
         selectResult(results[index]);
       }
     } else if (playerOrigin === 'downloads') {
-      const file = sharedFiles.find((item) => item.fileId === track.fileId);
-      if (file) selectTagFile(file);
+      const index = sharedFiles.findIndex((item) => item.fileId === track.fileId);
+      if (index >= 0) {
+        downloadLibraryPage = Math.floor(index / LOCAL_PAGE_SIZE);
+        selectTagFile(sharedFiles[index]);
+      }
     } else if (playerOrigin === 'shared') {
       const file = sharedFiles.find((item) => item.fileId === track.fileId);
-      if (file) selectedShared = { ...file };
+      if (file) {
+        const index = visibleSharedFiles().findIndex((item) => item.fileId === track.fileId);
+        if (index >= 0) sharedLibraryPage = Math.floor(index / LOCAL_PAGE_SIZE);
+        selectedShared = { ...file };
+      }
     }
   }
 
@@ -525,6 +574,9 @@
     profileAbout = snapshot.settings.profileAbout;
     profilePicture = snapshot.settings.profilePicture;
     sharedFiles = snapshot.files.map((file) => ({ ...file, name: file.filename, readableSize: readableSize(file.size), peers: 0 }));
+    localFileIds = new Set(snapshot.files.map((file) => file.fileId));
+    downloadLibraryPage = Math.min(downloadLibraryPage, localPageCount(snapshot.files) - 1);
+    sharedLibraryPage = Math.min(sharedLibraryPage, localPageCount(visibleSharedFiles()) - 1);
     if (selectedShared) selectedShared = snapshot.files.find((file) => file.fileId === selectedShared?.fileId) ?? null;
     results = mapFiles(snapshot.files);
     resultPage = 0;
@@ -750,6 +802,9 @@
       const nextFiles = snapshot.files.map((file) => ({ ...file, name: file.filename, readableSize: readableSize(file.size), peers: 0 }));
       const removedCurrentTrack = currentTrack && !nextFiles.some((file) => file.fileId === currentTrack?.fileId);
       sharedFiles = nextFiles;
+      localFileIds = new Set(nextFiles.map((file) => file.fileId));
+      downloadLibraryPage = Math.min(downloadLibraryPage, localPageCount(nextFiles) - 1);
+      sharedLibraryPage = Math.min(sharedLibraryPage, localPageCount(visibleSharedFiles()) - 1);
       if (selectedShared) selectedShared = nextFiles.find((file) => file.fileId === selectedShared?.fileId) ?? null;
       if (selectedTagFile && !nextFiles.some((file) => file.fileId === selectedTagFile?.fileId)) {
         selectedTagFile = null;
@@ -771,6 +826,28 @@
       }
       syncResultLocality();
     } catch { /* the next folder-watch or transfer poll will retry */ }
+  }
+
+  function mergeIndexBatch(batch: IndexBatch) {
+    const merged = new Map(sharedFiles.map((file) => [file.fileId, file]));
+    for (const file of batch.files) {
+      merged.set(file.fileId, {
+        ...file,
+        name: file.filename,
+        readableSize: readableSize(file.size),
+        peers: merged.get(file.fileId)?.peers ?? 0
+      });
+    }
+    sharedFiles = [...merged.values()].sort((left, right) => left.filename.localeCompare(right.filename));
+    localFileIds = new Set(sharedFiles.map((file) => file.fileId));
+    indexedBytes = sharedFiles.reduce((total, file) => total + file.size, 0);
+    if (selectedShared) selectedShared = merged.get(selectedShared.fileId) ?? selectedShared;
+    if (selectedTagFile) selectedTagFile = merged.get(selectedTagFile.fileId) ?? selectedTagFile;
+    if (currentTrack) {
+      playerQueue = queueForTrack(currentTrack, playerMode);
+      playerQueueIndex = playerQueue.findIndex((item) => item.fileId === currentTrack?.fileId);
+    }
+    syncResultLocality();
   }
 
   async function connectNetwork() {
@@ -1033,10 +1110,8 @@
       }
       if (!selectedPath) return;
       activityMessage = 'Indexing files and calculating SHA-256 hashes…';
-      const report = await invoke<{ fileCount: number; totalBytes: number; errors: string[] }>('set_napstr_folder', { path: selectedPath });
-      await refreshSnapshot();
-      if (networkConnected) await invoke('publish_catalogue');
-      activityMessage = `Indexed ${report.fileCount} file(s), ${readableSize(report.totalBytes)}${report.errors.length ? ` · ${report.errors.length} skipped` : ''}`;
+      const report = await invoke<{ fileCount: number; totalBytes: number; errors: string[]; errorCount: number; changedFiles: number }>('set_napstr_folder', { path: selectedPath });
+      activityMessage = `Indexed ${report.fileCount} file(s), ${readableSize(report.totalBytes)}${report.errorCount ? ` · ${report.errorCount} skipped` : ''}`;
     } catch (error) { activityMessage = `Folder selection failed: ${String(error)}`; }
   }
 
@@ -1051,14 +1126,22 @@
     rescanPending = true;
     activityMessage = 'Rescanning Napstr folder…';
     try {
-      const report = await invoke<{ fileCount: number; totalBytes: number }>('rescan_napstr_folder');
-      await refreshSnapshot();
-      if (networkConnected) await invoke('publish_catalogue');
+      const report = await invoke<{ fileCount: number; totalBytes: number; changedFiles: number }>('rescan_napstr_folder');
       activityMessage = `Indexed ${report.fileCount} file(s), ${readableSize(report.totalBytes)}`;
     } catch (error) {
       activityMessage = `Rescan failed: ${String(error)}`;
     } finally {
       rescanPending = false;
+    }
+  }
+
+  async function cancelLibraryScan() {
+    if (!nativeReady || !indexing) return;
+    try {
+      await invoke('cancel_library_scan');
+      activityMessage = 'Cancelling the library scan…';
+    } catch (error) {
+      activityMessage = `Could not cancel indexing: ${String(error)}`;
     }
   }
 
@@ -1145,14 +1228,34 @@
         appVersion = 'unknown';
       });
     let destroyed = false;
-    const chatUnlisteners: UnlistenFn[] = [];
+    const eventUnlisteners: UnlistenFn[] = [];
     void listen<string>('napstr-public-chat', ({ payload: topic }) => {
       if (topic === 'napstr-trollbox') void refreshTrollbox();
       const fileId = selected?.fileId?.toLowerCase();
       if (fileId && topic === `napstr-${fileId}`) void refreshTrackDiscussion(fileId);
     }).then((unlisten) => {
       if (destroyed) unlisten();
-      else chatUnlisteners.push(unlisten);
+      else eventUnlisteners.push(unlisten);
+    });
+    void listen('napstr-library-changed', () => {
+      void refreshLocalLibrary();
+    }).then((unlisten) => {
+      if (destroyed) unlisten();
+      else eventUnlisteners.push(unlisten);
+    });
+    void listen<IndexBatch>('napstr-index-batch', ({ payload }) => {
+      mergeIndexBatch(payload);
+    }).then((unlisten) => {
+      if (destroyed) unlisten();
+      else eventUnlisteners.push(unlisten);
+    });
+    void listen<IndexProgress>('napstr-index-progress', ({ payload }) => {
+      indexing = payload.scanning;
+      if (payload.message) activityMessage = payload.message;
+      if (!payload.scanning) rescanPending = false;
+    }).then((unlisten) => {
+      if (destroyed) unlisten();
+      else eventUnlisteners.push(unlisten);
     });
     const updateClock = () => {
       clock = new Intl.DateTimeFormat('en-GB', { hour: '2-digit', minute: '2-digit' }).format(new Date());
@@ -1217,13 +1320,6 @@
       } catch { /* the next transfer poll retries */ }
       finally { transferPollPending = false; }
     }, 1000);
-    let libraryPollPending = false;
-    const libraryTimer = window.setInterval(async () => {
-      if (!nativeReady || libraryPollPending) return;
-      libraryPollPending = true;
-      try { await refreshLocalLibrary(); }
-      finally { libraryPollPending = false; }
-    }, 2000);
     const playerTimer = window.setInterval(() => {
       if (!nativeReady || !currentTrack || playerLoading) return;
       const getStatus = isTauri
@@ -1237,12 +1333,11 @@
     }, 250);
     return () => {
       destroyed = true;
-      chatUnlisteners.forEach((unlisten) => unlisten());
+      eventUnlisteners.forEach((unlisten) => unlisten());
       clearInterval(clockTimer);
       clearInterval(wakeTimer);
       clearInterval(networkTimer);
       clearInterval(transferTimer);
-      clearInterval(libraryTimer);
       clearInterval(playerTimer);
       window.removeEventListener('resize', clampTransferPane);
       window.removeEventListener('focus', foregrounded);
@@ -1440,20 +1535,22 @@
           </div>
           <div class="tag-library">
             <table class="file-table tags-table"><thead><tr><th>Name</th><th>Folder</th><th>Tags</th></tr></thead><tbody>
-              {#each sharedFiles as file}
+              {#each paginatedTagFiles() as file}
                 <tr class:selected={selectedTagFile?.fileId === file.fileId} onclick={() => selectTagFile(file)} ondblclick={() => playAudio(file.fileId, file.filename, playerMode, 'downloads')}><td><button type="button" class="file-icon file-play-button" title={`Play ${file.filename}`} aria-label={`Play ${file.filename}`} onclick={(event) => { event.stopPropagation(); selectTagFile(file); playAudio(file.fileId, file.filename, playerMode, 'downloads'); }}>▶</button>{file.filename}</td><td>{folderName(file.folder)}</td><td>{file.tags || '—'}</td></tr>
               {/each}
             </tbody></table>
             {#if sharedFiles.length === 0}<p class="empty-state compact">Downloaded and shared tracks will appear here.</p>{/if}
           </div>
+          {#if sharedFiles.length > LOCAL_PAGE_SIZE}<div class="results-pager"><button disabled={downloadLibraryPage === 0} onclick={() => changeDownloadLibraryPage(downloadLibraryPage - 1)}>◀ Previous</button><span>{localPageRange(downloadLibraryPage, sharedFiles.length)} of {sharedFiles.length} · Page {downloadLibraryPage + 1} of {localPageCount(sharedFiles)}</span><button disabled={downloadLibraryPage + 1 >= localPageCount(sharedFiles)} onclick={() => changeDownloadLibraryPage(downloadLibraryPage + 1)}>Next ▶</button></div>{/if}
         </section>
       {:else if activeView === 'Shared'}
         <section class="full-panel">
           <div class="panel-title"><span></span><b>My Shared Files</b><span></span></div>
-          <div class="actionbar"><button class="classic-button" onclick={rescanSharedFolder} disabled={rescanPending}>{rescanPending ? '… Rescanning' : '↻ Rescan'}</button><button class="classic-button" onclick={openNapstrFolder}>Open folder</button><button class="classic-button" onclick={playSelectedSharedAudio} disabled={!selectedShared}>▶ Play</button><button class="classic-button" onclick={playSelectedFolder} disabled={!selectedShared}>▶ Play folder</button><button class="classic-button primary" onclick={playAllSongs} disabled={!sharedFiles.length}>▶ Play all</button><div class="spacer"></div><span>Sharing {sharedFiles.length} files · {readableSize(indexedBytes)}</span></div>
+          <div class="actionbar"><button class="classic-button" onclick={indexing ? cancelLibraryScan : rescanSharedFolder}>{indexing ? '× Cancel scan' : rescanPending ? '… Rescanning' : '↻ Rescan'}</button><button class="classic-button" onclick={openNapstrFolder}>Open folder</button><button class="classic-button" onclick={playSelectedSharedAudio} disabled={!selectedShared}>▶ Play</button><button class="classic-button" onclick={playSelectedFolder} disabled={!selectedShared}>▶ Play folder</button><button class="classic-button primary" onclick={playAllSongs} disabled={!sharedFiles.length}>▶ Play all</button><div class="spacer"></div><span>Sharing {sharedFiles.length} files · {readableSize(indexedBytes)}</span></div>
           <div class="folder-path"><b>Napstr folder:</b><input value={napstrFolder || 'No folder selected'} readonly /><button class="classic-button" onclick={chooseNapstrFolder}>Browse…</button></div>
-          <div class="library-filter"><label>View folder: <select bind:value={libraryFolderView}><option value="*">All folders</option>{#each libraryFolders() as folder}<option value={folder}>{folderName(folder)}</option>{/each}</select></label><span>{visibleSharedFiles().length} song{visibleSharedFiles().length === 1 ? '' : 's'} shown</span></div>
-          <table class="file-table shared-table"><thead><tr><th>Name</th><th>Folder</th><th>Size</th><th>Catalogue</th><th>Active peers</th></tr></thead><tbody>{#each visibleSharedFiles() as file}<tr class:selected={selectedShared?.fileId === file.fileId} onclick={() => (selectedShared = { ...file })} ondblclick={() => playAudio(file.fileId, file.name, playerMode, 'shared')}><td><span class="file-icon">▶</span>{file.name}</td><td>{folderName(file.folder)}</td><td>{file.readableSize}</td><td><span class:amber={!networkConnected} class="led"></span>{networkConnected ? 'Published' : 'Indexed'}</td><td>{file.peers}</td></tr>{/each}</tbody></table>
+          <div class="library-filter"><label>View folder: <select bind:value={libraryFolderView} onchange={changeLibraryFolder}><option value="*">All folders</option>{#each libraryFolders() as folder}<option value={folder}>{folderName(folder)}</option>{/each}</select></label><span>{visibleSharedFiles().length} song{visibleSharedFiles().length === 1 ? '' : 's'} shown</span></div>
+          <table class="file-table shared-table"><thead><tr><th>Name</th><th>Folder</th><th>Size</th><th>Catalogue</th><th>Active peers</th></tr></thead><tbody>{#each paginatedSharedFiles() as file}<tr class:selected={selectedShared?.fileId === file.fileId} onclick={() => (selectedShared = { ...file })} ondblclick={() => playAudio(file.fileId, file.name, playerMode, 'shared')}><td><span class="file-icon">▶</span>{file.name}</td><td>{folderName(file.folder)}</td><td>{file.readableSize}</td><td><span class:amber={!networkConnected} class="led"></span>{networkConnected ? 'Published' : 'Indexed'}</td><td>{file.peers}</td></tr>{/each}</tbody></table>
+          {#if visibleSharedFiles().length > LOCAL_PAGE_SIZE}<div class="results-pager"><button disabled={sharedLibraryPage === 0} onclick={() => changeSharedLibraryPage(sharedLibraryPage - 1)}>◀ Previous</button><span>{localPageRange(sharedLibraryPage, visibleSharedFiles().length)} of {visibleSharedFiles().length} · Page {sharedLibraryPage + 1} of {localPageCount(visibleSharedFiles())}</span><button disabled={sharedLibraryPage + 1 >= localPageCount(visibleSharedFiles())} onclick={() => changeSharedLibraryPage(sharedLibraryPage + 1)}>Next ▶</button></div>{/if}
           <p class="privacy-note wide"><span>♜</span> Only validated MP3, FLAC, WAV, Ogg Vorbis, and Opus audio is indexed recursively. Subfolders become player folders; folder names remain local and are not published. Embedded cover artwork is allowed.</p>
         </section>
       {:else if activeView === 'Trollbox'}

@@ -1,10 +1,10 @@
 use napstr_lib::{
     events::BroadcasterEmitter,
-    get_setting, index_path, initialise_database,
+    get_setting, index_path_headless, initialise_database,
     network::NetworkService,
     open_connection,
     server::{create_router, ServerState},
-    start_folder_watcher,
+    start_folder_watcher_headless,
     tor::TorManager,
     transfer::TransferService,
 };
@@ -65,13 +65,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if folder.is_dir() {
             println!("📂 Indexing music library at: {}", folder.display());
             if let Ok(mut conn) = open_connection(&db_path) {
-                let _ = index_path(&mut conn, &folder);
+                let _ = index_path_headless(&mut conn, &folder);
                 let _ = conn.execute(
                     "INSERT OR REPLACE INTO settings (key, value) VALUES ('shared_folder', ?1)",
                     [folder.to_string_lossy().as_ref()],
                 );
             }
-            start_folder_watcher(folder, db_path.clone(), network.clone()).ok()
+            start_folder_watcher_headless(folder, db_path.clone(), network.clone()).ok()
         } else {
             None
         }
