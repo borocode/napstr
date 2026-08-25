@@ -92,7 +92,7 @@
   let nativeReady = false;
   let activityMessage = 'Starting Napstr…';
   let napstrFolder = '';
-  let nostrRelays = 'wss://relay.damus.io, wss://nos.lol, wss://relay.nostr.com, wss://relay.primal.net, wss://relay.snort.social, wss://nostr.mom';
+  let nostrRelays = 'wss://relay.damus.io, wss://nos.lol, wss://relay.nostr.com, wss://relay.primal.net, wss://relay.snort.social, wss://nostr.mom, wss://relay.nostr.band';
   let displayName = 'napstr-user';
   let profileAbout = 'Sharing files privately with Napstr. napstr.net';
   let profilePicture = '';
@@ -162,7 +162,7 @@
 
   function mapFiles(files: NativeFile[]): Result[] {
     return files.map((file, index) => ({
-      id: index + 1, name: file.filename, format: file.format, size: readableSize(file.size), sources: 1,
+      id: index + 1, name: file.title || file.filename, format: file.format, size: readableSize(file.size), sources: 1,
       speed: 'Local', length: '—', fileId: file.fileId, artist: file.artist, album: file.album, license: file.license, description: file.description, tags: file.tags
     }));
   }
@@ -196,6 +196,26 @@
       && item.size <= maximumBytes()
       && matchesType(item.mime, item.format)
     );
+  }
+
+  function mergeSearchResults(networkMatches: NetworkResult[], localMatches: NativeFile[]) {
+    const merged = new Map<string, Result>();
+    for (const result of mapNetworkFiles(eligibleNetworkMatches(networkMatches))) {
+      merged.set(result.fileId, result);
+    }
+    if (minimumSources <= 1) {
+      for (const local of mapFiles(localMatches.filter((item) =>
+        item.size <= maximumBytes() && matchesType(item.mime, item.format)
+      ))) {
+        const existing = merged.get(local.fileId);
+        merged.set(local.fileId, existing
+          ? { ...existing, remote: false, speed: 'Local', sources: Math.max(1, existing.sources) }
+          : local);
+      }
+    }
+    return [...merged.values()]
+      .sort((left, right) => right.sources - left.sources || left.name.localeCompare(right.name))
+      .map((result, index) => ({ ...result, id: index + 1 }));
   }
 
   function shuffled<T>(items: T[]) {
@@ -893,14 +913,21 @@
     try {
       searchedQuery = query.trim() || 'All audio';
       if (networkConnected) {
-        try {
-          const matches = await invoke<NetworkResult[]>('network_search', { query: query.trim() });
-          const ranked = eligibleNetworkMatches(matches)
-            .sort((left, right) => right.sources.length - left.sources.length || left.filename.localeCompare(right.filename));
-          results = mapNetworkFiles(ranked);
-          resultsAreNetwork = true;
-          activityMessage = `${results.length} globally aggregated file ID(s), ranked by active seeders`;
-        } catch (error) { activityMessage = `Global search failed: ${String(error)}`; }
+        const [networkOutcome, localOutcome] = await Promise.allSettled([
+          invoke<NetworkResult[]>('network_search', { query: query.trim() }),
+          invoke<NativeFile[]>('search_catalog', { query: query.trim() })
+        ]);
+        const networkMatches = networkOutcome.status === 'fulfilled' ? networkOutcome.value : [];
+        const localMatches = localOutcome.status === 'fulfilled' ? localOutcome.value : [];
+        results = mergeSearchResults(networkMatches, localMatches);
+        resultsAreNetwork = networkOutcome.status === 'fulfilled';
+        if (networkOutcome.status === 'rejected') {
+          activityMessage = localOutcome.status === 'fulfilled'
+            ? `Global search failed: ${String(networkOutcome.reason)} · showing ${results.length} local match(es)`
+            : `Search failed: ${String(networkOutcome.reason)}`;
+        } else {
+          activityMessage = `${results.length} available file ID(s), ranked by active seeders`;
+        }
       } else if (nativeReady) {
         try {
           const matches = await invoke<NativeFile[]>('search_catalog', { query: query.trim() });
@@ -1448,6 +1475,7 @@
                 <div class="large-file-icon">▶</div>
                 <div><strong>{selected.name}</strong><span>{selected.format} · {selected.size} · {selected.length}</span><small>File ID: {selected.fileId}</small></div>
               </div>
+              {#if selected.artist || selected.album}<div class="file-metadata"><small>{selected.artist ? `Artist: ${selected.artist}` : ''}{selected.artist && selected.album ? ' · ' : ''}{selected.album ? `Album: ${selected.album}` : ''}</small></div>{/if}
               {#if selected.tags}<div class="file-metadata"><small>Tags: {selected.tags}</small></div>{/if}
               <fieldset><legend>Seeders</legend>
                 <div class="sources-list">
