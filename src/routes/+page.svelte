@@ -59,6 +59,8 @@
   type Snapshot = { files: NativeFile[]; transfers: NativeTransfer[]; settings: NativeSettings; indexedBytes: number; native: boolean };
   type NetworkStatus = { connected: boolean; npub: string; pubkey: string; relayCount: number; torRunning: boolean; torStarting: boolean; torProgress: number; torError: string; error: string };
   type NetworkResult = { fileId: string; filename: string; title: string; artist: string; album: string; format: string; mime: string; size: number; license: string; description: string; tags: string; sources: SourceDetail[] };
+  type CatalogueBrowseCursor = { sessionId: string };
+  type CatalogueBrowsePage = { results: NetworkResult[]; cursor: CatalogueBrowseCursor | null; totalAvailable: number };
   type PlayerTrack = { fileId: string; name: string; folder: string; artist: string; mime: string };
   type PlaybackStatus = { fileId: string; currentTime: number; duration: number; playing: boolean; ended: boolean; error: string };
   type ReleaseStatus = { version: string; url: string };
@@ -124,6 +126,11 @@
   let trackDiscussionRefreshAgain = false;
   let trackDiscussionLog: HTMLDivElement;
   let searchAction: 'search' | 'surprise' | null = null;
+  let browseCursor: CatalogueBrowseCursor | null = null;
+  let browseLoading = false;
+  let browseGeneration = 0;
+  let loadedNetworkMatches: NetworkResult[] = [];
+  let browseTotalAvailable = 0;
   let rescanPending = false;
   let indexing = false;
   let downloadLibraryPage = 0;
@@ -216,6 +223,21 @@
     return [...merged.values()]
       .sort((left, right) => right.sources - left.sources || left.name.localeCompare(right.name))
       .map((result, index) => ({ ...result, id: index + 1 }));
+  }
+
+  function mergeNetworkPages(existing: NetworkResult[], incoming: NetworkResult[]) {
+    const merged = new Map(existing.map((item) => [item.fileId, item]));
+    for (const item of incoming) {
+      const previous = merged.get(item.fileId);
+      if (!previous) {
+        merged.set(item.fileId, item);
+        continue;
+      }
+      const sources = new Map(previous.sources.map((source) => [source.pubkey, source]));
+      for (const source of item.sources) sources.set(source.pubkey, source);
+      merged.set(item.fileId, { ...previous, ...item, sources: [...sources.values()] });
+    }
+    return [...merged.values()];
   }
 
   function shuffled<T>(items: T[]) {
@@ -324,7 +346,14 @@
     return `${start}–${Math.min(start + SEARCH_PAGE_SIZE - 1, results.length)}`;
   }
 
-  function changeResultPage(nextPage: number) {
+  function availableResultTotal() {
+    return Math.max(results.length, browseTotalAvailable);
+  }
+
+  async function changeResultPage(nextPage: number) {
+    if (nextPage >= resultPageCount() && browseCursor && !browseLoading) {
+      await loadNextBrowsePage();
+    }
     resultPage = Math.max(0, Math.min(nextPage, resultPageCount() - 1));
     selectResult(paginatedResults()[0] ?? null);
   }
@@ -909,16 +938,36 @@
 
   async function search() {
     if (searchAction) return;
+    const generation = ++browseGeneration;
+    browseCursor = null;
+    browseLoading = false;
+    loadedNetworkMatches = [];
+    browseTotalAvailable = 0;
     searchAction = 'search';
     try {
-      searchedQuery = query.trim() || 'All audio';
+      const trimmedQuery = query.trim();
+      searchedQuery = trimmedQuery || 'All audio';
       if (networkConnected) {
         const [networkOutcome, localOutcome] = await Promise.allSettled([
-          invoke<NetworkResult[]>('network_search', { query: query.trim() }),
-          invoke<NativeFile[]>('search_catalog', { query: query.trim() })
+          trimmedQuery
+            ? invoke<NetworkResult[]>('network_search', { query: trimmedQuery })
+            : invoke<CatalogueBrowsePage>('network_browse', { cursor: null, limit: 500, cacheLimit: 10000 }),
+          invoke<NativeFile[]>('search_catalog', { query: trimmedQuery })
         ]);
-        const networkMatches = networkOutcome.status === 'fulfilled' ? networkOutcome.value : [];
+        if (generation !== browseGeneration) return;
+        const networkMatches = networkOutcome.status === 'fulfilled'
+          ? trimmedQuery
+            ? networkOutcome.value as NetworkResult[]
+            : (networkOutcome.value as CatalogueBrowsePage).results
+          : [];
         const localMatches = localOutcome.status === 'fulfilled' ? localOutcome.value : [];
+        loadedNetworkMatches = networkMatches;
+        browseCursor = networkOutcome.status === 'fulfilled' && !trimmedQuery
+          ? (networkOutcome.value as CatalogueBrowsePage).cursor
+          : null;
+        browseTotalAvailable = networkOutcome.status === 'fulfilled' && !trimmedQuery
+          ? (networkOutcome.value as CatalogueBrowsePage).totalAvailable
+          : 0;
         results = mergeSearchResults(networkMatches, localMatches);
         resultsAreNetwork = networkOutcome.status === 'fulfilled';
         if (networkOutcome.status === 'rejected') {
@@ -926,7 +975,9 @@
             ? `Global search failed: ${String(networkOutcome.reason)} · showing ${results.length} local match(es)`
             : `Search failed: ${String(networkOutcome.reason)}`;
         } else {
-          activityMessage = `${results.length} available file ID(s), ranked by active seeders`;
+          activityMessage = !trimmedQuery
+            ? `${results.length} loaded of ${availableResultTotal()} currently available file ID(s), ranked by active seeders`
+            : `${results.length} available file ID(s), ranked by active seeders`;
         }
       } else if (nativeReady) {
         try {
@@ -938,8 +989,33 @@
       }
       resultPage = 0;
       selectResult(results[0] ?? null, true);
+      if (generation === browseGeneration && !query.trim() && browseCursor) {
+        void loadNextBrowsePage();
+      }
     } finally {
-      searchAction = null;
+      if (generation === browseGeneration) searchAction = null;
+    }
+  }
+
+  async function loadNextBrowsePage() {
+    const cursor = browseCursor;
+    if (!cursor || browseLoading || query.trim()) return;
+    const generation = browseGeneration;
+    browseLoading = true;
+    activityMessage = `${results.length} available file ID(s) loaded · fetching the next relay page…`;
+    try {
+      const page = await invoke<CatalogueBrowsePage>('network_browse', { cursor, limit: 500, cacheLimit: 10000 });
+      if (generation !== browseGeneration || query.trim()) return;
+      loadedNetworkMatches = mergeNetworkPages(loadedNetworkMatches, page.results);
+      browseCursor = page.cursor;
+      browseTotalAvailable = page.totalAvailable;
+      results = mergeSearchResults(loadedNetworkMatches, sharedFiles);
+      resultsAreNetwork = true;
+      activityMessage = `${results.length} loaded of ${availableResultTotal()} currently available file ID(s), ranked by active seeders`;
+    } catch (error) {
+      if (generation === browseGeneration) activityMessage = `Could not load the next catalogue page: ${String(error)}`;
+    } finally {
+      if (generation === browseGeneration) browseLoading = false;
     }
   }
 
@@ -949,11 +1025,21 @@
       activityMessage = 'Connect to Nostr before asking for a surprise';
       return;
     }
+    browseGeneration += 1;
+    browseCursor = null;
+    browseLoading = false;
+    loadedNetworkMatches = [];
+    browseTotalAvailable = 0;
     searchAction = 'surprise';
     searchedQuery = 'Surprise me';
     activityMessage = 'Finding 50 random downloadable tracks…';
     try {
-      const matches = await invoke<NetworkResult[]>('network_search', { query: '' });
+      const page = await invoke<CatalogueBrowsePage>('network_browse', { cursor: null, limit: 50, cacheLimit: 50 });
+      let matches = page.results;
+      if (matches.length < 50 && page.cursor) {
+        const missing = await invoke<CatalogueBrowsePage>('network_browse', { cursor: page.cursor, limit: 50, cacheLimit: 50 });
+        matches = mergeNetworkPages(matches, missing.results);
+      }
       const downloadable = eligibleNetworkMatches(matches)
         .filter((item) => !isLocalFile(item.fileId) && item.sources.length > 0);
       results = mapNetworkFiles(shuffled(downloadable).slice(0, 50));
@@ -1448,7 +1534,7 @@
 
         <div class="split-content">
           <section class="results-pane" aria-label="Search results">
-            <div class="section-caption"><span>Search results for “{searchedQuery}”</span><small>{results.length} file IDs found</small></div>
+            <div class="section-caption"><span>Search results for “{searchedQuery}”</span><small>{browseTotalAvailable ? `${results.length} loaded of ${availableResultTotal()} available` : `${results.length} file IDs found`}</small></div>
             <div class="table-wrap">
               <table class="file-table">
                 <thead><tr><th class="name-col">Name</th><th>Type</th><th class="number">Size</th><th class="number">Seeders</th><th>Line speed</th><th>Length</th></tr></thead>
@@ -1462,9 +1548,9 @@
               </table>
             </div>
             <div class="results-pager">
-              <button onclick={() => changeResultPage(resultPage - 1)} disabled={resultPage === 0}>◀ Previous</button>
-              <span>{resultRange()} of {results.length} · Page {resultPage + 1} of {resultPageCount()}</span>
-              <button onclick={() => changeResultPage(resultPage + 1)} disabled={resultPage + 1 >= resultPageCount()}>Next ▶</button>
+              <button onclick={() => void changeResultPage(resultPage - 1)} disabled={resultPage === 0}>◀ Previous</button>
+              <span>{resultRange()} of {results.length} loaded{browseTotalAvailable ? ` · ${availableResultTotal()} available` : ''} · Page {resultPage + 1} of {resultPageCount()}{browseCursor ? '+' : ''}</span>
+              <button onclick={() => void changeResultPage(resultPage + 1)} disabled={browseLoading || (resultPage + 1 >= resultPageCount() && !browseCursor)}>{browseLoading ? 'Loading…' : 'Next ▶'}</button>
             </div>
           </section>
 

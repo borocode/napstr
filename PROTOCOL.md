@@ -199,14 +199,28 @@ locally because hashtag values are OR filters and NIP-50 support and matching
 behavior vary between relays. Clients SHOULD retain previously verified entries
 in a local cache.
 
-An empty search MUST NOT enumerate the complete public catalogue. Consumers
-first obtain unexpired availability events, rank active file IDs by distinct
-authors, select a bounded set, and request their exact addressable events with
-standard NIP-01 `d`-tag filters in batches:
+An empty search MUST NOT enumerate an unbounded public catalogue. Consumers
+first obtain unexpired availability events, deduplicate file IDs, rank them by
+distinct active authors, and select a bounded window. Previously validated
+catalogue records for active IDs SHOULD be hydrated from the local cache
+immediately. Only active IDs whose current seeder records are missing from that
+cache are requested from relays, using standard NIP-01 `d`-tag filters in
+bounded pages:
 
 ```json
 {"kinds":[30421],"#t":["napstr"],"#d":["<fileId1>","<fileId2>"],"limit":500}
 ```
+
+The reference client selects at most 10,000 active IDs, requests no more than
+500 missing IDs per progressive page, and retains browse state for 10 minutes.
+Named searches issue indexed `t`-tag and NIP-50 queries concurrently before
+applying local validation and matching. A random-track feature uses its own
+50-ID window rather than hydrating the full browse window.
+
+Clients may display the number of distinct, valid file IDs in the current
+unexpired availability heartbeats before every corresponding catalogue event
+has been fetched. This is an availability total, not a permanent global track
+count, and changes as heartbeat events expire or seeders connect and disconnect.
 
 They MUST validate the event signature, `protocol`, `fileId`, filename, size,
 format, MIME type, and tags before displaying an entry. Entries with the same

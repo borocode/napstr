@@ -1511,6 +1511,19 @@ async fn network_search(
 }
 
 #[tauri::command]
+async fn network_browse(
+    cursor: Option<network::CatalogueBrowseCursor>,
+    limit: Option<usize>,
+    cache_limit: Option<usize>,
+    state: State<'_, AppState>,
+) -> Result<network::CatalogueBrowsePage, String> {
+    state
+        .network
+        .browse(cursor, limit.unwrap_or(500), cache_limit.unwrap_or(10_000))
+        .await
+}
+
+#[tauri::command]
 async fn get_trollbox_messages(
     state: State<'_, AppState>,
 ) -> Result<Vec<network::TrollboxMessage>, String> {
@@ -1747,6 +1760,7 @@ pub fn run() {
             publish_catalogue,
             publish_profile,
             network_search,
+            network_browse,
             get_trollbox_messages,
             send_trollbox_message,
             get_track_discussion_messages,

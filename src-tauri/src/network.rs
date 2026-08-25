@@ -7,14 +7,14 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     path::PathBuf,
     str::FromStr,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex as StdMutex,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tauri::Emitter;
 use tokio::sync::{Mutex, RwLock};
@@ -33,9 +33,13 @@ const MAX_SEEDER_CANDIDATES: usize = 3;
 const CATALOGUE_EVENT_PACE: Duration = Duration::from_millis(75);
 const AVAILABILITY_QUERY_LIMIT: usize = 1_000;
 const AVAILABILITY_FILE_LIMIT: usize = 50_000;
-const NETWORK_SEARCH_RESULT_LIMIT: usize = 500;
+const EMPTY_SEARCH_RESULT_LIMIT: usize = 10_000;
+const EMPTY_SEARCH_PAGE_LIMIT: usize = 500;
 const CATALOGUE_IDENTIFIER_BATCH_SIZE: usize = 75;
-const CATALOGUE_IDENTIFIER_CONCURRENCY: usize = 3;
+const CATALOGUE_IDENTIFIER_CONCURRENCY: usize = 8;
+const CATALOGUE_BROWSE_SESSION_LIFETIME: Duration = Duration::from_secs(10 * 60);
+const CATALOGUE_BROWSE_SESSION_LIMIT: usize = 8;
+const NETWORK_SEARCH_RESULT_LIMIT: usize = 500;
 const CATALOGUE_CACHE_SCAN_LIMIT: usize = 25_000;
 const CATALOGUE_SEARCH_TOKEN_LIMIT: usize = 20;
 const CATALOGUE_SEARCH_TOKEN_LENGTH: usize = 32;
@@ -97,6 +101,28 @@ pub struct CatalogueResult {
     pub description: String,
     pub tags: String,
     pub sources: Vec<CatalogueSource>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogueBrowseCursor {
+    session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogueBrowsePage {
+    pub results: Vec<CatalogueResult>,
+    pub cursor: Option<CatalogueBrowseCursor>,
+    pub total_available: usize,
+}
+
+struct CatalogueBrowseSession {
+    created_at: Instant,
+    online: HashSet<(String, String)>,
+    available_by_file: HashMap<String, HashSet<String>>,
+    pending_file_ids: VecDeque<String>,
+    total_available: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -182,6 +208,65 @@ fn catalogue_name_search_filter(query: &str) -> Filter {
         .limit(NETWORK_SEARCH_RESULT_LIMIT)
 }
 
+fn catalogue_identifier_filter(file_ids: &[String]) -> Filter {
+    Filter::new()
+        .kind(Kind::from(CATALOGUE_KIND))
+        .hashtag("napstr")
+        .identifiers(file_ids.iter().cloned())
+        .limit(file_ids.len().saturating_mul(8).clamp(1, 1_000))
+}
+
+async fn fetch_catalogue_identifiers(
+    client: &Client,
+    file_ids: &[String],
+) -> Result<(Vec<Event>, Vec<String>), String> {
+    let batches = file_ids
+        .chunks(CATALOGUE_IDENTIFIER_BATCH_SIZE)
+        .map(|batch| batch.to_vec())
+        .collect::<Vec<_>>();
+    let fetched = stream::iter(batches)
+        .map(|batch| {
+            let client = client.clone();
+            async move {
+                let result = client
+                    .fetch_events(catalogue_identifier_filter(&batch), Duration::from_secs(8))
+                    .await;
+                (batch, result)
+            }
+        })
+        .buffer_unordered(CATALOGUE_IDENTIFIER_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+    let mut successful_batches = 0usize;
+    let mut failures = Vec::new();
+    let mut retry_file_ids = Vec::new();
+    let mut events_by_id = HashMap::new();
+    for (batch, result) in fetched {
+        match result {
+            Ok(events) => {
+                successful_batches += 1;
+                for event in events.iter() {
+                    events_by_id.insert(event.id, event.clone());
+                }
+            }
+            Err(error) => {
+                failures.push(error.to_string());
+                retry_file_ids.extend(batch);
+            }
+        }
+    }
+    if successful_batches == 0 && !file_ids.is_empty() {
+        return Err(format!(
+            "catalogue identifier lookup failed: {}",
+            failures
+                .first()
+                .map(String::as_str)
+                .unwrap_or("all relay queries failed")
+        ));
+    }
+    Ok((events_by_id.into_values().collect(), retry_file_ids))
+}
+
 fn catalogue_search_tokens(fields: &[&str]) -> Vec<String> {
     let mut seen = HashSet::new();
     let field_tokens = fields
@@ -233,14 +318,6 @@ fn catalogue_tag_search_filters(query: &str) -> Vec<Filter> {
         .collect()
 }
 
-fn catalogue_identifier_filter(file_ids: &[String]) -> Filter {
-    Filter::new()
-        .kind(Kind::from(CATALOGUE_KIND))
-        .hashtag("napstr")
-        .identifiers(file_ids.iter().cloned())
-        .limit(NETWORK_SEARCH_RESULT_LIMIT)
-}
-
 fn catalogue_event_fingerprint(content_json: &str, search_tokens: &[String]) -> String {
     let mut digest = Sha256::new();
     digest.update(b"napstr-catalogue-event-v1\0");
@@ -268,17 +345,30 @@ fn valid_catalogue_metadata(values: &[&str]) -> bool {
     })
 }
 
+fn valid_catalogue_event(event: &Event, content: &CatalogueContent) -> bool {
+    event.kind == Kind::from(CATALOGUE_KIND)
+        && event.verify().is_ok()
+        && event.tags.identifier() == Some(content.file_id.as_str())
+        && event.tags.hashtags().any(|tag| tag == "napstr")
+}
+
 fn merge_availability_events<'a>(
     events: impl IntoIterator<Item = &'a Event>,
     online: &mut HashSet<(String, String)>,
     available_by_file: &mut HashMap<String, HashSet<String>>,
 ) {
     for event in events {
-        if event
-            .tags
-            .expiration()
-            .map(|expires| *expires <= Timestamp::now())
-            .unwrap_or(true)
+        if event.kind != Kind::from(AVAILABILITY_KIND)
+            || event.verify().is_err()
+            || !event
+                .tags
+                .hashtags()
+                .any(|tag| tag == "napstr-availability")
+            || event
+                .tags
+                .expiration()
+                .map(|expires| *expires <= Timestamp::now())
+                .unwrap_or(true)
         {
             continue;
         }
@@ -360,6 +450,7 @@ pub struct NetworkService {
     catalogue_reconcile_requested: AtomicBool,
     catalogue_pending_ids: StdMutex<HashSet<String>>,
     catalogue_publish_worker_running: AtomicBool,
+    catalogue_browse_sessions: Mutex<HashMap<String, CatalogueBrowseSession>>,
     trollbox_cache_lock: Mutex<()>,
     track_discussion_subscription_lock: Mutex<()>,
     connected: AtomicBool,
@@ -387,6 +478,7 @@ impl NetworkService {
             catalogue_reconcile_requested: AtomicBool::new(false),
             catalogue_pending_ids: StdMutex::new(HashSet::new()),
             catalogue_publish_worker_running: AtomicBool::new(false),
+            catalogue_browse_sessions: Mutex::new(HashMap::new()),
             trollbox_cache_lock: Mutex::new(()),
             track_discussion_subscription_lock: Mutex::new(()),
             connected: AtomicBool::new(false),
@@ -1203,6 +1295,37 @@ impl NetworkService {
     }
 
     pub async fn search(&self, query: &str) -> Result<Vec<CatalogueResult>, String> {
+        let browse = query.trim().is_empty().then_some((
+            None,
+            EMPTY_SEARCH_PAGE_LIMIT,
+            EMPTY_SEARCH_RESULT_LIMIT,
+        ));
+        self.search_inner(query, browse)
+            .await
+            .map(|(results, _, _)| results)
+    }
+
+    pub async fn browse(
+        &self,
+        cursor: Option<CatalogueBrowseCursor>,
+        limit: usize,
+        cache_limit: usize,
+    ) -> Result<CatalogueBrowsePage, String> {
+        let (results, cursor, total_available) = self
+            .search_inner("", Some((cursor, limit, cache_limit)))
+            .await?;
+        Ok(CatalogueBrowsePage {
+            results,
+            cursor,
+            total_available,
+        })
+    }
+
+    async fn search_inner(
+        &self,
+        query: &str,
+        browse: Option<(Option<CatalogueBrowseCursor>, usize, usize)>,
+    ) -> Result<(Vec<CatalogueResult>, Option<CatalogueBrowseCursor>, usize), String> {
         let client = self
             .client
             .read()
@@ -1210,16 +1333,76 @@ impl NetworkService {
             .clone()
             .ok_or("Nostr is not connected")?;
         let query = query.trim();
+        let browse_result_limit = browse.as_ref().map(|(_, limit, _)| *limit);
         let mut requested_file_ids = HashSet::new();
+        let mut requested_file_id_order = Vec::new();
         let mut events_by_id: HashMap<EventId, Event> = HashMap::new();
         let mut catalogue_search_error = None;
-        let availability_query =
-            client.fetch_events(availability_search_filter(), Duration::from_secs(6));
-        let availability = if query.is_empty() {
-            availability_query
-                .await
-                .map_err(|error| format!("availability search failed: {error}"))?
+        let mut next_browse_cursor = None;
+        let mut online: HashSet<(String, String)> = HashSet::new();
+        let mut available_by_file: HashMap<String, HashSet<String>> = HashMap::new();
+        let mut continuation_session: Option<(String, CatalogueBrowseSession)> = None;
+        let mut initial_browse_cache_limit = EMPTY_SEARCH_RESULT_LIMIT;
+        let is_initial_browse = query.is_empty()
+            && browse
+                .as_ref()
+                .map(|(cursor, _, _)| cursor.is_none())
+                .unwrap_or(true);
+
+        if query.is_empty() {
+            let (cursor, limit, cache_limit) =
+                browse.unwrap_or((None, EMPTY_SEARCH_PAGE_LIMIT, EMPTY_SEARCH_RESULT_LIMIT));
+            initial_browse_cache_limit = cache_limit.clamp(1, EMPTY_SEARCH_RESULT_LIMIT);
+            if let Some(cursor) = cursor {
+                Uuid::parse_str(&cursor.session_id)
+                    .map_err(|_| "invalid catalogue browse cursor".to_string())?;
+                let mut sessions = self.catalogue_browse_sessions.lock().await;
+                sessions.retain(|_, session| {
+                    session.created_at.elapsed() < CATALOGUE_BROWSE_SESSION_LIFETIME
+                });
+                let mut session = sessions.remove(&cursor.session_id).ok_or_else(|| {
+                    "catalogue browse session expired; run the empty search again".to_string()
+                })?;
+                drop(sessions);
+                let page_size = limit.clamp(1, EMPTY_SEARCH_PAGE_LIMIT);
+                while requested_file_id_order.len() < page_size {
+                    let Some(file_id) = session.pending_file_ids.pop_front() else {
+                        break;
+                    };
+                    requested_file_ids.insert(file_id.clone());
+                    requested_file_id_order.push(file_id);
+                }
+                online = session.online.clone();
+                available_by_file = session.available_by_file.clone();
+                match fetch_catalogue_identifiers(&client, &requested_file_id_order).await {
+                    Ok((events, retry_file_ids)) => {
+                        for event in events {
+                            events_by_id.insert(event.id, event);
+                        }
+                        session.pending_file_ids.extend(retry_file_ids);
+                    }
+                    Err(error) => {
+                        for file_id in requested_file_id_order.iter().rev() {
+                            session.pending_file_ids.push_front(file_id.clone());
+                        }
+                        self.catalogue_browse_sessions
+                            .lock()
+                            .await
+                            .insert(cursor.session_id, session);
+                        return Err(error);
+                    }
+                }
+                continuation_session = Some((cursor.session_id, session));
+            } else {
+                let availability = client
+                    .fetch_events(availability_search_filter(), Duration::from_secs(6))
+                    .await
+                    .map_err(|error| format!("availability search failed: {error}"))?;
+                merge_availability_events(availability.iter(), &mut online, &mut available_by_file);
+            }
         } else {
+            let availability_query =
+                client.fetch_events(availability_search_filter(), Duration::from_secs(6));
             let mut filters = vec![catalogue_name_search_filter(query)];
             filters.extend(catalogue_tag_search_filters(query));
             let search_query = stream::iter(filters)
@@ -1257,54 +1440,9 @@ impl NetworkService {
                         .unwrap_or("all relay queries failed")
                 ));
             }
-            availability.map_err(|error| format!("availability search failed: {error}"))?
-        };
-        let mut online: HashSet<(String, String)> = HashSet::new();
-        let mut available_by_file: HashMap<String, HashSet<String>> = HashMap::new();
-        merge_availability_events(availability.iter(), &mut online, &mut available_by_file);
-
-        if query.is_empty() {
-            let mut ranked_ids = available_by_file
-                .iter()
-                .map(|(file_id, sources)| (file_id.clone(), sources.len()))
-                .collect::<Vec<_>>();
-            ranked_ids
-                .sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
-            requested_file_ids.extend(
-                ranked_ids
-                    .into_iter()
-                    .take(NETWORK_SEARCH_RESULT_LIMIT)
-                    .map(|(file_id, _)| file_id),
-            );
-            let batches = requested_file_ids
-                .iter()
-                .cloned()
-                .collect::<Vec<_>>()
-                .chunks(CATALOGUE_IDENTIFIER_BATCH_SIZE)
-                .map(|batch| batch.to_vec())
-                .collect::<Vec<_>>();
-            let fetched = stream::iter(batches)
-                .map(|batch| {
-                    let client = client.clone();
-                    async move {
-                        client
-                            .fetch_events(
-                                catalogue_identifier_filter(&batch),
-                                Duration::from_secs(6),
-                            )
-                            .await
-                            .ok()
-                    }
-                })
-                .buffer_unordered(CATALOGUE_IDENTIFIER_CONCURRENCY)
-                .collect::<Vec<_>>()
-                .await;
-            for events in fetched.into_iter().flatten() {
-                for event in events.iter() {
-                    events_by_id.insert(event.id, event.clone());
-                }
-            }
-        } else {
+            let availability =
+                availability.map_err(|error| format!("availability search failed: {error}"))?;
+            merge_availability_events(availability.iter(), &mut online, &mut available_by_file);
             let authors = events_by_id
                 .values()
                 .map(|event| event.pubkey)
@@ -1347,6 +1485,48 @@ impl NetworkService {
             rows.collect::<Result<HashSet<_>, _>>()
                 .map_err(|error| error.to_string())?
         };
+        let mut total_available = available_by_file
+            .iter()
+            .filter(|(file_id, sources)| {
+                !blocked_files.contains(*file_id)
+                    && sources
+                        .iter()
+                        .any(|source| !blocked_pubkeys.contains(source))
+            })
+            .count();
+        if let Some((_, session)) = &continuation_session {
+            total_available = session.total_available;
+        } else if is_initial_browse {
+            let mut ranked_ids = available_by_file
+                .iter()
+                .filter(|(file_id, sources)| {
+                    !blocked_files.contains(*file_id)
+                        && sources
+                            .iter()
+                            .any(|source| !blocked_pubkeys.contains(source))
+                })
+                .map(|(file_id, sources)| {
+                    let active_sources = sources
+                        .iter()
+                        .filter(|source| !blocked_pubkeys.contains(*source))
+                        .count();
+                    (file_id.clone(), active_sources)
+                })
+                .collect::<Vec<_>>();
+            ranked_ids.sort_by(|(left_id, left_sources), (right_id, right_sources)| {
+                right_sources
+                    .cmp(left_sources)
+                    .then_with(|| left_id.cmp(right_id))
+            });
+            requested_file_id_order = ranked_ids
+                .into_iter()
+                .take(initial_browse_cache_limit)
+                .map(|(file_id, _)| file_id)
+                .collect();
+            requested_file_ids.extend(requested_file_id_order.iter().cloned());
+            available_by_file.retain(|file_id, _| requested_file_ids.contains(file_id));
+            online.retain(|(_, file_id)| requested_file_ids.contains(file_id));
+        }
 
         // Previously verified relay events are an acceleration cache, not the
         // source of availability truth. Only rows paired with a fresh heartbeat
@@ -1408,6 +1588,7 @@ impl NetworkService {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| error.to_string())?
         };
+        let mut cached_source_pairs = HashSet::new();
         for cached in cached {
             if blocked_files.contains(&cached.file_id)
                 || blocked_pubkeys.contains(&cached.source_pubkey)
@@ -1425,6 +1606,7 @@ impl NetworkService {
                     ))
                 || (query.is_empty() && !requested_file_ids.contains(&cached.file_id))
                 || !valid_file_id(&cached.file_id)
+                || cached.size == 0
                 || !audio_claim_valid(&cached.filename, &cached.format, &cached.mime)
                 || !valid_catalogue_metadata(&[
                     &cached.filename,
@@ -1453,6 +1635,7 @@ impl NetworkService {
                 picture: String::new(),
                 event_id: cached.event_id,
             };
+            cached_source_pairs.insert((cached.source_pubkey.clone(), cached.file_id.clone()));
             merge_catalogue_result(
                 &mut aggregated,
                 CatalogueContent {
@@ -1478,8 +1661,10 @@ impl NetworkService {
             let Ok(content) = serde_json::from_str::<CatalogueContent>(&event.content) else {
                 continue;
             };
-            if content.protocol != "napstr/1"
+            if !valid_catalogue_event(event, &content)
+                || content.protocol != "napstr/1"
                 || !valid_file_id(&content.file_id)
+                || content.size == 0
                 || !audio_claim_valid(&content.filename, &content.format, &content.mime)
                 || !valid_catalogue_metadata(&[
                     &content.filename,
@@ -1528,7 +1713,56 @@ impl NetworkService {
                 "INSERT OR REPLACE INTO remote_catalogue (file_id,source_pubkey,filename,title,artist,album,format,mime,size,license,description,tags,event_id,seen_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
                 params![content.file_id, pubkey, catalogue_name, content.title, content.artist, content.album, content.format, content.mime, content.size as i64, "unspecified", "", catalogue_tags, event.id.to_hex(), Utc::now().to_rfc3339()],
             ).map_err(|error| error.to_string())?;
+            cached_source_pairs.insert((pubkey, content.file_id.clone()));
             merge_catalogue_result(&mut aggregated, content, catalogue_tags, source);
+        }
+        if is_initial_browse {
+            let pending_file_ids = requested_file_id_order
+                .iter()
+                .filter(|file_id| {
+                    available_by_file.get(*file_id).is_some_and(|sources| {
+                        sources.iter().any(|source| {
+                            !blocked_pubkeys.contains(source)
+                                && !cached_source_pairs
+                                    .contains(&(source.clone(), (*file_id).clone()))
+                        })
+                    })
+                })
+                .cloned()
+                .collect::<VecDeque<_>>();
+            if !pending_file_ids.is_empty() {
+                let session_id = Uuid::new_v4().to_string();
+                let session = CatalogueBrowseSession {
+                    created_at: Instant::now(),
+                    online,
+                    available_by_file,
+                    pending_file_ids,
+                    total_available,
+                };
+                let mut sessions = self.catalogue_browse_sessions.lock().await;
+                sessions.retain(|_, session| {
+                    session.created_at.elapsed() < CATALOGUE_BROWSE_SESSION_LIFETIME
+                });
+                if sessions.len() >= CATALOGUE_BROWSE_SESSION_LIMIT {
+                    if let Some(oldest) = sessions
+                        .iter()
+                        .max_by_key(|(_, session)| session.created_at.elapsed())
+                        .map(|(session_id, _)| session_id.clone())
+                    {
+                        sessions.remove(&oldest);
+                    }
+                }
+                sessions.insert(session_id.clone(), session);
+                next_browse_cursor = Some(CatalogueBrowseCursor { session_id });
+            }
+        } else if let Some((session_id, session)) = continuation_session {
+            if !session.pending_file_ids.is_empty() {
+                self.catalogue_browse_sessions
+                    .lock()
+                    .await
+                    .insert(session_id.clone(), session);
+                next_browse_cursor = Some(CatalogueBrowseCursor { session_id });
+            }
         }
         let mut results: Vec<_> = aggregated.into_values().collect();
         if results.is_empty() {
@@ -1536,13 +1770,18 @@ impl NetworkService {
                 return Err(error);
             }
         }
-        let profile_keys = results
-            .iter()
-            .flat_map(|result| result.sources.iter())
-            .filter_map(|source| PublicKey::from_str(&source.pubkey).ok())
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .take(128);
+        let profile_keys = (!query.is_empty())
+            .then(|| {
+                results
+                    .iter()
+                    .flat_map(|result| result.sources.iter())
+                    .filter_map(|source| PublicKey::from_str(&source.pubkey).ok())
+                    .collect::<HashSet<_>>()
+                    .into_iter()
+                    .take(128)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         let profiles: HashMap<String, Metadata> = stream::iter(profile_keys)
             .map(|public_key| {
                 let client = client.clone();
@@ -1581,8 +1820,14 @@ impl NetworkService {
                 .cmp(&left.sources.len())
                 .then_with(|| left.filename.cmp(&right.filename))
         });
-        results.truncate(NETWORK_SEARCH_RESULT_LIMIT);
-        Ok(results)
+        results.truncate(if is_initial_browse {
+            initial_browse_cache_limit
+        } else if let Some(limit) = browse_result_limit {
+            limit.clamp(1, EMPTY_SEARCH_PAGE_LIMIT)
+        } else {
+            NETWORK_SEARCH_RESULT_LIMIT
+        });
+        Ok((results, next_browse_cursor, total_available))
     }
 
     pub async fn request_download(
@@ -2392,11 +2637,12 @@ mod tests {
             vec!["enter", "sandman"]
         );
 
-        let file_ids = vec!["ab".repeat(32), "cd".repeat(32)];
-        let exact = serde_json::to_value(catalogue_identifier_filter(&file_ids)).unwrap();
-        assert_eq!(exact["kinds"], serde_json::json!([CATALOGUE_KIND]));
-        assert_eq!(exact["#d"], serde_json::json!(file_ids));
-        assert_eq!(exact["limit"], NETWORK_SEARCH_RESULT_LIMIT);
+        let identifiers = vec!["a".repeat(64), "b".repeat(64)];
+        let browse = serde_json::to_value(catalogue_identifier_filter(&identifiers)).unwrap();
+        assert_eq!(browse["kinds"], serde_json::json!([CATALOGUE_KIND]));
+        assert_eq!(browse["#t"], serde_json::json!(["napstr"]));
+        assert_eq!(browse["#d"], serde_json::json!(identifiers));
+        assert_eq!(browse["limit"], 16);
 
         let availability = serde_json::to_value(availability_search_filter()).unwrap();
         assert_eq!(
