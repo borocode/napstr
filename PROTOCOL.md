@@ -33,6 +33,7 @@ Relevant standards:
 - [NIP-01: basic protocol](https://github.com/nostr-protocol/nips/blob/master/01.md)
 - [NIP-17: private direct messages](https://github.com/nostr-protocol/nips/blob/master/17.md)
 - [NIP-40: expiration timestamps](https://github.com/nostr-protocol/nips/blob/master/40.md)
+- [NIP-50: relay search](https://github.com/nostr-protocol/nips/blob/master/50.md)
 - [NIP-56: reporting](https://github.com/nostr-protocol/nips/blob/master/56.md)
 - [NIP-59: gift wrapping](https://github.com/nostr-protocol/nips/blob/master/59.md)
 - [NIP-C7: chats](https://github.com/nostr-protocol/nips/blob/master/C7.md)
@@ -67,6 +68,7 @@ wss://relay.nostr.com
 wss://relay.primal.net
 wss://relay.snort.social
 wss://nostr.mom
+wss://relay.nostr.band
 ```
 
 After connecting, a client publishes the relays on which it accepts private
@@ -126,16 +128,24 @@ Required tags:
   ["name", "song.mp3"],
   ["size", "1234567"],
   ["m", "audio/mpeg"],
+  ["t", "song"],
   ["alt", "Napstr shared file catalogue entry"]
 ]
 ```
 
 - `d`, `x`: the lowercase SHA-256 file ID.
-- `t`: the literal value `napstr`.
+- `t`: the literal catalogue marker `napstr`, plus lowercase search words.
 - `name`: the public filename basename.
 - `size`: file size in bytes as a base-10 string.
 - `m`: supported audio MIME type.
 - `alt`: human-readable event description.
+
+A catalogue event contains at most 20 distinct search-word `t` tags, each no
+longer than 32 characters. Tokens are split on non-alphanumeric characters and
+derived from the filename, embedded title, artist, album, and user tags. These
+hashtags are indexed by ordinary NIP-01 relays and provide the portable
+exact-word search path. Clients omit common stop words such as `the`, `a`,
+`and`, `of`, `on`, `in`, `to`, `for`, and `with` from these search tags.
 
 The event content is JSON with camel-case property names:
 
@@ -144,9 +154,9 @@ The event content is JSON with camel-case property names:
   "protocol": "napstr/1",
   "fileId": "c893b2b1206667a573ddb335ce550a3b7a06b28617ddb8e61f21d7d6c8f09abc",
   "filename": "song.mp3",
-  "title": "song.mp3",
-  "artist": "",
-  "album": "",
+  "title": "Song Title",
+  "artist": "Artist Name",
+  "album": "Album Name",
   "format": "MP3",
   "mime": "audio/mpeg",
   "size": 1234567,
@@ -156,9 +166,10 @@ The event content is JSON with camel-case property names:
 }
 ```
 
-For protocol version `napstr/1`, `filename` is the authoritative searchable
-name. `title` mirrors it; `artist`, `album`, and `description` are empty; and
-`license` is `unspecified`. `tags` is an optional comma-separated search field.
+For protocol version `napstr/1`, `filename` is the authoritative public file
+basename. `title`, `artist`, and `album` are optional, bounded text read from
+the audio file's embedded metadata. `description` is empty and `license` is
+`unspecified`. `tags` is an optional comma-separated user search field.
 
 The reference tag rules are:
 
@@ -168,17 +179,40 @@ The reference tag rules are:
 - no control characters;
 - duplicates are removed case-insensitively.
 
-Clients discover catalogue events with a filter equivalent to:
+Named searches issue a separate bounded indexed `t`-hashtag filter for up to
+four meaningful query words. This prevents one common word from consuming the
+relay limit for every other term:
 
 ```json
-{"kinds":[30421],"#t":["napstr"]}
+{"kinds":[30421],"#t":["metallica"],"limit":500}
+```
+
+Clients MAY issue a bounded NIP-50 query alongside this for partial-word,
+fuzzy, or better-ranked matches:
+
+```json
+{"kinds":[30421],"#t":["napstr"],"search":"metallica","limit":500}
+```
+
+Clients MUST verify the returned filename, title, artist, album, and tags
+locally because hashtag values are OR filters and NIP-50 support and matching
+behavior vary between relays. Clients SHOULD retain previously verified entries
+in a local cache.
+
+An empty search MUST NOT enumerate the complete public catalogue. Consumers
+first obtain unexpired availability events, rank active file IDs by distinct
+authors, select a bounded set, and request their exact addressable events with
+standard NIP-01 `d`-tag filters in batches:
+
+```json
+{"kinds":[30421],"#t":["napstr"],"#d":["<fileId1>","<fileId2>"],"limit":500}
 ```
 
 They MUST validate the event signature, `protocol`, `fileId`, filename, size,
 format, MIME type, and tags before displaying an entry. Entries with the same
 `fileId` are aggregated, with each distinct author becoming a possible seeder.
-Search is case-insensitive over `filename` and `tags`. Results should be ranked
-by the number of currently available seeders.
+Search is case-insensitive over `filename`, `title`, `artist`, `album`, and
+`tags`. Results should be ranked by the number of currently available seeders.
 
 ### Catalogue withdrawal
 

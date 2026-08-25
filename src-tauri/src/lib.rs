@@ -28,10 +28,12 @@ const HASH_BUFFER_SIZE: usize = 256 * 1024;
 const MAX_INDEX_ERRORS: usize = 100;
 const INDEX_PROGRESS_INTERVAL: usize = 25;
 const INDEX_COMMIT_BATCH_SIZE: usize = 50;
+const AUDIO_METADATA_VERSION: i64 = 1;
 const LIBRARY_CHANGED_EVENT: &str = "napstr-library-changed";
 const INDEX_BATCH_EVENT: &str = "napstr-index-batch";
 const INDEX_PROGRESS_EVENT: &str = "napstr-index-progress";
-const DEFAULT_NOSTR_RELAYS: &str = "wss://relay.damus.io,wss://nos.lol,wss://relay.nostr.com,wss://relay.primal.net,wss://relay.snort.social,wss://nostr.mom";
+const DEFAULT_NOSTR_RELAYS: &str = "wss://relay.damus.io,wss://nos.lol,wss://relay.nostr.com,wss://relay.primal.net,wss://relay.snort.social,wss://nostr.mom,wss://relay.nostr.band";
+const PREVIOUS_DEFAULT_NOSTR_RELAYS: &str = "wss://relay.damus.io,wss://nos.lol,wss://relay.nostr.com,wss://relay.primal.net,wss://relay.snort.social,wss://nostr.mom";
 const LEGACY_DEFAULT_NOSTR_RELAYS: &str = "wss://relay.damus.io,wss://nos.lol";
 
 struct AppState {
@@ -204,6 +206,7 @@ fn initialise_database(path: &Path, app_data: &Path) -> Result<(), String> {
         ("tags", "TEXT NOT NULL DEFAULT ''"),
         ("folder", "TEXT NOT NULL DEFAULT ''"),
         ("modified_ns", "INTEGER NOT NULL DEFAULT 0"),
+        ("metadata_version", "INTEGER NOT NULL DEFAULT 0"),
     ] {
         ensure_column(&connection, "files", column, declaration)?;
     }
@@ -248,12 +251,21 @@ fn initialise_database(path: &Path, app_data: &Path) -> Result<(), String> {
             [&downloads],
         )
         .map_err(|error| error.to_string())?;
-    connection
+    let migrated_relays = connection
         .execute(
-            "UPDATE settings SET value=?1 WHERE key='nostr_relays' AND replace(value,' ','')=?2",
-            params![DEFAULT_NOSTR_RELAYS, LEGACY_DEFAULT_NOSTR_RELAYS],
+            "UPDATE settings SET value=?1 WHERE key='nostr_relays' AND replace(value,' ','') IN (?2,?3)",
+            params![
+                DEFAULT_NOSTR_RELAYS,
+                LEGACY_DEFAULT_NOSTR_RELAYS,
+                PREVIOUS_DEFAULT_NOSTR_RELAYS
+            ],
         )
         .map_err(|error| error.to_string())?;
+    if migrated_relays > 0 {
+        connection
+            .execute("DELETE FROM published_catalogue", [])
+            .map_err(|error| error.to_string())?;
+    }
     let migrated_profile = connection
         .execute(
             "UPDATE settings SET value=?1 WHERE key='profile_about' AND value=?2",
@@ -319,9 +331,9 @@ fn shared_file_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SharedFile>
         size: row.get::<_, i64>(3)? as u64,
         format: row.get(4)?,
         status: "Published".into(),
-        title: filename,
-        artist: String::new(),
-        album: String::new(),
+        title: row.get(8)?,
+        artist: row.get(9)?,
+        album: row.get(10)?,
         mime: row.get(5)?,
         license: "unspecified".into(),
         description: String::new(),
@@ -332,7 +344,7 @@ fn shared_file_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SharedFile>
 fn load_files(connection: &Connection, query: Option<&str>) -> Result<Vec<SharedFile>, String> {
     let mut statement = connection
         .prepare(
-            "SELECT file_id, filename, path, size, format, mime, folder, tags FROM files
+            "SELECT file_id, filename, path, size, format, mime, folder, tags, title, artist, album FROM files
          WHERE format IN ('MP3','FLAC','WAV','OGG','OPUS')
            AND NOT EXISTS(SELECT 1 FROM blocked_files WHERE blocked_files.file_id=files.file_id)
          ORDER BY filename",
@@ -347,7 +359,18 @@ fn load_files(connection: &Connection, query: Option<&str>) -> Result<Vec<Shared
     let query = query.unwrap_or_default();
     Ok(files
         .into_iter()
-        .filter(|file| search_matches(query, &[&file.filename, &file.tags]))
+        .filter(|file| {
+            search_matches(
+                query,
+                &[
+                    &file.filename,
+                    &file.title,
+                    &file.artist,
+                    &file.album,
+                    &file.tags,
+                ],
+            )
+        })
         .collect())
 }
 
@@ -357,7 +380,7 @@ fn load_files_by_id(
 ) -> Result<Vec<SharedFile>, String> {
     let mut statement = connection
         .prepare(
-            "SELECT file_id, filename, path, size, format, mime, folder, tags FROM files
+            "SELECT file_id, filename, path, size, format, mime, folder, tags, title, artist, album FROM files
              WHERE file_id=?1
                AND format IN ('MP3','FLAC','WAV','OGG','OPUS')
                AND NOT EXISTS(SELECT 1 FROM blocked_files WHERE blocked_files.file_id=files.file_id)",
@@ -538,17 +561,22 @@ pub(crate) fn upsert_verified_file(
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("Unnamed file");
+    let filename = audio::sanitise_public_text(filename);
+    if filename.is_empty() {
+        return Err("audio filename has no safe public text".into());
+    }
     let relative_folder = library_folder(folder_root, path);
     let modified = fs::metadata(path)
         .map(|metadata| modified_ns(&metadata))
         .unwrap_or(0);
     connection
         .execute(
-            "INSERT INTO files (file_id, filename, path, size, format, indexed_at, mime, folder, modified_ns)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            "INSERT INTO files (file_id, filename, path, size, format, indexed_at, mime, folder, modified_ns, title, artist, album, metadata_version)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
              ON CONFLICT(file_id) DO UPDATE SET filename=excluded.filename,path=excluded.path,size=excluded.size,
              format=excluded.format,mime=excluded.mime,folder=excluded.folder,indexed_at=excluded.indexed_at,
-             modified_ns=excluded.modified_ns",
+             modified_ns=excluded.modified_ns,title=excluded.title,artist=excluded.artist,album=excluded.album,
+             metadata_version=excluded.metadata_version",
             params![
                 file_id,
                 filename,
@@ -558,7 +586,11 @@ pub(crate) fn upsert_verified_file(
                 Utc::now().to_rfc3339(),
                 audio.mime,
                 relative_folder,
-                modified
+                modified,
+                audio.metadata.title,
+                audio.metadata.artist,
+                audio.metadata.album,
+                AUDIO_METADATA_VERSION
             ],
         )
         .map_err(|error| error.to_string())?;
@@ -668,7 +700,7 @@ fn index_path_with_progress(
     let mut processed_files = 0usize;
     let existing = {
         let mut statement = connection
-            .prepare("SELECT path,file_id,size,modified_ns FROM files")
+            .prepare("SELECT path,file_id,size,modified_ns,metadata_version FROM files")
             .map_err(|error| error.to_string())?;
         let rows = statement
             .query_map([], |row| {
@@ -678,6 +710,7 @@ fn index_path_with_progress(
                         row.get::<_, String>(1)?,
                         row.get::<_, i64>(2)? as u64,
                         row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
                     ),
                 ))
             })
@@ -720,14 +753,45 @@ fn index_path_with_progress(
         let unchanged = current_modified_ns != 0
             && existing
                 .get(path_key.as_ref())
-                .is_some_and(|(_, size, stored_modified_ns)| {
+                .is_some_and(|(_, size, stored_modified_ns, _)| {
                     *size == metadata.len() && *stored_modified_ns == current_modified_ns
                 });
         if unchanged {
-            let (file_id, size, _) = existing
+            let (file_id, size, _, metadata_version) = existing
                 .get(path_key.as_ref())
                 .expect("unchanged index entry disappeared");
-            verified.push((path.to_path_buf(), None, file_id.clone(), *size));
+            if *metadata_version >= AUDIO_METADATA_VERSION {
+                verified.push((path.to_path_buf(), None, file_id.clone(), *size));
+            } else {
+                match audio::validate_audio(path) {
+                    Ok(audio) => {
+                        let still_unchanged = fs::metadata(path)
+                            .map(|after| {
+                                after.len() == *size && modified_ns(&after) == current_modified_ns
+                            })
+                            .unwrap_or(false);
+                        if still_unchanged {
+                            verified.push((
+                                path.to_path_buf(),
+                                Some(audio),
+                                file_id.clone(),
+                                *size,
+                            ));
+                        } else {
+                            record_index_error(
+                                &mut report,
+                                format!(
+                                    "{}: file changed while its metadata was being indexed",
+                                    path.display()
+                                ),
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        record_index_error(&mut report, format!("{}: {}", path.display(), error))
+                    }
+                }
+            }
         } else {
             match validate_and_hash_index_file(path, current_modified_ns) {
                 Ok(file) => verified.push(file),
@@ -1008,38 +1072,53 @@ fn cancel_library_scan(state: State<'_, AppState>) {
 }
 
 #[tauri::command]
-fn save_settings(settings: Settings, state: State<'_, AppState>) -> Result<AppSnapshot, String> {
+async fn save_settings(
+    settings: Settings,
+    state: State<'_, AppState>,
+) -> Result<AppSnapshot, String> {
     network::validate_profile_picture(&settings.profile_picture)?;
     validate_length("display name", &settings.display_name, 64)?;
     validate_length("profile about", &settings.profile_about, 500)?;
     validate_length("relay list", &settings.nostr_relays, 4096)?;
-    let connection = open_db(&state)?;
-    let profile_changed = get_setting(&connection, "display_name")? != settings.display_name
-        || get_setting(&connection, "profile_about")? != settings.profile_about
-        || get_setting(&connection, "profile_picture")? != settings.profile_picture;
-    for (key, value) in [
-        ("shared_folder", settings.napstr_folder),
-        ("nostr_relays", settings.nostr_relays),
-        ("display_name", settings.display_name),
-        ("profile_about", settings.profile_about),
-        ("profile_picture", settings.profile_picture),
-    ] {
-        connection
-            .execute(
-                "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)",
-                params![key, value],
-            )
-            .map_err(|error| error.to_string())?;
+    let (snapshot, relays_changed) = {
+        let connection = open_db(&state)?;
+        let relays_changed = get_setting(&connection, "nostr_relays")? != settings.nostr_relays;
+        let profile_changed = get_setting(&connection, "display_name")? != settings.display_name
+            || get_setting(&connection, "profile_about")? != settings.profile_about
+            || get_setting(&connection, "profile_picture")? != settings.profile_picture;
+        for (key, value) in [
+            ("shared_folder", settings.napstr_folder),
+            ("nostr_relays", settings.nostr_relays),
+            ("display_name", settings.display_name),
+            ("profile_about", settings.profile_about),
+            ("profile_picture", settings.profile_picture),
+        ] {
+            connection
+                .execute(
+                    "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)",
+                    params![key, value],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        if profile_changed {
+            connection
+                .execute(
+                    "UPDATE settings SET value='' WHERE key='profile_event_fingerprint'",
+                    [],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        if relays_changed {
+            connection
+                .execute("DELETE FROM published_catalogue", [])
+                .map_err(|error| error.to_string())?;
+        }
+        (snapshot(&connection)?, relays_changed)
+    };
+    if relays_changed && state.network.status().await?.connected {
+        state.network.restart().await?;
     }
-    if profile_changed {
-        connection
-            .execute(
-                "UPDATE settings SET value='' WHERE key='profile_event_fingerprint'",
-                [],
-            )
-            .map_err(|error| error.to_string())?;
-    }
-    snapshot(&connection)
+    Ok(snapshot)
 }
 
 fn unique_destination(folder: &Path, filename: &str) -> PathBuf {
@@ -1294,8 +1373,20 @@ pub(crate) fn normalise_tags(value: &str) -> Result<String, String> {
         .filter(|value| !value.is_empty())
     {
         validate_length("each tag", value, 32)?;
-        if value.chars().any(char::is_control) {
-            return Err("tags cannot contain control characters".into());
+        if value.chars().any(|character| {
+            character.is_control()
+                || matches!(
+                    character,
+                    '\u{061c}'
+                        | '\u{200e}'
+                        | '\u{200f}'
+                        | '\u{202a}'..='\u{202e}'
+                        | '\u{2066}'..='\u{2069}'
+                )
+        }) {
+            return Err(
+                "tags cannot contain control or bidirectional formatting characters".into(),
+            );
         }
         let key = value.to_lowercase();
         if seen.insert(key) {
@@ -1749,16 +1840,19 @@ mod tests {
         assert_eq!(indexed[0].folder, "artist/album");
         connection
             .execute(
-                "UPDATE files SET tags='punk, favourite' WHERE file_id=?1",
+                "UPDATE files SET tags='punk, favourite',metadata_version=0 WHERE file_id=?1",
                 [&indexed[0].file_id],
             )
             .unwrap();
         let report = index_path(&mut connection, &directory).unwrap();
         assert_eq!(report.file_count, 1);
-        assert_eq!(report.changed_files, 0);
+        assert_eq!(report.changed_files, 1);
         let tagged = load_files(&connection, Some("FAVOURITE")).unwrap();
         assert_eq!(tagged.len(), 1);
         assert_eq!(tagged[0].tags, "punk, favourite");
+        let report = index_path(&mut connection, &directory).unwrap();
+        assert_eq!(report.file_count, 1);
+        assert_eq!(report.changed_files, 0);
         fs::remove_file(&audio).unwrap();
         let report = index_path(&mut connection, &directory).unwrap();
         assert_eq!(report.file_count, 0);
@@ -1902,6 +1996,7 @@ mod tests {
             "punk, Live, audiobook"
         );
         assert!(normalise_tags("bad\ntag").is_err());
+        assert!(normalise_tags("safe\u{202e}spoofed").is_err());
         let too_many = (0..13)
             .map(|index| format!("tag{index}"))
             .collect::<Vec<_>>()
@@ -2026,6 +2121,19 @@ mod tests {
             .execute(
                 "UPDATE settings SET value=?1 WHERE key='nostr_relays'",
                 [LEGACY_DEFAULT_NOSTR_RELAYS],
+            )
+            .unwrap();
+        drop(connection);
+        initialise_database(&db_path, &directory).unwrap();
+        let connection = open_connection(&db_path).unwrap();
+        assert_eq!(
+            get_setting(&connection, "nostr_relays").unwrap(),
+            DEFAULT_NOSTR_RELAYS
+        );
+        connection
+            .execute(
+                "UPDATE settings SET value=?1 WHERE key='nostr_relays'",
+                [PREVIOUS_DEFAULT_NOSTR_RELAYS],
             )
             .unwrap();
         drop(connection);

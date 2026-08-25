@@ -31,6 +31,19 @@ const TROLLBOX_CACHE_LIMIT: usize = 200;
 const LIVE_NOSTR_EVENT_LIMIT: usize = 35_000;
 const MAX_SEEDER_CANDIDATES: usize = 3;
 const CATALOGUE_EVENT_PACE: Duration = Duration::from_millis(75);
+const AVAILABILITY_QUERY_LIMIT: usize = 1_000;
+const AVAILABILITY_FILE_LIMIT: usize = 50_000;
+const NETWORK_SEARCH_RESULT_LIMIT: usize = 500;
+const CATALOGUE_IDENTIFIER_BATCH_SIZE: usize = 75;
+const CATALOGUE_IDENTIFIER_CONCURRENCY: usize = 3;
+const CATALOGUE_CACHE_SCAN_LIMIT: usize = 25_000;
+const CATALOGUE_SEARCH_TOKEN_LIMIT: usize = 20;
+const CATALOGUE_SEARCH_TOKEN_LENGTH: usize = 32;
+const CATALOGUE_QUERY_TOKEN_LIMIT: usize = 4;
+const CATALOGUE_SEARCH_STOP_WORDS: &[&str] = &[
+    "a", "an", "and", "are", "as", "at", "audio", "be", "by", "flac", "for", "from", "in", "is",
+    "it", "mp3", "of", "ogg", "on", "opus", "or", "the", "to", "wav", "with",
+];
 
 pub fn validate_profile_picture(value: &str) -> Result<(), String> {
     if value.trim().is_empty() {
@@ -116,6 +129,21 @@ struct CatalogueContent {
     tags: String,
 }
 
+#[derive(Debug)]
+struct CachedCatalogueRecord {
+    file_id: String,
+    source_pubkey: String,
+    filename: String,
+    title: String,
+    artist: String,
+    album: String,
+    format: String,
+    mime: String,
+    size: u64,
+    tags: String,
+    event_id: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
 enum SignalMessage {
@@ -134,6 +162,189 @@ enum SignalMessage {
         file_id: String,
         reason: String,
     },
+}
+
+fn availability_search_filter() -> Filter {
+    Filter::new()
+        .kind(Kind::from(AVAILABILITY_KIND))
+        .hashtag("napstr-availability")
+        .since(Timestamp::from(
+            Utc::now().timestamp().saturating_sub(12 * 60) as u64,
+        ))
+        .limit(AVAILABILITY_QUERY_LIMIT)
+}
+
+fn catalogue_name_search_filter(query: &str) -> Filter {
+    Filter::new()
+        .kind(Kind::from(CATALOGUE_KIND))
+        .hashtag("napstr")
+        .search(query)
+        .limit(NETWORK_SEARCH_RESULT_LIMIT)
+}
+
+fn catalogue_search_tokens(fields: &[&str]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let field_tokens = fields
+        .iter()
+        .map(|field| {
+            super::search_tokens(field)
+                .into_iter()
+                .filter(|token| {
+                    token != "napstr" && !CATALOGUE_SEARCH_STOP_WORDS.contains(&token.as_str())
+                })
+                .filter(|token| token.chars().count() <= CATALOGUE_SEARCH_TOKEN_LENGTH)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let mut tokens = Vec::new();
+    for index in 0..field_tokens.iter().map(Vec::len).max().unwrap_or(0) {
+        for field in &field_tokens {
+            if let Some(token) = field.get(index) {
+                if seen.insert(token.clone()) {
+                    tokens.push(token.clone());
+                    if tokens.len() == CATALOGUE_SEARCH_TOKEN_LIMIT {
+                        return tokens;
+                    }
+                }
+            }
+        }
+    }
+    tokens
+}
+
+fn catalogue_tag_search_filters(query: &str) -> Vec<Filter> {
+    let mut tokens = catalogue_search_tokens(&[query]);
+    tokens.sort_by(|left, right| {
+        right
+            .chars()
+            .count()
+            .cmp(&left.chars().count())
+            .then_with(|| left.cmp(right))
+    });
+    tokens
+        .into_iter()
+        .take(CATALOGUE_QUERY_TOKEN_LIMIT)
+        .map(|token| {
+            Filter::new()
+                .kind(Kind::from(CATALOGUE_KIND))
+                .custom_tag(SingleLetterTag::lowercase(Alphabet::T), token)
+                .limit(NETWORK_SEARCH_RESULT_LIMIT)
+        })
+        .collect()
+}
+
+fn catalogue_identifier_filter(file_ids: &[String]) -> Filter {
+    Filter::new()
+        .kind(Kind::from(CATALOGUE_KIND))
+        .hashtag("napstr")
+        .identifiers(file_ids.iter().cloned())
+        .limit(NETWORK_SEARCH_RESULT_LIMIT)
+}
+
+fn catalogue_event_fingerprint(content_json: &str, search_tokens: &[String]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"napstr-catalogue-event-v1\0");
+    digest.update(content_json.as_bytes());
+    for token in search_tokens {
+        digest.update((token.len() as u64).to_be_bytes());
+        digest.update(token.as_bytes());
+    }
+    hex::encode(digest.finalize())
+}
+
+fn catalogue_publication_is_current(existing: Option<&String>, fingerprint: &str) -> bool {
+    existing.is_some_and(|existing| !existing.is_empty() && existing == fingerprint)
+}
+
+fn valid_file_id(file_id: &str) -> bool {
+    hex::decode(file_id)
+        .map(|bytes| bytes.len() == 32)
+        .unwrap_or(false)
+}
+
+fn valid_catalogue_metadata(values: &[&str]) -> bool {
+    values.iter().all(|value| {
+        value.chars().count() <= 256 && !value.chars().any(is_unsafe_public_chat_character)
+    })
+}
+
+fn merge_availability_events<'a>(
+    events: impl IntoIterator<Item = &'a Event>,
+    online: &mut HashSet<(String, String)>,
+    available_by_file: &mut HashMap<String, HashSet<String>>,
+) {
+    for event in events {
+        if event
+            .tags
+            .expiration()
+            .map(|expires| *expires <= Timestamp::now())
+            .unwrap_or(true)
+        {
+            continue;
+        }
+        let Ok(ids) = serde_json::from_str::<Vec<String>>(&event.content) else {
+            continue;
+        };
+        if ids.len() > 400 {
+            continue;
+        }
+        let pubkey = event.pubkey.to_hex();
+        for id in ids {
+            if !valid_file_id(&id) {
+                continue;
+            }
+            if online.len() >= AVAILABILITY_FILE_LIMIT {
+                return;
+            }
+            online.insert((pubkey.clone(), id.clone()));
+            available_by_file
+                .entry(id)
+                .or_default()
+                .insert(pubkey.clone());
+        }
+    }
+}
+
+fn merge_catalogue_result(
+    aggregated: &mut HashMap<String, CatalogueResult>,
+    content: CatalogueContent,
+    catalogue_tags: String,
+    source: CatalogueSource,
+) {
+    let catalogue_name = content.filename.clone();
+    let catalogue_title = if content.title.is_empty() {
+        catalogue_name.clone()
+    } else {
+        content.title.clone()
+    };
+    aggregated
+        .entry(content.file_id.clone())
+        .and_modify(|item| {
+            if !item
+                .sources
+                .iter()
+                .any(|existing| existing.pubkey == source.pubkey)
+            {
+                item.sources.push(source.clone());
+            }
+            if item.tags.is_empty() {
+                item.tags = catalogue_tags.clone();
+            }
+        })
+        .or_insert(CatalogueResult {
+            file_id: content.file_id,
+            filename: catalogue_name,
+            title: catalogue_title,
+            artist: content.artist,
+            album: content.album,
+            format: content.format,
+            mime: content.mime,
+            size: content.size,
+            license: "unspecified".into(),
+            description: String::new(),
+            tags: catalogue_tags,
+            sources: vec![source],
+        });
 }
 
 pub struct NetworkService {
@@ -530,14 +741,16 @@ impl NetworkService {
         }
         let mut published = 0;
         let mut published_ids = Vec::new();
-        for (file_id, filename, size, format, mime, catalogue_tags) in files {
+        for (file_id, filename, size, format, mime, catalogue_tags, title, artist, album) in files {
+            let search_tokens =
+                catalogue_search_tokens(&[&filename, &title, &artist, &album, &catalogue_tags]);
             let content = CatalogueContent {
                 protocol: "napstr/1".into(),
                 file_id: file_id.clone(),
                 filename: filename.clone(),
-                title: filename.clone(),
-                artist: String::new(),
-                album: String::new(),
+                title,
+                artist,
+                album,
                 format: format.clone(),
                 mime: if mime.is_empty() || mime == "application/octet-stream" {
                     mime_for_format(&format)
@@ -551,23 +764,12 @@ impl NetworkService {
             };
             let content_json =
                 serde_json::to_string(&content).map_err(|error| error.to_string())?;
-            let fingerprint = hex::encode(Sha256::digest(content_json.as_bytes()));
-            if published_fingerprints.get(&file_id) == Some(&fingerprint) {
-                continue;
-            }
-            if published_fingerprints
-                .get(&file_id)
-                .is_some_and(|existing| existing.is_empty())
+            let fingerprint = catalogue_event_fingerprint(&content_json, &search_tokens);
+            if catalogue_publication_is_current(published_fingerprints.get(&file_id), &fingerprint)
             {
-                publication_db
-                    .execute(
-                        "UPDATE published_catalogue SET fingerprint=?1 WHERE file_id=?2",
-                        params![fingerprint, file_id],
-                    )
-                    .map_err(|error| error.to_string())?;
                 continue;
             }
-            let tags = vec![
+            let mut tags = vec![
                 Tag::parse(["d", file_id.as_str()]),
                 Tag::parse(["t", "napstr"]),
                 Tag::parse(["x", file_id.as_str()]),
@@ -579,6 +781,9 @@ impl NetworkService {
             .into_iter()
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| error.to_string())?;
+            for token in search_tokens {
+                tags.push(Tag::parse(["t", token.as_str()]).map_err(|error| error.to_string())?);
+            }
             client
                 .send_event_builder(
                     EventBuilder::new(Kind::from(CATALOGUE_KIND), content_json).tags(tags),
@@ -1004,69 +1209,305 @@ impl NetworkService {
             .await
             .clone()
             .ok_or("Nostr is not connected")?;
-        let catalogue_query = client.fetch_events(
-            Filter::new()
-                .kind(Kind::from(CATALOGUE_KIND))
-                .hashtag("napstr")
-                .limit(10_000),
-            Duration::from_secs(10),
-        );
-        let availability_query = client.fetch_events(
-            Filter::new()
-                .kind(Kind::from(AVAILABILITY_KIND))
-                .hashtag("napstr-availability")
-                .since(Timestamp::from(
-                    Utc::now().timestamp().saturating_sub(12 * 60) as u64,
-                ))
-                .limit(5_000),
-            Duration::from_secs(6),
-        );
-        let (events, availability) = tokio::join!(catalogue_query, availability_query);
-        let events = events.map_err(|error| format!("catalogue search failed: {error}"))?;
-        let availability =
-            availability.map_err(|error| format!("availability search failed: {error}"))?;
-        let mut online: HashSet<(String, String)> = HashSet::new();
-        for event in availability.iter() {
-            if event
-                .tags
-                .expiration()
-                .map(|expires| *expires <= Timestamp::now())
-                .unwrap_or(true)
-            {
-                continue;
+        let query = query.trim();
+        let mut requested_file_ids = HashSet::new();
+        let mut events_by_id: HashMap<EventId, Event> = HashMap::new();
+        let mut catalogue_search_error = None;
+        let availability_query =
+            client.fetch_events(availability_search_filter(), Duration::from_secs(6));
+        let availability = if query.is_empty() {
+            availability_query
+                .await
+                .map_err(|error| format!("availability search failed: {error}"))?
+        } else {
+            let mut filters = vec![catalogue_name_search_filter(query)];
+            filters.extend(catalogue_tag_search_filters(query));
+            let search_query = stream::iter(filters)
+                .map(|filter| {
+                    let client = client.clone();
+                    async move {
+                        client
+                            .fetch_events(filter, Duration::from_secs(8))
+                            .await
+                            .map_err(|error| error.to_string())
+                    }
+                })
+                .buffer_unordered(CATALOGUE_QUERY_TOKEN_LIMIT + 1)
+                .collect::<Vec<_>>();
+            let (availability, fetched) = tokio::join!(availability_query, search_query);
+            let mut successful_queries = 0usize;
+            let mut failures = Vec::new();
+            for result in fetched {
+                match result {
+                    Ok(events) => {
+                        successful_queries += 1;
+                        for event in events.iter() {
+                            events_by_id.insert(event.id, event.clone());
+                        }
+                    }
+                    Err(error) => failures.push(error),
+                }
             }
-            if let Ok(ids) = serde_json::from_str::<Vec<String>>(&event.content) {
-                for id in ids {
-                    online.insert((event.pubkey.to_hex(), id));
+            if successful_queries == 0 {
+                catalogue_search_error = Some(format!(
+                    "catalogue search failed: {}",
+                    failures
+                        .first()
+                        .map(String::as_str)
+                        .unwrap_or("all relay queries failed")
+                ));
+            }
+            availability.map_err(|error| format!("availability search failed: {error}"))?
+        };
+        let mut online: HashSet<(String, String)> = HashSet::new();
+        let mut available_by_file: HashMap<String, HashSet<String>> = HashMap::new();
+        merge_availability_events(availability.iter(), &mut online, &mut available_by_file);
+
+        if query.is_empty() {
+            let mut ranked_ids = available_by_file
+                .iter()
+                .map(|(file_id, sources)| (file_id.clone(), sources.len()))
+                .collect::<Vec<_>>();
+            ranked_ids
+                .sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+            requested_file_ids.extend(
+                ranked_ids
+                    .into_iter()
+                    .take(NETWORK_SEARCH_RESULT_LIMIT)
+                    .map(|(file_id, _)| file_id),
+            );
+            let batches = requested_file_ids
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .chunks(CATALOGUE_IDENTIFIER_BATCH_SIZE)
+                .map(|batch| batch.to_vec())
+                .collect::<Vec<_>>();
+            let fetched = stream::iter(batches)
+                .map(|batch| {
+                    let client = client.clone();
+                    async move {
+                        client
+                            .fetch_events(
+                                catalogue_identifier_filter(&batch),
+                                Duration::from_secs(6),
+                            )
+                            .await
+                            .ok()
+                    }
+                })
+                .buffer_unordered(CATALOGUE_IDENTIFIER_CONCURRENCY)
+                .collect::<Vec<_>>()
+                .await;
+            for events in fetched.into_iter().flatten() {
+                for event in events.iter() {
+                    events_by_id.insert(event.id, event.clone());
+                }
+            }
+        } else {
+            let authors = events_by_id
+                .values()
+                .map(|event| event.pubkey)
+                .collect::<HashSet<_>>();
+            if !authors.is_empty() {
+                let targeted_limit = (authors.len() * 8).clamp(8, AVAILABILITY_QUERY_LIMIT);
+                if let Ok(targeted) = client
+                    .fetch_events(
+                        availability_search_filter()
+                            .authors(authors)
+                            .limit(targeted_limit),
+                        Duration::from_secs(5),
+                    )
+                    .await
+                {
+                    merge_availability_events(targeted.iter(), &mut online, &mut available_by_file);
                 }
             }
         }
+
         let mut aggregated: HashMap<String, CatalogueResult> = HashMap::new();
         let connection = super::open_connection(&self.db_path)?;
-        for event in events.iter() {
+        let blocked_files = {
+            let mut statement = connection
+                .prepare("SELECT file_id FROM blocked_files")
+                .map_err(|error| error.to_string())?;
+            let rows = statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|error| error.to_string())?;
+            rows.collect::<Result<HashSet<_>, _>>()
+                .map_err(|error| error.to_string())?
+        };
+        let blocked_pubkeys = {
+            let mut statement = connection
+                .prepare("SELECT pubkey FROM blocked_pubkeys")
+                .map_err(|error| error.to_string())?;
+            let rows = statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|error| error.to_string())?;
+            rows.collect::<Result<HashSet<_>, _>>()
+                .map_err(|error| error.to_string())?
+        };
+
+        // Previously verified relay events are an acceleration cache, not the
+        // source of availability truth. Only rows paired with a fresh heartbeat
+        // are eligible, and named searches are verified locally again.
+        let cached = {
+            let mut statement = connection
+                .prepare(
+                    "SELECT file_id,source_pubkey,filename,title,artist,album,format,mime,size,tags,event_id
+                 FROM remote_catalogue ORDER BY seen_at DESC LIMIT ?1",
+                )
+                .map_err(|error| error.to_string())?;
+            let rows = statement
+                .query_map([CATALOGUE_CACHE_SCAN_LIMIT as i64], |row| {
+                    let size = row.get::<_, i64>(8)?;
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, String>(7)?,
+                        size,
+                        row.get::<_, String>(9)?,
+                        row.get::<_, String>(10)?,
+                    ))
+                })
+                .map_err(|error| error.to_string())?;
+            rows.filter_map(|row| match row {
+                Ok((
+                    file_id,
+                    source_pubkey,
+                    filename,
+                    title,
+                    artist,
+                    album,
+                    format,
+                    mime,
+                    size,
+                    tags,
+                    event_id,
+                )) if size >= 0 => Some(Ok(CachedCatalogueRecord {
+                    file_id,
+                    source_pubkey,
+                    filename,
+                    title,
+                    artist,
+                    album,
+                    format,
+                    mime,
+                    size: size as u64,
+                    tags,
+                    event_id,
+                })),
+                Ok(_) => None,
+                Err(error) => Some(Err(error)),
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?
+        };
+        for cached in cached {
+            if blocked_files.contains(&cached.file_id)
+                || blocked_pubkeys.contains(&cached.source_pubkey)
+                || !online.contains(&(cached.source_pubkey.clone(), cached.file_id.clone()))
+                || (!query.is_empty()
+                    && !super::search_matches(
+                        query,
+                        &[
+                            &cached.filename,
+                            &cached.title,
+                            &cached.artist,
+                            &cached.album,
+                            &cached.tags,
+                        ],
+                    ))
+                || (query.is_empty() && !requested_file_ids.contains(&cached.file_id))
+                || !valid_file_id(&cached.file_id)
+                || !audio_claim_valid(&cached.filename, &cached.format, &cached.mime)
+                || !valid_catalogue_metadata(&[
+                    &cached.filename,
+                    &cached.title,
+                    &cached.artist,
+                    &cached.album,
+                    &cached.tags,
+                ])
+            {
+                continue;
+            }
+            let Ok(catalogue_tags) = super::normalise_tags(&cached.tags) else {
+                continue;
+            };
+            let Ok(public_key) = PublicKey::from_str(&cached.source_pubkey) else {
+                continue;
+            };
+            let source = CatalogueSource {
+                pubkey: cached.source_pubkey.clone(),
+                npub: public_key
+                    .to_bech32()
+                    .unwrap_or_else(|_| cached.source_pubkey.clone()),
+                display_name: short_key(&cached.source_pubkey),
+                relay: String::new(),
+                about: String::new(),
+                picture: String::new(),
+                event_id: cached.event_id,
+            };
+            merge_catalogue_result(
+                &mut aggregated,
+                CatalogueContent {
+                    protocol: "napstr/1".into(),
+                    file_id: cached.file_id,
+                    filename: cached.filename.clone(),
+                    title: cached.title,
+                    artist: cached.artist,
+                    album: cached.album,
+                    format: cached.format,
+                    mime: cached.mime,
+                    size: cached.size,
+                    license: "unspecified".into(),
+                    description: String::new(),
+                    tags: catalogue_tags.clone(),
+                },
+                catalogue_tags,
+                source,
+            );
+        }
+
+        for event in events_by_id.values() {
             let Ok(content) = serde_json::from_str::<CatalogueContent>(&event.content) else {
                 continue;
             };
             if content.protocol != "napstr/1"
-                || !hex::decode(&content.file_id)
-                    .map(|bytes| bytes.len() == 32)
-                    .unwrap_or(false)
+                || !valid_file_id(&content.file_id)
                 || !audio_claim_valid(&content.filename, &content.format, &content.mime)
+                || !valid_catalogue_metadata(&[
+                    &content.filename,
+                    &content.title,
+                    &content.artist,
+                    &content.album,
+                    &content.tags,
+                ])
             {
                 continue;
             }
             let Ok(catalogue_tags) = super::normalise_tags(&content.tags) else {
                 continue;
             };
-            if !super::search_matches(query, &[&content.filename, &catalogue_tags]) {
+            if !super::search_matches(
+                query,
+                &[
+                    &content.filename,
+                    &content.title,
+                    &content.artist,
+                    &content.album,
+                    &catalogue_tags,
+                ],
+            ) {
                 continue;
             }
             let pubkey = event.pubkey.to_hex();
-            let blocked: bool = connection.query_row(
-                "SELECT EXISTS(SELECT 1 FROM blocked_files WHERE file_id=?1) OR EXISTS(SELECT 1 FROM blocked_pubkeys WHERE pubkey=?2)",
-                params![content.file_id, pubkey], |row| row.get(0),
-            ).map_err(|error| error.to_string())?;
-            if blocked {
+            if blocked_files.contains(&content.file_id) || blocked_pubkeys.contains(&pubkey) {
                 continue;
             }
             if !online.contains(&(pubkey.clone(), content.file_id.clone())) {
@@ -1085,38 +1526,16 @@ impl NetworkService {
             let catalogue_name = content.filename.clone();
             connection.execute(
                 "INSERT OR REPLACE INTO remote_catalogue (file_id,source_pubkey,filename,title,artist,album,format,mime,size,license,description,tags,event_id,seen_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
-                params![content.file_id, pubkey, catalogue_name, catalogue_name, "", "", content.format, content.mime, content.size as i64, "unspecified", "", catalogue_tags, event.id.to_hex(), Utc::now().to_rfc3339()],
+                params![content.file_id, pubkey, catalogue_name, content.title, content.artist, content.album, content.format, content.mime, content.size as i64, "unspecified", "", catalogue_tags, event.id.to_hex(), Utc::now().to_rfc3339()],
             ).map_err(|error| error.to_string())?;
-            aggregated
-                .entry(content.file_id.clone())
-                .and_modify(|item| {
-                    if !item
-                        .sources
-                        .iter()
-                        .any(|existing| existing.pubkey == source.pubkey)
-                    {
-                        item.sources.push(source.clone());
-                    }
-                    if item.tags.is_empty() {
-                        item.tags = catalogue_tags.clone();
-                    }
-                })
-                .or_insert(CatalogueResult {
-                    file_id: content.file_id,
-                    filename: catalogue_name.clone(),
-                    title: catalogue_name,
-                    artist: String::new(),
-                    album: String::new(),
-                    format: content.format,
-                    mime: content.mime,
-                    size: content.size,
-                    license: "unspecified".into(),
-                    description: String::new(),
-                    tags: catalogue_tags,
-                    sources: vec![source],
-                });
+            merge_catalogue_result(&mut aggregated, content, catalogue_tags, source);
         }
         let mut results: Vec<_> = aggregated.into_values().collect();
+        if results.is_empty() {
+            if let Some(error) = catalogue_search_error {
+                return Err(error);
+            }
+        }
         let profile_keys = results
             .iter()
             .flat_map(|result| result.sources.iter())
@@ -1162,6 +1581,7 @@ impl NetworkService {
                 .cmp(&left.sources.len())
                 .then_with(|| left.filename.cmp(&right.filename))
         });
+        results.truncate(NETWORK_SEARCH_RESULT_LIMIT);
         Ok(results)
     }
 
@@ -1727,8 +2147,30 @@ fn profile_fingerprint(
     hex::encode(digest.finalize())
 }
 
-type PublishFile = (String, String, u64, String, String, String);
-type PublishFileRecord = (String, String, u64, String, String, String, String, i64);
+type PublishFile = (
+    String,
+    String,
+    u64,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+);
+type PublishFileRecord = (
+    String,
+    String,
+    u64,
+    String,
+    String,
+    String,
+    String,
+    i64,
+    String,
+    String,
+    String,
+);
 
 fn publish_file_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PublishFileRecord> {
     Ok((
@@ -1740,22 +2182,39 @@ fn publish_file_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PublishFil
         row.get(5)?,
         row.get(6)?,
         row.get(7)?,
+        row.get(8)?,
+        row.get(9)?,
+        row.get(10)?,
     ))
 }
 
 fn current_publish_file(record: PublishFileRecord) -> Option<PublishFile> {
-    let (file_id, filename, size, format, mime, path, tags, indexed_modified_ns) = record;
+    let (
+        file_id,
+        filename,
+        size,
+        format,
+        mime,
+        path,
+        tags,
+        indexed_modified_ns,
+        title,
+        artist,
+        album,
+    ) = record;
     let metadata = std::fs::metadata(path).ok()?;
     if metadata.len() != size || super::modified_ns(&metadata) != indexed_modified_ns {
         return None;
     }
-    Some((file_id, filename, size, format, mime, tags))
+    Some((
+        file_id, filename, size, format, mime, tags, title, artist, album,
+    ))
 }
 
 fn load_publish_files(db_path: &PathBuf) -> Result<Vec<PublishFile>, String> {
     let connection = super::open_connection(db_path)?;
     let mut statement = connection.prepare(
-        "SELECT file_id, filename, size, format, mime, path, tags, modified_ns
+        "SELECT file_id, filename, size, format, mime, path, tags, modified_ns, title, artist, album
          FROM files WHERE NOT EXISTS(SELECT 1 FROM blocked_files WHERE blocked_files.file_id=files.file_id)
          ORDER BY filename,file_id"
     ).map_err(|error| error.to_string())?;
@@ -1781,7 +2240,7 @@ fn load_publish_files_by_id(
     let connection = super::open_connection(db_path)?;
     let mut statement = connection
         .prepare(
-            "SELECT file_id, filename, size, format, mime, path, tags, modified_ns
+            "SELECT file_id, filename, size, format, mime, path, tags, modified_ns, title, artist, album
              FROM files
              WHERE file_id=?1
                AND NOT EXISTS(SELECT 1 FROM blocked_files WHERE blocked_files.file_id=files.file_id)",
@@ -1873,6 +2332,98 @@ fn mime_for_format(format: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn catalogue_search_filters_are_server_side_and_bounded() {
+        let named = serde_json::to_value(catalogue_name_search_filter("metallica")).unwrap();
+        assert_eq!(named["kinds"], serde_json::json!([CATALOGUE_KIND]));
+        assert_eq!(named["#t"], serde_json::json!(["napstr"]));
+        assert_eq!(named["search"], "metallica");
+        assert_eq!(named["limit"], NETWORK_SEARCH_RESULT_LIMIT);
+
+        let indexed = catalogue_tag_search_filters("Metallica Enter Sandman")
+            .into_iter()
+            .map(|filter| serde_json::to_value(filter).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            indexed
+                .iter()
+                .map(|filter| filter["#t"][0].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["metallica", "sandman", "enter"]
+        );
+        assert!(indexed
+            .iter()
+            .all(|filter| filter["limit"] == NETWORK_SEARCH_RESULT_LIMIT));
+        let many_words = format!(
+            "{}.mp3",
+            (0..40)
+                .map(|index| format!("word{index}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        let bounded_tokens = catalogue_search_tokens(&[&many_words]);
+        assert_eq!(bounded_tokens.len(), CATALOGUE_SEARCH_TOKEN_LIMIT);
+        let balanced_tokens = catalogue_search_tokens(&[
+            &many_words,
+            "A Distinct Track Title",
+            "Specific Artist",
+            "Recognisable Album",
+            "favourite",
+        ]);
+        for expected in [
+            "distinct",
+            "track",
+            "title",
+            "specific",
+            "artist",
+            "recognisable",
+            "album",
+            "favourite",
+        ] {
+            assert!(balanced_tokens.contains(&expected.to_string()));
+        }
+        assert_eq!(
+            catalogue_search_tokens(&["The House of the Rising Sun"]),
+            vec!["house", "rising", "sun"]
+        );
+        assert_eq!(
+            catalogue_search_tokens(&["enter_sandman.mp3", "enter-sandman"]),
+            vec!["enter", "sandman"]
+        );
+
+        let file_ids = vec!["ab".repeat(32), "cd".repeat(32)];
+        let exact = serde_json::to_value(catalogue_identifier_filter(&file_ids)).unwrap();
+        assert_eq!(exact["kinds"], serde_json::json!([CATALOGUE_KIND]));
+        assert_eq!(exact["#d"], serde_json::json!(file_ids));
+        assert_eq!(exact["limit"], NETWORK_SEARCH_RESULT_LIMIT);
+
+        let availability = serde_json::to_value(availability_search_filter()).unwrap();
+        assert_eq!(
+            availability["kinds"],
+            serde_json::json!([AVAILABILITY_KIND])
+        );
+        assert_eq!(
+            availability["limit"],
+            serde_json::json!(AVAILABILITY_QUERY_LIMIT)
+        );
+
+        let old_empty_fingerprint = String::new();
+        let tokens = vec!["metallica".to_string()];
+        let fingerprint = catalogue_event_fingerprint("catalogue", &tokens);
+        assert!(!catalogue_publication_is_current(
+            Some(&old_empty_fingerprint),
+            &fingerprint
+        ));
+        assert!(catalogue_publication_is_current(
+            Some(&fingerprint),
+            &fingerprint
+        ));
+        assert_ne!(
+            fingerprint,
+            catalogue_event_fingerprint("catalogue", &["sandman".to_string()])
+        );
+    }
 
     #[test]
     fn trollbox_uses_a_separate_public_chat_kind_and_indexed_topic() {

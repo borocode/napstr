@@ -11,7 +11,7 @@ const match = /^v(\d+\.\d+\.\d+(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?)$/.exec(r
 
 if (!match) {
   throw new Error(
-    `Release tag must be valid SemVer such as v0.2.3 or v0.2.3-beta.1; received ${JSON.stringify(requestedTag)}`
+    `Release tag must be valid SemVer such as v0.2.3 or v0.1.5-rc1; received ${JSON.stringify(requestedTag)}`
   );
 }
 
