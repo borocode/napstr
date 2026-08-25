@@ -161,18 +161,25 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          bundle_root="src-tauri/target/release/bundle"
-          if [[ '${{ matrix.mac_arch }}' == 'arm64' ]]; then
-            bundle_root="src-tauri/target/aarch64-apple-darwin/release/bundle"
-          fi
-
-          app="$bundle_root/macos/Napstr.app"
-          dmg="$(find "$bundle_root/dmg" -maxdepth 1 -type f -name '*.dmg' -print -quit)"
-          if [[ ! -d "$app" || -z "$dmg" ]]; then
-            echo "Tauri did not produce the expected macOS app and DMG" >&2
+          dmg="$(find src-tauri/target -type f -path '*/release/bundle/dmg/*.dmg' -print -quit)"
+          if [[ -z "$dmg" ]]; then
+            echo "Tauri did not produce the expected macOS DMG" >&2
             exit 1
           fi
 
+          mount_point="$(mktemp -d "$RUNNER_TEMP/napstr-dmg.XXXXXX")"
+          cleanup_dmg() {
+            hdiutil detach -quiet "$mount_point" >/dev/null 2>&1 || true
+            rmdir "$mount_point" >/dev/null 2>&1 || true
+          }
+          trap cleanup_dmg EXIT
+          hdiutil attach -readonly -nobrowse -mountpoint "$mount_point" "$dmg" >/dev/null
+
+          app="$(find "$mount_point" -maxdepth 2 -type d -name 'Napstr.app' -print -quit)"
+          if [[ -z "$app" ]]; then
+            echo "The finished DMG does not contain Napstr.app" >&2
+            exit 1
+          fi
           codesign --verify --deep --strict --verbose=2 "$app"
           app_binary="$app/Contents/MacOS/napstr"
           tor_binary="$(find "$app/Contents/Resources" -type f -path '*/tor/macos/tor/tor' -print -quit)"
@@ -183,6 +190,8 @@ jobs:
 
           bash scripts/verify-macos-bundle.sh "$app_binary" "$tor_binary" '${{ matrix.mac_arch }}'
 
+          cleanup_dmg
+          trap - EXIT
           checksum="$dmg.sha256"
           (
             cd "$(dirname "$dmg")"

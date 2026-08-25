@@ -14,4 +14,8 @@ for binary in "$app_binary" "$tor_binary"; do
   codesign --verify --strict --verbose=2 "$binary"
 done
 
-"$tor_binary" --version
+tor_library_dir="$(dirname "$tor_binary")"
+if [[ -n "${DYLD_LIBRARY_PATH:-}" ]]; then
+  tor_library_dir="$tor_library_dir:$DYLD_LIBRARY_PATH"
+fi
+DYLD_LIBRARY_PATH="$tor_library_dir" "$tor_binary" --version
