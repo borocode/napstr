@@ -35,7 +35,13 @@
 
     return {
       windows: safeAssets.find((asset) => /\.exe$/i.test(asset.name)),
-      linux: safeAssets.find((asset) => /\.appimage$/i.test(asset.name))
+      linux: safeAssets.find((asset) => /\.appimage$/i.test(asset.name)),
+      'macos-arm64': safeAssets.find((asset) =>
+        /\.dmg$/i.test(asset.name) && /(aarch64|arm64|apple[-_ ]?silicon)/i.test(asset.name)
+      ),
+      'macos-intel': safeAssets.find((asset) =>
+        /\.dmg$/i.test(asset.name) && /(x86_64|x64|amd64|intel)/i.test(asset.name)
+      )
     };
   }
 
@@ -87,7 +93,7 @@
         .filter(([platform, asset]) => enableLinks(platform, asset))
         .map(([platform]) => platform);
 
-      if (available.length === 2) {
+      if (available.length === 4) {
         status.textContent = `Napstr ${version} downloads are ready.`;
       } else {
         status.textContent = `Napstr ${version} is published, but one or more installers are still uploading.`;

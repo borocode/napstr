@@ -42,6 +42,10 @@ npm run bundle
 Napstr automatically downloads and verifies the pinned official Tor Expert
 Bundle for your platform before building.
 
+macOS release DMGs are ad-hoc-signed community builds and require no Apple
+Developer account. After the first blocked launch, open **System Settings →
+Privacy & Security → Open Anyway**. Apple Silicon and Intel builds both include Tor.
+
 ## Implemented architecture
 
 - On first launch, Napstr creates a Nostr identity and securely stores its private key using your operating system's credential store.

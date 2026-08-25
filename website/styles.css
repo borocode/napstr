@@ -295,6 +295,7 @@ footer em { display: block; }
 
 .download-option p { font-size: 16px; line-height: 19px; }
 .download-option .version { margin-bottom: 16px; font-size: 13px; line-height: 14px; }
+.download-option.macos { grid-column: 1 / -1; }
 .download-link { display: inline-block; margin-top: -5px; font-size: 16px; font-weight: bold; }
 .release-link[aria-disabled="true"] { color: #666; cursor: wait; pointer-events: none; }
 
