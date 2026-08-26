@@ -28,6 +28,7 @@ const TROLLBOX_MESSAGE_KIND: u16 = 9;
 const TRACK_DISCUSSION_PREFIX: &str = "napstr-";
 const TRACK_DISCUSSION_SUBSCRIPTION: &str = "napstr-track-discussion";
 const PUBLIC_CHAT_EVENT: &str = "napstr-public-chat";
+const TRANSFERS_CHANGED_EVENT: &str = "napstr-transfers-changed";
 const TROLLBOX_CACHE_LIMIT: usize = 200;
 const LIVE_NOSTR_EVENT_LIMIT: usize = 35_000;
 const MAX_SEEDER_CANDIDATES: usize = 3;
@@ -2396,6 +2397,10 @@ impl NetworkService {
             connection.execute("INSERT INTO download_sources(request_id,source_pubkey,status,updated_at) VALUES(?1,?2,'Requested',?3)", params![request_id, source, Utc::now().to_rfc3339()]).map_err(|error| error.to_string())?;
         }
         drop(connection);
+        // A download can be requested by Napstrfy rather than by the desktop
+        // UI. Wake the UI immediately so it discovers the new database row and
+        // starts its normal high-frequency progress polling.
+        let _ = self.app_handle.emit(TRANSFERS_CHANGED_EVENT, ());
         let message = SignalMessage::DownloadRequest {
             protocol: "napstr/1".into(),
             request_id: request_id.clone(),
@@ -2433,6 +2438,7 @@ impl NetworkService {
                     params![Utc::now().to_rfc3339(), request_id],
                 )
                 .map_err(|error| error.to_string())?;
+            let _ = self.app_handle.emit(TRANSFERS_CHANGED_EVENT, ());
             return Err("NIP-17 request could not be delivered to any seeder".into());
         }
         Ok(request_id)

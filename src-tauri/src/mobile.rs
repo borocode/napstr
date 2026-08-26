@@ -21,6 +21,8 @@ use std::{
 use tokio::io::AsyncReadExt;
 
 const PAIRING_LIFETIME_SECONDS: i64 = 5 * 60;
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+const CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -153,9 +155,10 @@ impl MobileService {
                 let service = accept_service.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
-                    match incoming.await {
-                        Ok(connection) => service.handle_connection(connection).await,
-                        Err(error) => eprintln!("Napstrfy connection failed: {error}"),
+                    match tokio::time::timeout(HANDSHAKE_TIMEOUT, incoming).await {
+                        Ok(Ok(connection)) => service.handle_connection(connection).await,
+                        Ok(Err(error)) => eprintln!("Napstrfy connection failed: {error}"),
+                        Err(_) => eprintln!("Napstrfy connection handshake timed out"),
                     }
                 });
             }
@@ -277,11 +280,18 @@ impl MobileService {
 
     async fn handle_connection(self: Arc<Self>, connection: iroh::endpoint::Connection) {
         let remote_id = connection.remote_id().to_string();
+        if !self.connection_is_allowed(&remote_id) {
+            return;
+        }
         loop {
-            let (mut send, mut receive) = match connection.accept_bi().await {
-                Ok(streams) => streams,
-                Err(_) => break,
-            };
+            if !self.connection_is_allowed(&remote_id) {
+                break;
+            }
+            let (mut send, mut receive) =
+                match tokio::time::timeout(CONNECTION_IDLE_TIMEOUT, connection.accept_bi()).await {
+                    Ok(Ok(streams)) => streams,
+                    Ok(Err(_)) | Err(_) => break,
+                };
             let service = self.clone();
             let remote_id = remote_id.clone();
             let permit = match self.request_slots.clone().try_acquire_owned() {
@@ -335,29 +345,28 @@ impl MobileService {
         }
     }
 
-    async fn audiobook_catalogue(&self, query: &str) -> Result<Vec<RemoteAudiobook>, String> {
-        let connection = open_connection(&self.db_path)?;
-        let local_tracks = load_files(&connection, None)?
-            .into_iter()
-            .map(|file| {
-                let track = RemoteTrack {
-                    file_id: file.file_id.clone(),
-                    filename: file.filename,
-                    title: file.title,
-                    artist: file.artist,
-                    album: file.album,
-                    format: file.format,
-                    mime: file.mime,
-                    size: file.size,
-                    tags: file.tags,
-                    local: true,
-                    sources: Vec::new(),
-                };
-                (file.file_id, track)
+    fn connection_is_allowed(&self, remote_id: &str) -> bool {
+        if self.authorise(remote_id).is_ok() {
+            return true;
+        }
+        let now = Utc::now().timestamp();
+        self.pairing
+            .lock()
+            .ok()
+            .and_then(|mut pairing| {
+                if pairing
+                    .as_ref()
+                    .is_some_and(|session| session.expires_at < now)
+                {
+                    *pairing = None;
+                }
+                pairing.as_ref().map(|_| true)
             })
-            .collect::<std::collections::HashMap<_, _>>();
-        let local_books = build_local_audiobooks(&connection)?;
-        drop(connection);
+            .unwrap_or(false)
+    }
+
+    async fn audiobook_catalogue(&self, query: &str) -> Result<Vec<RemoteAudiobook>, String> {
+        let (local_books, local_tracks) = load_local_remote_audiobooks(&self.db_path)?;
         let mut books = std::collections::HashMap::new();
         for book in local_books.into_iter().filter(|book| {
             search_matches(
@@ -374,10 +383,7 @@ impl MobileService {
                     .collect::<Vec<_>>(),
             )
         }) {
-            books.insert(
-                book.audiobook_id.clone(),
-                remote_audiobook(book, &local_tracks),
-            );
+            books.insert(book.audiobook_id.clone(), book);
         }
         for book in self.network.search_audiobooks(query).await? {
             books
@@ -560,6 +566,20 @@ impl MobileService {
                 .await
             }
             ClientRequest::Audiobook { audiobook_id } => {
+                // Napstrfy may retain a library summary while Napstr restarts or
+                // while another search replaces this process's detail cache.
+                // Local files and audiobook configuration are authoritative, so
+                // resolve those from the database before consulting the cache.
+                let local_audiobook = load_local_remote_audiobooks(&self.db_path)?
+                    .0
+                    .into_iter()
+                    .find(|book| book.audiobook_id == audiobook_id);
+                if let Some(audiobook) = local_audiobook {
+                    if let Ok(mut cache) = self.audiobook_cache.lock() {
+                        cache.insert(audiobook_id, audiobook.clone());
+                    }
+                    return write_response(send, &ServerResponse::Audiobook { audiobook }).await;
+                }
                 let mut audiobook = self
                     .audiobook_cache
                     .lock()
@@ -787,6 +807,42 @@ fn remote_audiobook(
         total_size: book.total_size,
         chapters,
     }
+}
+
+fn load_local_remote_audiobooks(
+    db_path: &Path,
+) -> Result<
+    (
+        Vec<RemoteAudiobook>,
+        std::collections::HashMap<String, RemoteTrack>,
+    ),
+    String,
+> {
+    let connection = open_connection(db_path)?;
+    let local_tracks = load_files(&connection, None)?
+        .into_iter()
+        .map(|file| {
+            let track = RemoteTrack {
+                file_id: file.file_id.clone(),
+                filename: file.filename,
+                title: file.title,
+                artist: file.artist,
+                album: file.album,
+                format: file.format,
+                mime: file.mime,
+                size: file.size,
+                tags: file.tags,
+                local: true,
+                sources: Vec::new(),
+            };
+            (file.file_id, track)
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+    let audiobooks = build_local_audiobooks(&connection)?
+        .into_iter()
+        .map(|book| remote_audiobook(book, &local_tracks))
+        .collect();
+    Ok((audiobooks, local_tracks))
 }
 
 fn initialise_schema(db_path: &Path) -> Result<(), String> {
@@ -1120,6 +1176,15 @@ mod tests {
         assert_eq!(audiobook_chapter_ids.len(), 2);
         assert!(audiobook_chapter_ids.contains(&"22".repeat(32)));
         assert!(audiobook_chapter_ids.contains(&"33".repeat(32)));
+
+        // Audiobook detail lookup must be reconstructable from the database.
+        // Napstrfy can retain summaries while the desktop process restarts, so
+        // correctness cannot depend on an in-memory catalogue cache.
+        let (audiobooks, _) = load_local_remote_audiobooks(&db_path).unwrap();
+        assert_eq!(audiobooks.len(), 1);
+        assert_eq!(audiobooks[0].title, "A Book");
+        assert_eq!(audiobooks[0].chapters.len(), 2);
+        assert!(audiobooks[0].chapters.iter().all(|chapter| chapter.local));
         fs::remove_dir_all(directory).unwrap();
     }
 }

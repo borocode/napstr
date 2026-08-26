@@ -1788,6 +1788,14 @@
       if (destroyed) unlisten();
       else eventUnlisteners.push(unlisten);
     });
+    void listen('napstr-transfers-changed', () => {
+      void invoke<NativeTransfer[]>('get_transfers')
+        .then((items) => { transfers = mapTransfers(items); })
+        .catch(() => {});
+    }).then((unlisten) => {
+      if (destroyed) unlisten();
+      else eventUnlisteners.push(unlisten);
+    });
     void listen<IndexBatch>('napstr-index-batch', ({ payload }) => {
       mergeIndexBatch(payload);
     }).then((unlisten) => {
