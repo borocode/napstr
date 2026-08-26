@@ -37,8 +37,51 @@ await writeFile(
     <exclude domain="sharedpref" path="." />
     <exclude domain="external" path="." />
 </full-backup-content>
-`,
+  `,
 );
+
+if (process.env.NAPSTRFY_ANDROID_RELEASE_SIGNING === '1') {
+  const gradlePath = resolve('src-tauri/gen/android/app/build.gradle.kts');
+  let gradle = await readFile(gradlePath, 'utf8');
+
+  if (!gradle.includes('import java.io.FileInputStream')) {
+    gradle = gradle.replace(
+      'import java.util.Properties',
+      'import java.io.FileInputStream\nimport java.util.Properties',
+    );
+  }
+
+  if (!gradle.includes('create("release")')) {
+    gradle = gradle.replace(
+      '    buildTypes {',
+      `    signingConfigs {
+        create("release") {
+            val keystorePropertiesFile = rootProject.file("keystore.properties")
+            require(keystorePropertiesFile.exists()) {
+                "Release signing requires gen/android/keystore.properties"
+            }
+            val keystoreProperties = Properties().apply {
+                load(FileInputStream(keystorePropertiesFile))
+            }
+            keyAlias = keystoreProperties["keyAlias"] as String
+            keyPassword = keystoreProperties["password"] as String
+            storeFile = file(keystoreProperties["storeFile"] as String)
+            storePassword = keystoreProperties["password"] as String
+        }
+    }
+    buildTypes {`,
+    );
+  }
+
+  if (!gradle.includes('signingConfig = signingConfigs.getByName("release")')) {
+    gradle = gradle.replace(
+      '        getByName("release") {',
+      '        getByName("release") {\n            signingConfig = signingConfigs.getByName("release")',
+    );
+  }
+
+  await writeFile(gradlePath, gradle);
+}
 await writeFile(
   resolve(xmlDirectory, 'data_extraction_rules.xml'),
   `<?xml version="1.0" encoding="utf-8"?>
