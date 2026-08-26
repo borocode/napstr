@@ -515,11 +515,11 @@ async fn download_offer(
         ServerFrame::Error { message, .. } => return Err(message),
         _ => return Err("peer returned an invalid manifest".into()),
     };
-    let (filename, expected_size): (String, i64) = crate::open_connection(db_path)?
+    let (filename, expected_size, destination_folder): (String, i64, String) = crate::open_connection(db_path)?
         .query_row(
-            "SELECT filename,size FROM network_downloads WHERE request_id=?1 AND file_id=?2",
+            "SELECT filename,size,destination_folder FROM network_downloads WHERE request_id=?1 AND file_id=?2",
             params![offer.request_id, offer.file_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .map_err(|error| error.to_string())?;
     if size != expected_size as u64 {
@@ -558,13 +558,25 @@ async fn download_offer(
 
     let connection = crate::open_connection(db_path)?;
     let napstr_folder = PathBuf::from(super::get_setting(&connection, "shared_folder")?);
-    fs::create_dir_all(&napstr_folder)
+    let destination_component = Path::new(&destination_folder);
+    let destination_root = if !destination_folder.is_empty()
+        && !destination_component.is_absolute()
+        && destination_component.components().count() == 1
+        && destination_component
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+    {
+        napstr_folder.join("Audiobooks").join(destination_component)
+    } else {
+        napstr_folder.clone()
+    };
+    fs::create_dir_all(&destination_root)
         .await
         .map_err(|error| error.to_string())?;
     let destination = {
         let mut selected = coordinator.destination.lock().await;
         selected
-            .get_or_insert_with(|| super::unique_destination(&napstr_folder, &filename))
+            .get_or_insert_with(|| super::unique_destination(&destination_root, &filename))
             .clone()
     };
     drop(connection);
@@ -692,7 +704,7 @@ async fn download_offer(
             match fs::hard_link(&partial, &final_destination).await {
                 Ok(()) => break,
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    final_destination = super::unique_destination(&napstr_folder, &filename);
+                    final_destination = super::unique_destination(&destination_root, &filename);
                 }
                 Err(error) => return Err(error.to_string()),
             }

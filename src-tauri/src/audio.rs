@@ -13,6 +13,8 @@ pub struct AudioMetadata {
     pub title: String,
     pub artist: String,
     pub album: String,
+    pub track_number: u32,
+    pub disc_number: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,6 +76,16 @@ pub fn read_metadata(path: &Path) -> AudioMetadata {
         title: first_safe_metadata_value(&tagged_file, |tag| tag.title()),
         artist: first_safe_metadata_value(&tagged_file, |tag| tag.artist()),
         album: first_safe_metadata_value(&tagged_file, |tag| tag.album()),
+        track_number: tagged_file
+            .tags()
+            .iter()
+            .find_map(|tag| tag.track())
+            .unwrap_or_default(),
+        disc_number: tagged_file
+            .tags()
+            .iter()
+            .find_map(|tag| tag.disk())
+            .unwrap_or_default(),
     }
 }
 

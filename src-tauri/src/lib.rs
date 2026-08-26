@@ -18,6 +18,7 @@ use tauri::{Emitter, Manager, State};
 use walkdir::WalkDir;
 
 mod audio;
+mod mobile;
 mod network;
 mod player;
 mod protocol;
@@ -28,7 +29,7 @@ const HASH_BUFFER_SIZE: usize = 256 * 1024;
 const MAX_INDEX_ERRORS: usize = 100;
 const INDEX_PROGRESS_INTERVAL: usize = 25;
 const INDEX_COMMIT_BATCH_SIZE: usize = 50;
-const AUDIO_METADATA_VERSION: i64 = 1;
+const AUDIO_METADATA_VERSION: i64 = 2;
 const LIBRARY_CHANGED_EVENT: &str = "napstr-library-changed";
 const INDEX_BATCH_EVENT: &str = "napstr-index-batch";
 const INDEX_PROGRESS_EVENT: &str = "napstr-index-progress";
@@ -45,12 +46,14 @@ struct AppState {
     scan_cancel: Arc<AtomicBool>,
     app_handle: tauri::AppHandle,
     player: Arc<player::NativePlayer>,
+    mobile: Arc<mobile::MobileService>,
     recovering_after_sleep: Arc<AtomicBool>,
 }
 
 struct ShutdownServices {
     network: Arc<network::NetworkService>,
     tor: Arc<tor::TorManager>,
+    mobile: Arc<mobile::MobileService>,
 }
 
 struct FolderWatcher {
@@ -70,6 +73,8 @@ struct SharedFile {
     title: String,
     artist: String,
     album: String,
+    track_number: u32,
+    disc_number: u32,
     mime: String,
     license: String,
     description: String,
@@ -103,6 +108,7 @@ struct Settings {
 #[serde(rename_all = "camelCase")]
 struct AppSnapshot {
     files: Vec<SharedFile>,
+    audiobooks: Vec<network::AudiobookResult>,
     transfers: Vec<Transfer>,
     settings: Settings,
     indexed_bytes: u64,
@@ -171,7 +177,8 @@ fn initialise_database(path: &Path, app_data: &Path) -> Result<(), String> {
            title TEXT NOT NULL DEFAULT '', artist TEXT NOT NULL DEFAULT '', album TEXT NOT NULL DEFAULT '',
            mime TEXT NOT NULL DEFAULT 'application/octet-stream', license TEXT NOT NULL DEFAULT 'unspecified',
            description TEXT NOT NULL DEFAULT '', tags TEXT NOT NULL DEFAULT '', folder TEXT NOT NULL DEFAULT '',
-           modified_ns INTEGER NOT NULL DEFAULT 0
+           modified_ns INTEGER NOT NULL DEFAULT 0,
+           track_number INTEGER NOT NULL DEFAULT 0, disc_number INTEGER NOT NULL DEFAULT 0
          );
          CREATE TABLE IF NOT EXISTS transfers (
            id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -190,6 +197,13 @@ fn initialise_database(path: &Path, app_data: &Path) -> Result<(), String> {
          CREATE TABLE IF NOT EXISTS blocked_pubkeys (
            pubkey TEXT PRIMARY KEY, reason TEXT NOT NULL, created_at TEXT NOT NULL
          );
+         CREATE TABLE IF NOT EXISTS local_audiobooks (
+           folder TEXT PRIMARY KEY,
+           title TEXT NOT NULL,
+           author TEXT NOT NULL DEFAULT '',
+           narrator TEXT NOT NULL DEFAULT '',
+           updated_at TEXT NOT NULL
+         );
          DROP TABLE IF EXISTS download_chunks;"
     ).map_err(|error| error.to_string())?;
     // Pre-release databases used these transfer fields in the library table.
@@ -207,9 +221,45 @@ fn initialise_database(path: &Path, app_data: &Path) -> Result<(), String> {
         ("folder", "TEXT NOT NULL DEFAULT ''"),
         ("modified_ns", "INTEGER NOT NULL DEFAULT 0"),
         ("metadata_version", "INTEGER NOT NULL DEFAULT 0"),
+        ("track_number", "INTEGER NOT NULL DEFAULT 0"),
+        ("disc_number", "INTEGER NOT NULL DEFAULT 0"),
     ] {
         ensure_column(&connection, "files", column, declaration)?;
     }
+    connection
+        .execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_files_folder ON files(folder);
+             CREATE INDEX IF NOT EXISTS idx_files_modified_ns ON files(modified_ns);
+             CREATE TABLE IF NOT EXISTS library_state (
+               id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL
+             );
+             INSERT OR IGNORE INTO library_state(id,revision) VALUES(1,1);
+             CREATE TRIGGER IF NOT EXISTS files_library_revision_insert
+               AFTER INSERT ON files BEGIN
+                 UPDATE library_state SET revision=revision+1 WHERE id=1;
+               END;
+             CREATE TRIGGER IF NOT EXISTS files_library_revision_update
+               AFTER UPDATE ON files BEGIN
+                 UPDATE library_state SET revision=revision+1 WHERE id=1;
+               END;
+             CREATE TRIGGER IF NOT EXISTS files_library_revision_delete
+               AFTER DELETE ON files BEGIN
+                 UPDATE library_state SET revision=revision+1 WHERE id=1;
+               END;
+             CREATE TRIGGER IF NOT EXISTS audiobooks_library_revision_insert
+               AFTER INSERT ON local_audiobooks BEGIN
+                 UPDATE library_state SET revision=revision+1 WHERE id=1;
+               END;
+             CREATE TRIGGER IF NOT EXISTS audiobooks_library_revision_update
+               AFTER UPDATE ON local_audiobooks BEGIN
+                 UPDATE library_state SET revision=revision+1 WHERE id=1;
+               END;
+             CREATE TRIGGER IF NOT EXISTS audiobooks_library_revision_delete
+               AFTER DELETE ON local_audiobooks BEGIN
+                 UPDATE library_state SET revision=revision+1 WHERE id=1;
+               END;",
+        )
+        .map_err(|error| error.to_string())?;
     network::initialise_network_schema(&connection)?;
     connection
         .execute_batch(
@@ -251,6 +301,9 @@ fn initialise_database(path: &Path, app_data: &Path) -> Result<(), String> {
             [&downloads],
         )
         .map_err(|error| error.to_string())?;
+    let shared_folder = get_setting(&connection, "shared_folder")?;
+    fs::create_dir_all(Path::new(&shared_folder).join("Audiobooks"))
+        .map_err(|error| format!("could not create the Audiobooks folder: {error}"))?;
     let migrated_relays = connection
         .execute(
             "UPDATE settings SET value=?1 WHERE key='nostr_relays' AND replace(value,' ','') IN (?2,?3)",
@@ -334,6 +387,8 @@ fn shared_file_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SharedFile>
         title: row.get(8)?,
         artist: row.get(9)?,
         album: row.get(10)?,
+        track_number: row.get::<_, i64>(11)?.max(0) as u32,
+        disc_number: row.get::<_, i64>(12)?.max(0) as u32,
         mime: row.get(5)?,
         license: "unspecified".into(),
         description: String::new(),
@@ -344,7 +399,7 @@ fn shared_file_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SharedFile>
 fn load_files(connection: &Connection, query: Option<&str>) -> Result<Vec<SharedFile>, String> {
     let mut statement = connection
         .prepare(
-            "SELECT file_id, filename, path, size, format, mime, folder, tags, title, artist, album FROM files
+            "SELECT file_id, filename, path, size, format, mime, folder, tags, title, artist, album, track_number, disc_number FROM files
          WHERE format IN ('MP3','FLAC','WAV','OGG','OPUS')
            AND NOT EXISTS(SELECT 1 FROM blocked_files WHERE blocked_files.file_id=files.file_id)
          ORDER BY filename",
@@ -380,7 +435,7 @@ fn load_files_by_id(
 ) -> Result<Vec<SharedFile>, String> {
     let mut statement = connection
         .prepare(
-            "SELECT file_id, filename, path, size, format, mime, folder, tags, title, artist, album FROM files
+            "SELECT file_id, filename, path, size, format, mime, folder, tags, title, artist, album, track_number, disc_number FROM files
              WHERE file_id=?1
                AND format IN ('MP3','FLAC','WAV','OGG','OPUS')
                AND NOT EXISTS(SELECT 1 FROM blocked_files WHERE blocked_files.file_id=files.file_id)",
@@ -476,12 +531,272 @@ fn snapshot(connection: &Connection) -> Result<AppSnapshot, String> {
     let files = load_files(connection, None)?;
     let indexed_bytes = files.iter().map(|file| file.size).sum();
     Ok(AppSnapshot {
+        audiobooks: build_local_audiobooks(connection)?,
         files,
         transfers: load_transfers(connection)?,
         settings: load_settings(connection)?,
         indexed_bytes,
         native: true,
     })
+}
+
+fn natural_sort_key(value: &str) -> String {
+    let mut key = String::with_capacity(value.len() + 24);
+    let mut digits = String::new();
+    for character in value.chars().flat_map(char::to_lowercase) {
+        if character.is_ascii_digit() {
+            digits.push(character);
+        } else {
+            if !digits.is_empty() {
+                key.push_str(&format!("#{:0>20}", digits.trim_start_matches('0')));
+                digits.clear();
+            }
+            key.push(character);
+        }
+    }
+    if !digits.is_empty() {
+        key.push_str(&format!("#{:0>20}", digits.trim_start_matches('0')));
+    }
+    key
+}
+
+pub(crate) fn build_local_audiobooks(
+    connection: &Connection,
+) -> Result<Vec<network::AudiobookResult>, String> {
+    let files = load_files(connection, None)?;
+    build_local_audiobooks_from_files(connection, &files)
+}
+
+pub(crate) fn build_local_audiobooks_from_files(
+    connection: &Connection,
+    files: &[SharedFile],
+) -> Result<Vec<network::AudiobookResult>, String> {
+    let mut statement = connection
+        .prepare("SELECT folder,title,author,narrator FROM local_audiobooks ORDER BY title")
+        .map_err(|error| error.to_string())?;
+    let configurations = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    let mut audiobooks = Vec::new();
+    let mut grouped_file_ids = HashSet::new();
+    let build_book = |local_folder: String,
+                      title: String,
+                      author: String,
+                      narrator: String,
+                      mut chapters: Vec<&SharedFile>| {
+        chapters.sort_by_cached_key(|file| {
+            let has_track_number = file.track_number > 0;
+            (
+                if has_track_number { 0 } else { 1 },
+                if has_track_number {
+                    file.disc_number.max(1)
+                } else {
+                    0
+                },
+                if has_track_number {
+                    file.track_number
+                } else {
+                    0
+                },
+                natural_sort_key(&format!("{}/{}", file.folder, file.filename)),
+                file.file_id.clone(),
+            )
+        });
+        if chapters.is_empty() || chapters.len() > 500 {
+            return None;
+        }
+        let mut digest = Sha256::new();
+        digest.update(b"napstr-audiobook-v1\0");
+        for file in &chapters {
+            digest.update(file.file_id.as_bytes());
+        }
+        let audiobook_id = hex::encode(digest.finalize());
+        let chapter_records = chapters
+            .iter()
+            .enumerate()
+            .map(|(index, file)| network::AudiobookChapter {
+                position: index + 1,
+                file_id: file.file_id.clone(),
+                filename: file.filename.clone(),
+                title: if file.title.is_empty() {
+                    file.filename.clone()
+                } else {
+                    file.title.clone()
+                },
+                format: file.format.clone(),
+                mime: file.mime.clone(),
+                size: file.size,
+            })
+            .collect::<Vec<_>>();
+        Some(network::AudiobookResult {
+            audiobook_id,
+            title,
+            author,
+            narrator,
+            total_size: chapters.iter().map(|file| file.size).sum(),
+            chapters: chapter_records,
+            sources: Vec::new(),
+            local: true,
+            local_folder,
+        })
+    };
+    // Assign files to configured books in one library pass. Previously every
+    // book re-scanned every file, which became expensive for large libraries.
+    let configuration_index = configurations
+        .iter()
+        .enumerate()
+        .map(|(index, (folder, _, _, _))| (folder.as_str(), index))
+        .collect::<HashMap<_, _>>();
+    let mut configured_chapters = vec![Vec::new(); configurations.len()];
+    for file in files {
+        let mut ancestor = String::new();
+        for component in file
+            .folder
+            .split('/')
+            .filter(|component| !component.is_empty())
+        {
+            if !ancestor.is_empty() {
+                ancestor.push('/');
+            }
+            ancestor.push_str(component);
+            if let Some(index) = configuration_index.get(ancestor.as_str()) {
+                configured_chapters[*index].push(file);
+            }
+        }
+    }
+    for ((folder, title, author, narrator), mut chapters) in
+        configurations.into_iter().zip(configured_chapters)
+    {
+        if let Some(book) = build_book(
+            folder,
+            title,
+            author,
+            narrator,
+            std::mem::take(&mut chapters),
+        ) {
+            grouped_file_ids.extend(book.chapters.iter().map(|chapter| chapter.file_id.clone()));
+            audiobooks.push(book);
+        }
+    }
+    // `Audiobooks` is a convention-based drop zone. Each immediate child
+    // directory is one recursive book; loose files are complete one-file
+    // books. Explicitly configured collections above take precedence.
+    let mut automatic_folders: HashMap<String, Vec<&SharedFile>> = HashMap::new();
+    let mut automatic_loose_files = Vec::new();
+    for file in files
+        .iter()
+        .filter(|file| !grouped_file_ids.contains(&file.file_id))
+    {
+        if file.folder == "Audiobooks" {
+            automatic_loose_files.push(file);
+        } else if let Some(relative) = file.folder.strip_prefix("Audiobooks/") {
+            if let Some(folder) = relative
+                .split('/')
+                .next()
+                .filter(|folder| !folder.is_empty())
+            {
+                automatic_folders
+                    .entry(format!("Audiobooks/{folder}"))
+                    .or_default()
+                    .push(file);
+            }
+        }
+    }
+    for (folder, chapters) in automatic_folders {
+        let folder_title = folder
+            .strip_prefix("Audiobooks/")
+            .unwrap_or("Audiobook")
+            .replace('_', " ");
+        let title = audio::sanitise_public_text(&folder_title);
+        let title = if title.is_empty() {
+            "Audiobook".to_string()
+        } else {
+            title
+        };
+        let author = chapters
+            .iter()
+            .find_map(|file| (!file.artist.is_empty()).then(|| file.artist.clone()))
+            .unwrap_or_default();
+        if let Some(book) = build_book(folder, title, author, String::new(), chapters) {
+            grouped_file_ids.extend(book.chapters.iter().map(|chapter| chapter.file_id.clone()));
+            audiobooks.push(book);
+        }
+    }
+    for file in automatic_loose_files {
+        let title = if file.title.is_empty() {
+            Path::new(&file.filename)
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .unwrap_or(&file.filename)
+                .to_string()
+        } else {
+            file.title.clone()
+        };
+        if let Some(book) = build_book(
+            format!("@automatic:{}", file.file_id),
+            title,
+            file.artist.clone(),
+            String::new(),
+            vec![file],
+        ) {
+            grouped_file_ids.insert(file.file_id.clone());
+            audiobooks.push(book);
+        }
+    }
+    // A complete audiobook is often distributed as one MP3. The exact
+    // `audiobook` tag opts that file into the collection catalogue without
+    // changing its ordinary track event. Files already covered by an explicit
+    // multi-file folder manifest are not duplicated as one-file books.
+    for file in files.iter().filter(|file| {
+        !grouped_file_ids.contains(&file.file_id)
+            && file
+                .tags
+                .split(',')
+                .any(|tag| tag.trim().eq_ignore_ascii_case("audiobook"))
+    }) {
+        let chapter = network::AudiobookChapter {
+            position: 1,
+            file_id: file.file_id.clone(),
+            filename: file.filename.clone(),
+            title: if file.title.is_empty() {
+                file.filename.clone()
+            } else {
+                file.title.clone()
+            },
+            format: file.format.clone(),
+            mime: file.mime.clone(),
+            size: file.size,
+        };
+        let mut digest = Sha256::new();
+        digest.update(b"napstr-audiobook-v1\0");
+        digest.update(file.file_id.as_bytes());
+        audiobooks.push(network::AudiobookResult {
+            audiobook_id: hex::encode(digest.finalize()),
+            title: if file.title.is_empty() {
+                file.filename.clone()
+            } else {
+                file.title.clone()
+            },
+            author: file.artist.clone(),
+            narrator: String::new(),
+            total_size: file.size,
+            chapters: vec![chapter],
+            sources: Vec::new(),
+            local: true,
+            local_folder: format!("@tagged:{}", file.file_id),
+        });
+    }
+    audiobooks.sort_by(|left, right| left.title.cmp(&right.title));
+    Ok(audiobooks)
 }
 
 fn ensure_column(
@@ -571,12 +886,12 @@ pub(crate) fn upsert_verified_file(
         .unwrap_or(0);
     connection
         .execute(
-            "INSERT INTO files (file_id, filename, path, size, format, indexed_at, mime, folder, modified_ns, title, artist, album, metadata_version)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+            "INSERT INTO files (file_id, filename, path, size, format, indexed_at, mime, folder, modified_ns, title, artist, album, metadata_version, track_number, disc_number)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
              ON CONFLICT(file_id) DO UPDATE SET filename=excluded.filename,path=excluded.path,size=excluded.size,
              format=excluded.format,mime=excluded.mime,folder=excluded.folder,indexed_at=excluded.indexed_at,
              modified_ns=excluded.modified_ns,title=excluded.title,artist=excluded.artist,album=excluded.album,
-             metadata_version=excluded.metadata_version",
+             metadata_version=excluded.metadata_version,track_number=excluded.track_number,disc_number=excluded.disc_number",
             params![
                 file_id,
                 filename,
@@ -590,7 +905,9 @@ pub(crate) fn upsert_verified_file(
                 audio.metadata.title,
                 audio.metadata.artist,
                 audio.metadata.album,
-                AUDIO_METADATA_VERSION
+                AUDIO_METADATA_VERSION,
+                audio.metadata.track_number,
+                audio.metadata.disc_number
             ],
         )
         .map_err(|error| error.to_string())?;
@@ -983,6 +1300,91 @@ fn search_catalog(query: String, state: State<'_, AppState>) -> Result<Vec<Share
 }
 
 #[tauri::command]
+fn save_audiobook(
+    folder: String,
+    title: String,
+    author: String,
+    narrator: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<network::AudiobookResult>, String> {
+    let folder = folder.trim();
+    if folder.is_empty()
+        || Path::new(folder).is_absolute()
+        || Path::new(folder)
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err("choose a subfolder inside the Napstr folder".into());
+    }
+    let title = audio::sanitise_public_text(title.trim());
+    let author = audio::sanitise_public_text(author.trim());
+    let narrator = audio::sanitise_public_text(narrator.trim());
+    if title.is_empty() {
+        return Err("an audiobook title is required".into());
+    }
+    let mut connection = open_db(&state)?;
+    let nested_prefix = format!("{folder}/");
+    let chapter_count = {
+        let mut statement = connection
+            .prepare("SELECT folder FROM files")
+            .map_err(|error| error.to_string())?;
+        let count = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?
+            .filter_map(Result::ok)
+            .filter(|candidate| candidate == folder || candidate.starts_with(&nested_prefix))
+            .count();
+        count
+    };
+    if !(1..=500).contains(&chapter_count) {
+        return Err("an audiobook must contain between 1 and 500 indexed audio chapters".into());
+    }
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute(
+            "INSERT INTO local_audiobooks(folder,title,author,narrator,updated_at)
+             VALUES(?1,?2,?3,?4,?5)
+             ON CONFLICT(folder) DO UPDATE SET title=excluded.title,author=excluded.author,
+             narrator=excluded.narrator,updated_at=excluded.updated_at",
+            params![folder, title, author, narrator, Utc::now().to_rfc3339()],
+        )
+        .map_err(|error| error.to_string())?;
+    let audiobooks = build_local_audiobooks(&transaction)?;
+    let saved = audiobooks
+        .iter()
+        .find(|book| book.local_folder == folder)
+        .ok_or("the selected folder no longer contains enough indexed chapters")?;
+    if serde_json::to_vec(saved)
+        .map_err(|error| error.to_string())?
+        .len()
+        > 128 * 1024
+    {
+        return Err("this audiobook manifest is too large; split it into volumes".into());
+    }
+    transaction.commit().map_err(|error| error.to_string())?;
+    drop(connection);
+    state.network.queue_catalogue_publish(false);
+    Ok(audiobooks)
+}
+
+#[tauri::command]
+fn remove_audiobook(
+    folder: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<network::AudiobookResult>, String> {
+    let connection = open_db(&state)?;
+    connection
+        .execute("DELETE FROM local_audiobooks WHERE folder=?1", [&folder])
+        .map_err(|error| error.to_string())?;
+    let audiobooks = build_local_audiobooks(&connection)?;
+    drop(connection);
+    state.network.queue_catalogue_publish(false);
+    Ok(audiobooks)
+}
+
+#[tauri::command]
 async fn set_napstr_folder(
     path: String,
     state: State<'_, AppState>,
@@ -991,6 +1393,8 @@ async fn set_napstr_folder(
     if !folder.is_dir() {
         return Err("The selected Napstr folder does not exist or is not a directory".into());
     }
+    fs::create_dir_all(folder.join("Audiobooks"))
+        .map_err(|error| format!("could not create the Audiobooks folder: {error}"))?;
     let connection = open_db(&state)?;
     connection
         .execute(
@@ -1000,6 +1404,9 @@ async fn set_napstr_folder(
         .map_err(|error| error.to_string())?;
     connection
         .execute("DELETE FROM files", [])
+        .map_err(|error| error.to_string())?;
+    connection
+        .execute("DELETE FROM local_audiobooks", [])
         .map_err(|error| error.to_string())?;
     drop(connection);
     let _ = state.app_handle.emit(LIBRARY_CHANGED_EVENT, ());
@@ -1323,6 +1730,14 @@ fn open_release_url(url: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn open_napstrfy_website() -> Result<(), String> {
+    open_with_system(
+        Path::new("https://napstr.net/napstrfy.html"),
+        "Napstrfy website",
+    )
+}
+
+#[tauri::command]
 fn open_napstr_folder(state: State<'_, AppState>) -> Result<(), String> {
     let folder = PathBuf::from(get_setting(&open_db(&state)?, "shared_folder")?);
     fs::create_dir_all(&folder).map_err(|error| error.to_string())?;
@@ -1511,6 +1926,14 @@ async fn network_search(
 }
 
 #[tauri::command]
+async fn network_search_audiobooks(
+    query: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<network::AudiobookResult>, String> {
+    state.network.search_audiobooks(&query).await
+}
+
+#[tauri::command]
 async fn network_browse(
     cursor: Option<network::CatalogueBrowseCursor>,
     limit: Option<usize>,
@@ -1566,12 +1989,30 @@ async fn send_track_discussion_message(
 async fn request_network_download(
     file_id: String,
     source_pubkeys: Vec<String>,
+    destination_folder: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
     state
         .network
-        .request_download(file_id, source_pubkeys)
+        .request_download(file_id, source_pubkeys, destination_folder)
         .await
+}
+
+#[tauri::command]
+async fn mobile_status(state: State<'_, AppState>) -> Result<mobile::MobileStatus, String> {
+    Ok(state.mobile.status().await)
+}
+
+#[tauri::command]
+async fn create_mobile_pairing(
+    state: State<'_, AppState>,
+) -> Result<mobile::MobilePairingOffer, String> {
+    state.mobile.create_pairing().await
+}
+
+#[tauri::command]
+fn revoke_mobile_device(endpoint_id: String, state: State<'_, AppState>) -> Result<(), String> {
+    state.mobile.revoke(&endpoint_id)
 }
 
 #[tauri::command]
@@ -1649,6 +2090,7 @@ fn toggle_maximise(window: tauri::Window) -> Result<(), String> {
 async fn close_window(window: tauri::Window, state: State<'_, AppState>) -> Result<(), String> {
     state.network.stop().await;
     state.tor.stop().await;
+    state.mobile.stop().await;
     window.close().map_err(|error| error.to_string())
 }
 
@@ -1669,10 +2111,12 @@ pub fn run() {
                 .map_err(|error| error.to_string())?;
             let db_path = app_data.join("napstr.sqlite3");
             initialise_database(&db_path, &app_data)?;
-            let tor = Arc::new(tor::TorManager::new(app_data, resource_dir));
+            let tor = Arc::new(tor::TorManager::new(app_data.clone(), resource_dir));
             let transfers = Arc::new(transfer::TransferService::new(db_path.clone(), tor.clone()));
             let network =
                 network::NetworkService::new(db_path.clone(), transfers, app.handle().clone());
+            let mobile =
+                mobile::MobileService::new(db_path.clone(), app_data.clone(), network.clone())?;
             let scan_lock = Arc::new(Mutex::new(()));
             let scan_cancel = Arc::new(AtomicBool::new(false));
             *setup_shutdown_services
@@ -1680,6 +2124,7 @@ pub fn run() {
                 .map_err(|_| "shutdown service lock was poisoned")? = Some(ShutdownServices {
                 network: network.clone(),
                 tor: tor.clone(),
+                mobile: mobile.clone(),
             });
             let existing_folder = open_connection(&db_path)
                 .ok()
@@ -1712,8 +2157,14 @@ pub fn run() {
                 scan_cancel: scan_cancel.clone(),
                 app_handle: app.handle().clone(),
                 player: Arc::new(player::NativePlayer::default()),
+                mobile: mobile.clone(),
                 recovering_after_sleep: Arc::new(AtomicBool::new(false)),
             });
+            if mobile.has_devices() {
+                tauri::async_runtime::spawn(async move {
+                    let _ = mobile.start().await;
+                });
+            }
             if let Some(folder) = startup_folder.filter(|folder| folder.is_dir()) {
                 let startup_db_path = app
                     .path()
@@ -1737,6 +2188,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_snapshot,
             search_catalog,
+            save_audiobook,
+            remove_audiobook,
             set_napstr_folder,
             rescan_napstr_folder,
             cancel_library_scan,
@@ -1746,6 +2199,7 @@ pub fn run() {
             get_transfers,
             open_napstr_folder,
             open_release_url,
+            open_napstrfy_website,
             player::play_audio,
             player::toggle_audio,
             player::stop_audio,
@@ -1760,12 +2214,16 @@ pub fn run() {
             publish_catalogue,
             publish_profile,
             network_search,
+            network_search_audiobooks,
             network_browse,
             get_trollbox_messages,
             send_trollbox_message,
             get_track_discussion_messages,
             send_track_discussion_message,
             request_network_download,
+            mobile_status,
+            create_mobile_pairing,
+            revoke_mobile_device,
             block_file,
             block_user,
             report_catalogue,
@@ -1785,6 +2243,7 @@ pub fn run() {
         tauri::async_runtime::block_on(async move {
             services.network.stop().await;
             services.tor.stop().await;
+            services.mobile.stop().await;
         });
     }
     std::process::exit(exit_code);
@@ -1872,6 +2331,140 @@ mod tests {
         assert_eq!(report.file_count, 0);
         assert_eq!(report.changed_files, 1);
         assert!(load_files(&connection, None).unwrap().is_empty());
+        drop(connection);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn audiobook_manifest_prefers_metadata_then_naturally_orders_chapters() {
+        let directory = test_directory("audiobook-manifest-test");
+        fs::create_dir_all(&directory).unwrap();
+        let db_path = directory.join("napstr.sqlite3");
+        initialise_database(&db_path, &directory).unwrap();
+        let connection = open_connection(&db_path).unwrap();
+        for (file_id, filename, size) in [
+            ("22".repeat(32), "Chapter 10.mp3", 10i64),
+            ("11".repeat(32), "Chapter 2.mp3", 20i64),
+        ] {
+            connection.execute(
+                "INSERT INTO files(file_id,filename,path,size,format,indexed_at,mime,folder,modified_ns,title,artist,album,metadata_version)
+                 VALUES(?1,?2,?3,?4,'MP3','now','audio/mpeg','My Audiobook',1,?2,'Author','Book',1)",
+                params![file_id, filename, directory.join(filename).to_string_lossy(), size],
+            ).unwrap();
+        }
+        connection.execute(
+            "INSERT INTO local_audiobooks(folder,title,author,narrator,updated_at) VALUES('My Audiobook','The Book','Author','Narrator','now')",
+            [],
+        ).unwrap();
+
+        let books = build_local_audiobooks(&connection).unwrap();
+
+        assert_eq!(books.len(), 1);
+        assert_eq!(books[0].chapters[0].filename, "Chapter 2.mp3");
+        assert_eq!(books[0].chapters[1].filename, "Chapter 10.mp3");
+        assert_eq!(books[0].total_size, 30);
+        assert_eq!(books[0].audiobook_id.len(), 64);
+
+        connection
+            .execute(
+                "UPDATE files SET track_number=CASE filename WHEN 'Chapter 10.mp3' THEN 1 ELSE 2 END",
+                [],
+            )
+            .unwrap();
+        let metadata_ordered = build_local_audiobooks(&connection).unwrap();
+        assert_eq!(metadata_ordered[0].chapters[0].filename, "Chapter 10.mp3");
+        assert_eq!(metadata_ordered[0].chapters[1].filename, "Chapter 2.mp3");
+
+        connection
+            .execute(
+                "INSERT INTO files(file_id,filename,path,size,format,indexed_at,mime,folder,title,artist,tags)
+                 VALUES(?1,'Complete Book.mp3',?2,40,'MP3','now','audio/mpeg','Singles','Complete Book','Author','spoken, Audiobook')",
+                params!["33".repeat(32), directory.join("Complete Book.mp3").to_string_lossy()],
+            )
+            .unwrap();
+        let with_tagged_book = build_local_audiobooks(&connection).unwrap();
+        let tagged_book = with_tagged_book
+            .iter()
+            .find(|book| book.title == "Complete Book")
+            .unwrap();
+        assert_eq!(tagged_book.chapters.len(), 1);
+        assert_eq!(tagged_book.chapters[0].filename, "Complete Book.mp3");
+        connection.execute(
+            "INSERT INTO files(file_id,filename,path,size,format,indexed_at,mime,folder,title,artist)
+             VALUES(?1,'Only Chapter.mp3',?2,50,'MP3','now','audio/mpeg','One Chapter Folder','Only Chapter','Author')",
+            params!["44".repeat(32), directory.join("Only Chapter.mp3").to_string_lossy()],
+        ).unwrap();
+        connection
+            .execute(
+                "INSERT INTO local_audiobooks(folder,title,author,narrator,updated_at)
+             VALUES('One Chapter Folder','Folder Book','Author','','now')",
+                [],
+            )
+            .unwrap();
+        let with_one_chapter_folder = build_local_audiobooks(&connection).unwrap();
+        let folder_book = with_one_chapter_folder
+            .iter()
+            .find(|book| book.title == "Folder Book")
+            .unwrap();
+        assert_eq!(folder_book.chapters.len(), 1);
+        assert_eq!(folder_book.chapters[0].filename, "Only Chapter.mp3");
+
+        for (file_id, filename, folder, title, artist, size) in [
+            (
+                "55".repeat(32),
+                "Chapter 10.mp3",
+                "Audiobooks/Automatic Book/Disc 1",
+                "Chapter 10",
+                "Automatic Author",
+                60i64,
+            ),
+            (
+                "66".repeat(32),
+                "Chapter 2.mp3",
+                "Audiobooks/Automatic Book/Disc 1",
+                "Chapter 2",
+                "Automatic Author",
+                70i64,
+            ),
+            (
+                "77".repeat(32),
+                "Complete Story.mp3",
+                "Audiobooks",
+                "Complete Story",
+                "Solo Author",
+                80i64,
+            ),
+        ] {
+            connection.execute(
+                "INSERT INTO files(file_id,filename,path,size,format,indexed_at,mime,folder,title,artist)
+                 VALUES(?1,?2,?3,?4,'MP3','now','audio/mpeg',?5,?6,?7)",
+                params![
+                    file_id,
+                    filename,
+                    directory.join(filename).to_string_lossy(),
+                    size,
+                    folder,
+                    title,
+                    artist
+                ],
+            ).unwrap();
+        }
+        let with_automatic_books = build_local_audiobooks(&connection).unwrap();
+        let automatic_folder = with_automatic_books
+            .iter()
+            .find(|book| book.title == "Automatic Book")
+            .unwrap();
+        assert_eq!(automatic_folder.author, "Automatic Author");
+        assert_eq!(automatic_folder.chapters.len(), 2);
+        assert_eq!(automatic_folder.chapters[0].filename, "Chapter 2.mp3");
+        assert_eq!(automatic_folder.chapters[1].filename, "Chapter 10.mp3");
+        let automatic_file = with_automatic_books
+            .iter()
+            .find(|book| book.title == "Complete Story")
+            .unwrap();
+        assert_eq!(automatic_file.author, "Solo Author");
+        assert_eq!(automatic_file.chapters.len(), 1);
+        assert_eq!(automatic_file.chapters[0].filename, "Complete Story.mp3");
         drop(connection);
         fs::remove_dir_all(directory).unwrap();
     }
@@ -2022,6 +2615,10 @@ mod tests {
     #[test]
     fn fresh_install_uses_one_napstr_folder() {
         let directory = test_directory("default-folder-test");
+        let existing_audiobooks = directory.join("Downloads/Audiobooks");
+        fs::create_dir_all(&existing_audiobooks).unwrap();
+        let existing_book = existing_audiobooks.join("Already Here.txt");
+        fs::write(&existing_book, b"must remain untouched").unwrap();
         let db_path = directory.join("napstr.sqlite3");
         initialise_database(&db_path, &directory).unwrap();
         let connection = open_connection(&db_path).unwrap();
@@ -2031,6 +2628,8 @@ mod tests {
             directory.join("Downloads")
         );
         assert!(Path::new(&settings.napstr_folder).is_dir());
+        assert!(existing_audiobooks.is_dir());
+        assert_eq!(fs::read(existing_book).unwrap(), b"must remain untouched");
         assert!(get_setting(&connection, "download_folder").is_err());
         assert_eq!(settings.nostr_relays, DEFAULT_NOSTR_RELAYS);
         assert_eq!(

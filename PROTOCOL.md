@@ -19,10 +19,12 @@ The words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are normative.
 | DM relay discovery | Nostr, kind `10050` |
 | Audio catalogue | Nostr, kind `30421` |
 | Seeder availability | Nostr, kind `30422` |
+| Audiobook collections | Nostr, kind `30423` |
 | Private download negotiation | NIP-17 and NIP-59 |
 | Public chat and track discussions | NIP-C7, kind `9` |
 | Reports | NIP-56, kind `1984` |
 | File transfer | TCP through a temporary Tor v3 onion service |
+| Optional phone companion | Iroh QUIC with ALPN `/napstr/mobile/1` |
 | File identity and integrity | SHA-256 of the complete file bytes |
 
 Nostr events use the standard NIP-01 event format and signature validation.
@@ -246,6 +248,91 @@ same kind and `d` coordinate with:
 
 Clients MUST treat the latest event at this coordinate as withdrawn and MUST
 not offer the older entry from that author.
+
+## Audiobook manifest: kind 30423
+
+Kind `30423` is an addressable collection event layered over ordinary kind
+`30421` files. Every chapter MUST still be published as an independent catalogue
+entry and transferred with the normal Napstr file protocol. Clients that do not
+support audiobook manifests therefore remain able to find and download the
+chapters individually.
+
+The manifest `d` tag and `audiobookId` are the lowercase SHA-256 of the bytes
+`napstr-audiobook-v1\0` followed by every ordered chapter file ID in hexadecimal
+text. Changing the files or their order creates a new edition ID.
+
+Required tags include:
+
+```json
+[
+  ["d", "<audiobookId>"],
+  ["t", "napstr-audiobook"],
+  ["x", "<audiobookId>"],
+  ["title", "Book title"],
+  ["alt", "Napstr audiobook manifest"]
+]
+```
+
+Search-word `t` tags follow the catalogue token rules and may be derived from
+the book title, author, narrator, and chapter names. The content is:
+
+```json
+{
+  "protocol": "napstr/1",
+  "audiobookId": "<64 lowercase hex characters>",
+  "title": "Book title",
+  "author": "Author",
+  "narrator": "Narrator",
+  "totalSize": 123456789,
+  "chapters": [
+    {
+      "position": 1,
+      "fileId": "<chapter SHA-256>",
+      "filename": "01 - Chapter One.mp3",
+      "title": "Chapter One",
+      "format": "MP3",
+      "mime": "audio/mpeg",
+      "size": 1234567
+    }
+  ]
+}
+```
+
+A manifest MUST contain between 1 and 500 unique chapters. Positions MUST be
+contiguous and start at 1, `totalSize` MUST equal the sum of chapter sizes, each
+filename MUST be a basename, and every chapter claim MUST satisfy the normal
+audio catalogue rules. The reference client limits manifest content to 128 KiB.
+Clients MUST validate the event signature and recompute
+the edition ID before displaying the collection.
+
+For a complete audiobook stored in one audio file, the reference client creates
+a one-chapter manifest when the publisher adds the exact, case-insensitive track
+tag `audiobook`. This does not replace or suppress the file's ordinary kind
+`30421` catalogue entry.
+
+The reference client also uses a top-level local directory named `Audiobooks`.
+It creates that directory only when it is missing and never replaces or clears
+an existing directory. Each immediate child directory becomes one recursively
+ordered manifest, while each loose audio file directly inside `Audiobooks`
+becomes a one-chapter manifest. This filesystem convention is local UI
+behaviour, not a wire-protocol requirement; all books use the same kind `30423`
+format above. Publishers may explicitly group folders elsewhere in the shared
+library too.
+
+A publisher is a complete active seeder for an audiobook only while its current
+kind `30422` availability events contain every chapter file ID. A client MAY
+download chapters from different complete publishers, but MUST preserve manifest
+order. Downloaded chapters SHOULD be stored together and played in that order.
+
+When a local collection is removed or its edition ID changes, its author replaces
+the previous coordinate with the same deletion content used for catalogue
+withdrawals and the tags `d=<old audiobookId>` and `t=napstr-audiobook`.
+
+Audiobook manifests are additive catalogue assertions. Clients MUST NOT use a
+manifest to remove, suppress, or reclassify its kind `30421` chapter entries in
+ordinary audio search. This ensures that an inaccurate or malicious collection
+published by one identity cannot hide regular tracks or alter another
+publisher's catalogue.
 
 ## Availability event: kind 30422
 
@@ -570,6 +657,92 @@ handle any `ERROR` code without treating its message as trusted markup.
 Reference timeouts are 30 seconds for `HELLO`, 60 seconds for manifest and data
 headers, 45 seconds without file progress, and 15 minutes for an idle authorized
 connection.
+
+## Optional Napstrfy companion protocol
+
+The phone companion is separate from Napstr's public Nostr/Tor protocol. It
+connects only to the user's own running desktop over Iroh, using ALPN
+`/napstr/mobile/1`. Iroh authenticates both endpoints by Ed25519 endpoint ID and
+encrypts QUIC traffic end to end; a relay may forward ciphertext when a direct
+path is unavailable.
+
+The desktop displays a URI with this shape as a QR code:
+
+```text
+napstrfy://pair/<unpadded-base64url-encoded-ticket-json>
+```
+
+The decoded ticket uses camel-case fields:
+
+```json
+{
+  "version": 1,
+  "endpointId": "<desktop Iroh endpoint ID>",
+  "endpointAddr": "<JSON-encoded Iroh EndpointAddr>",
+  "token": "<32 random bytes as lowercase hex>",
+  "expiresAt": 1787680200,
+  "desktopName": "Napstr"
+}
+```
+
+The token expires after five minutes and MUST be consumed by the first
+successful pairing. The desktop stores the authenticated phone endpoint ID in
+an allowlist. The phone persists its own Iroh secret key and the desktop address,
+but MUST NOT persist the one-use token. Removing the phone from Napstr deletes
+that allowlist entry.
+
+Each operation uses one Iroh bidirectional stream. A control frame is a
+four-byte unsigned big-endian length followed by UTF-8 JSON, with a maximum
+length of 262,144 bytes. Request and response objects use a camel-case `type`
+discriminator. Defined requests are:
+
+```json
+{"type":"pair","token":"<token>","deviceName":"Napstrfy on Android phone"}
+{"type":"library","query":"metallica","offset":0,"limit":100}
+{"type":"search","query":"enter sandman"}
+{"type":"requestDownload","fileId":"<fileId>","sourcePubkeys":["<Nostr pubkey>"],"destinationFolder":"<optional audiobook folder>"}
+{"type":"transfers"}
+{"type":"fetchAudio","fileId":"<fileId>"}
+{"type":"available","fileIds":["<fileId>","<fileId>"]}
+{"type":"status"}
+{"type":"ping"}
+```
+
+Library pages are limited to 200 items and searches to 120 characters. Search
+and download requests are executed by the desktop's normal Nostr and Tor
+services; the phone never receives the desktop Nostr secret key, Tor onion
+capabilities, or filesystem paths.
+
+`available` accepts at most 200 SHA-256 file IDs and returns the subset still
+present in the desktop's indexed Napstr folder. Napstrfy uses this bounded check
+after reconnecting to reconcile its verified offline audio cache. A companion
+MUST preserve cached files when paired with an older desktop that does not
+support this request.
+
+`destinationFolder` is optional and is used for audiobook chapters. The desktop
+accepts only one sanitized path component and stores it beneath
+`Napstr/Audiobooks/`; it never accepts an absolute path or nested path from the
+companion. Omitting it keeps the normal music destination at the Napstr-folder
+root.
+
+Responses have `type` values `paired`, `library`, `search`, `status`,
+`downloadRequested`, `transfers`, `audioReady`, `available`, `pong`, or `error`. Track
+objects contain `fileId`, `filename`, `title`, `artist`, `album`, `format`,
+`mime`, `size`, `tags`, `local`, and a `sources` array whose entries contain
+only `pubkey` and `displayName`.
+
+The lightweight `status` response contains `libraryRevision`, a monotonically
+increasing local-library revision. A companion MAY poll it and should reload
+library pages only when it changes. The revision check carries no catalogue
+rows and does not affect active audio streams.
+
+For `fetchAudio`, an `audioReady` control frame is immediately followed on the
+same receive stream by exactly `track.size` raw bytes and then stream finish.
+The desktop MUST serve only an indexed supported-audio path contained by the
+currently selected Napstr folder. The phone writes to a temporary cache file,
+MUST reject excess or truncated bytes, and MUST verify that the complete
+SHA-256 digest equals `track.fileId` before playback. All other responses end
+after their control frame.
 
 ## Reports and local blocking
 
