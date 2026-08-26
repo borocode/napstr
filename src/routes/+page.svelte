@@ -2256,7 +2256,10 @@
     <div class="modal-backdrop" role="presentation" onclick={() => (aboutOpen = false)}>
       <dialog class="dialog" open aria-label="About Napstr" onclick={(e) => e.stopPropagation()} onkeydown={(e) => { if (e.key === 'Escape') aboutOpen = false; }}>
         <header class="titlebar"><div class="title-left"><span class="app-icon"><img src="/napstr-logo.png" alt="" /></span><span>About Napstr</span></div><div class="window-controls"><button onclick={() => (aboutOpen = false)}>×</button></div></header>
-        <div class="dialog-body"><div class="about-logo"><img src="/napstr-logo.png" alt="" /></div><div><h2>Napstr</h2><p>Version {appVersion}</p><p>Public discovery over Nostr.<br />Private verified transfers over Tor.</p></div></div>
+        <div class="dialog-body about-dialog-body">
+          <div class="about-summary"><div class="about-logo"><img src="/napstr-logo.png" alt="" /></div><div><h2>Napstr</h2><p>Version {appVersion}</p><p>Public discovery over Nostr.<br />Private verified transfers over Tor.</p></div></div>
+          <p class="about-donation">donations welcome!<br /><code>bc1qwgms685z3j69qtgalyjtrfuqg5f6pt302z0k60</code></p>
+        </div>
         <div class="dialog-actions"><button class="classic-button primary" onclick={() => (aboutOpen = false)}>OK</button></div>
       </dialog>
     </div>
