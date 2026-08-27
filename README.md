@@ -8,6 +8,8 @@ Run a sovereign, self-hosted **P2P music library & streaming node** directly on 
 
 <img height="400" alt="napstr-ui" src="https://github.com/user-attachments/assets/95b4d9f8-a844-49e1-ba9a-6dd003c8acd3" />
 
+The cross-platform Napstrfy phone companion lives in [`android/`](android/README.md).
+
 ---
 
 ## ⚠️ Read This Before You "Update"
@@ -106,9 +108,25 @@ To stay current with [`lnbits/napstr`](https://github.com/lnbits/napstr):
 
 For official [`getumbrel/umbrel-apps`](https://github.com/getumbrel/umbrel-apps) submission: copy the `napstr/` package directory into your fork and open a PR — same path as `octra-umbrel`.
 
+<<<<<<< HEAD
 ---
 
 ## 📜 License
+=======
+macOS release DMGs are ad-hoc-signed community builds and require no Apple
+Developer account. After the first blocked launch, open **System Settings →
+Privacy & Security → Open Anyway**. Apple Silicon and Intel builds both include Tor.
+
+## Implemented architecture
+
+- On first launch, Napstr creates a Nostr identity and securely stores its private key using your operating system's credential store.
+- Nostr publishes the searchable catalogue, live seeders, NIP-C7 trollbox, and per-track discussions; NIP-17 handles private download negotiation.
+- A bundled Tor process carries transfers without a direct-IP fallback.
+- The optional Napstrfy companion pairs by one-use QR and reaches the running desktop over encrypted Iroh.
+- One recursively watched folder contains both downloads and shared audio.
+- Napstr uses or creates a non-destructive `Audiobooks` drop zone: each child folder becomes an ordered book and each loose audio file becomes a one-file book. Existing contents are never replaced.
+- Files are audio-validated and identified by SHA-256. Downloads use a responsive seeder, verify the complete hash, and are available in the built-in player.
+>>>>>>> upstream/main
 
 Packaged with 🧅 by [Boro Labs](https://github.com/borocode).
 Napstr core is developed by [lnbits/napstr contributors](https://github.com/lnbits/napstr).

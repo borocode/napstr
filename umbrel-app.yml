@@ -3,7 +3,7 @@ id: napstr
 name: Napstr
 tagline: Sovereign P2P Nostr & Tor audio seeder & web player
 category: Media
-version: "0.1.4"
+version: "0.2.0"
 port: 30421
 description: >-
   Napstr is a sovereign peer-to-peer music library and streaming client built on Nostr and Tor.

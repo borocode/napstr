@@ -2,7 +2,6 @@ use crate::{
     get_setting, index_path_headless, load_files, load_transfers,
     network::{self, NetworkService},
     normalise_tags, open_connection, playable_audio_path, snapshot,
-    start_folder_watcher_headless,
     tor::TorManager,
     validate_length, AppSnapshot, FolderWatcher, IndexReport, Settings, SharedFile, Transfer,
 };
@@ -88,6 +87,8 @@ pub struct DownloadRequestPayload {
     pub file_id: String,
     #[serde(rename = "sourcePubkeys")]
     pub source_pubkeys: Vec<String>,
+    #[serde(rename = "destinationFolder")]
+    pub destination_folder: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -382,7 +383,11 @@ async fn handle_request_network_download(
 ) -> Result<Json<()>, (StatusCode, String)> {
     state
         .network
-        .request_download(payload.file_id, payload.source_pubkeys)
+        .request_download(
+            payload.file_id,
+            payload.source_pubkeys,
+            payload.destination_folder,
+        )
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     Ok(Json(()))
