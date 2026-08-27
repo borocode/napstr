@@ -20,6 +20,7 @@ RUN apt-get update && apt-get install -y \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
+COPY remote-protocol ./remote-protocol
 COPY src-tauri ./src-tauri
 WORKDIR /usr/src/napstr/src-tauri
 
