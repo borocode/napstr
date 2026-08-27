@@ -12,13 +12,8 @@ The cross-platform Napstrfy phone companion lives in [`android/`](android/README
 
 ---
 
-## ⚠️ Read This Before You "Update"
-
-The in-app store may show **"New release 0.1.4 available."** That version comes from **upstream** `lnbits/napstr` — **not** from this Umbrel package.
-
-- This port's last tagged build is `v0.1.2`; the running image is the `dd7c9a8` CI build (version string `0.1.0`).
-- Upstream 0.1.4 is a **different binary** with different packaging. Installing it through the Umbrel updater will **overwrite tonight's working deployment** and drop the runtime fixes listed below.
-- **Do not blind-update.** If you want upstream 0.1.4, diff it, confirm the Dockerfile still builds clean against it (our runtime-lib fix must survive), then let CI rebuild. Same closed-loop posture as everything else here.
+> [!NOTE]
+> **Umbrel Release v0.2.0:** This package is built directly against upstream `lnbits/napstr` v0.2.0 with full multi-arch containerization (`linux/amd64` and `linux/arm64` for Raspberry Pi 4/5) and the headless Umbrel server daemon.
 
 ---
 
@@ -82,7 +77,7 @@ This is a **packaging fork**, not a feature fork. The daemon, web UI, Nostr/Tor 
 
 - **No desktop/Tauri app** — upstream ships a `npm run desktop` Tauri GUI; this port builds and runs only the `napstr-daemon` server binary. The ~250MB of GUI-only libraries remain in the runtime image only because the daemon still links them (a future Option-B refactor would decouple and shed them).
 - **No `npm run bundle` / bundled-Tor-download step** — Tor is installed via `apt` in the runtime image and run as a separate `tor_server` container, not downloaded at build time.
-- **App version pinned at `0.1.0`** in `umbrel-app.yml` while upstream has moved to `0.1.4` — see the update warning above.
+- **App version aligned with upstream release `0.2.0`** in `umbrel-app.yml`.
 
 ---
 
@@ -108,25 +103,16 @@ To stay current with [`lnbits/napstr`](https://github.com/lnbits/napstr):
 
 For official [`getumbrel/umbrel-apps`](https://github.com/getumbrel/umbrel-apps) submission: copy the `napstr/` package directory into your fork and open a PR — same path as `octra-umbrel`.
 
-<<<<<<< HEAD
+## 🏗️ Architecture & Core Protocols
+
+- **Identity & Keys:** On first launch, Napstr creates a Nostr identity and securely persists keys for headless container reboots.
+- **Discovery & Swarm:** Nostr relays publish searchable Kind 30421 catalogues, Kind 30422 live seeder heartbeats, NIP-C7 trollbox, and per-track discussions; NIP-17 handles private download negotiation.
+- **Lossless Tor Transfers:** Ephemeral Tor v3 onion services carry all audio transfers without direct-IP leaks or central servers.
+- **Audiobooks & Napstrfy:** Built-in support for `Audiobooks` drop zones and optional pairing with the Napstrfy mobile companion via encrypted Iroh.
+- **Integrity:** Lossless audio streaming with SHA-256 chunk validation.
+
 ---
 
 ## 📜 License
-=======
-macOS release DMGs are ad-hoc-signed community builds and require no Apple
-Developer account. After the first blocked launch, open **System Settings →
-Privacy & Security → Open Anyway**. Apple Silicon and Intel builds both include Tor.
 
-## Implemented architecture
-
-- On first launch, Napstr creates a Nostr identity and securely stores its private key using your operating system's credential store.
-- Nostr publishes the searchable catalogue, live seeders, NIP-C7 trollbox, and per-track discussions; NIP-17 handles private download negotiation.
-- A bundled Tor process carries transfers without a direct-IP fallback.
-- The optional Napstrfy companion pairs by one-use QR and reaches the running desktop over encrypted Iroh.
-- One recursively watched folder contains both downloads and shared audio.
-- Napstr uses or creates a non-destructive `Audiobooks` drop zone: each child folder becomes an ordered book and each loose audio file becomes a one-file book. Existing contents are never replaced.
-- Files are audio-validated and identified by SHA-256. Downloads use a responsive seeder, verify the complete hash, and are available in the built-in player.
->>>>>>> upstream/main
-
-Packaged with 🧅 by [Boro Labs](https://github.com/borocode).
-Napstr core is developed by [lnbits/napstr contributors](https://github.com/lnbits/napstr).
+MIT License. Core software developed by [`lnbits/napstr` contributors](https://github.com/lnbits/napstr). Umbrel packaging and daemon integration maintained by [Boro Labs](https://github.com/borocode).
