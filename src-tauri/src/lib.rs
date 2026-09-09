@@ -35,8 +35,11 @@ const AUDIO_METADATA_VERSION: i64 = 2;
 const LIBRARY_CHANGED_EVENT: &str = "napstr-library-changed";
 const INDEX_BATCH_EVENT: &str = "napstr-index-batch";
 const INDEX_PROGRESS_EVENT: &str = "napstr-index-progress";
-const DEFAULT_NOSTR_RELAYS: &str = "wss://relay.damus.io,wss://nos.lol,wss://relay.nostr.com,wss://relay.primal.net,wss://relay.snort.social,wss://nostr.mom,wss://relay.nostr.band";
-const PREVIOUS_DEFAULT_NOSTR_RELAYS: &str = "wss://relay.damus.io,wss://nos.lol,wss://relay.nostr.com,wss://relay.primal.net,wss://relay.snort.social,wss://nostr.mom";
+const DEFAULT_NOSTR_RELAYS: &str = "wss://nos.lol,wss://relay.nostr.com,wss://relay.primal.net,wss://nostr.mom,wss://relay.nostr.band";
+/// Stock default before dead relays (damus/snort) were pruned.
+const PREVIOUS_DEFAULT_NOSTR_RELAYS: &str = "wss://relay.damus.io,wss://nos.lol,wss://relay.nostr.com,wss://relay.primal.net,wss://relay.snort.social,wss://nostr.mom,wss://relay.nostr.band";
+/// Stock default before relay.nostr.band was added.
+const PRIOR_DEFAULT_NOSTR_RELAYS: &str = "wss://relay.damus.io,wss://nos.lol,wss://relay.nostr.com,wss://relay.primal.net,wss://relay.snort.social,wss://nostr.mom";
 const LEGACY_DEFAULT_NOSTR_RELAYS: &str = "wss://relay.damus.io,wss://nos.lol";
 
 struct AppState {
@@ -308,10 +311,11 @@ pub fn initialise_database(path: &Path, app_data: &Path) -> Result<(), String> {
         .map_err(|error| format!("could not create the Audiobooks folder: {error}"))?;
     let migrated_relays = connection
         .execute(
-            "UPDATE settings SET value=?1 WHERE key='nostr_relays' AND replace(value,' ','') IN (?2,?3)",
+            "UPDATE settings SET value=?1 WHERE key='nostr_relays' AND replace(value,' ','') IN (?2,?3,?4)",
             params![
                 DEFAULT_NOSTR_RELAYS,
                 LEGACY_DEFAULT_NOSTR_RELAYS,
+                PRIOR_DEFAULT_NOSTR_RELAYS,
                 PREVIOUS_DEFAULT_NOSTR_RELAYS
             ],
         )
@@ -2788,6 +2792,19 @@ mod tests {
             .execute(
                 "UPDATE settings SET value=?1 WHERE key='nostr_relays'",
                 [PREVIOUS_DEFAULT_NOSTR_RELAYS],
+            )
+            .unwrap();
+        drop(connection);
+        initialise_database(&db_path, &directory).unwrap();
+        let connection = open_connection(&db_path).unwrap();
+        assert_eq!(
+            get_setting(&connection, "nostr_relays").unwrap(),
+            DEFAULT_NOSTR_RELAYS
+        );
+        connection
+            .execute(
+                "UPDATE settings SET value=?1 WHERE key='nostr_relays'",
+                [PRIOR_DEFAULT_NOSTR_RELAYS],
             )
             .unwrap();
         drop(connection);

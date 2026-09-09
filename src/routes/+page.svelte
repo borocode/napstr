@@ -98,7 +98,7 @@
   let nativeReady = false;
   let activityMessage = 'Starting Napstr…';
   let napstrFolder = '';
-  let nostrRelays = 'wss://relay.damus.io, wss://nos.lol, wss://relay.nostr.com, wss://relay.primal.net, wss://relay.snort.social, wss://nostr.mom, wss://relay.nostr.band';
+  let nostrRelays = 'wss://nos.lol, wss://relay.nostr.com, wss://relay.primal.net, wss://nostr.mom, wss://relay.nostr.band';
   let displayName = 'napstr-user';
   let profileAbout = 'Sharing files privately with Napstr. napstr.net';
   let profilePicture = '';
