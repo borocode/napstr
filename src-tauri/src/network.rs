@@ -36,6 +36,9 @@ const CATALOGUE_EVENT_PACE: Duration = Duration::from_millis(75);
 const AVAILABILITY_QUERY_LIMIT: usize = 1_000;
 const AVAILABILITY_FILE_LIMIT: usize = 50_000;
 const AVAILABILITY_CACHE_LIFETIME: Duration = Duration::from_secs(5);
+const RELAY_HEALTH_INTERVAL: Duration = Duration::from_secs(90);
+const RELAY_BREAKER_FAILURES: u32 = 2;
+const RELAY_BREAKER_COOLDOWN: Duration = Duration::from_secs(300);
 const EMPTY_SEARCH_RESULT_LIMIT: usize = 10_000;
 const EMPTY_SEARCH_PAGE_LIMIT: usize = 500;
 const CATALOGUE_IDENTIFIER_BATCH_SIZE: usize = 75;
@@ -542,6 +545,32 @@ fn merge_catalogue_result(
         });
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BreakerState {
+    Closed,
+    Open,
+    HalfOpen,
+}
+
+#[derive(Debug, Clone)]
+struct RelayBreaker {
+    failures: u32,
+    state: BreakerState,
+    opened_at: Option<Instant>,
+    logged_open: bool,
+}
+
+impl Default for RelayBreaker {
+    fn default() -> Self {
+        Self {
+            failures: 0,
+            state: BreakerState::Closed,
+            opened_at: None,
+            logged_open: false,
+        }
+    }
+}
+
 struct AvailabilitySnapshot {
     fetched_at: Instant,
     online: HashSet<(String, String)>,
@@ -570,6 +599,8 @@ pub struct NetworkService {
     generation: AtomicU64,
     last_error: RwLock<String>,
     trollbox_profiles: RwLock<HashMap<String, String>>,
+    configured_relays: RwLock<Vec<String>>,
+    relay_breakers: Mutex<HashMap<String, RelayBreaker>>,
 }
 
 impl NetworkService {
@@ -600,6 +631,8 @@ impl NetworkService {
             generation: AtomicU64::new(0),
             last_error: RwLock::new(String::new()),
             trollbox_profiles: RwLock::new(HashMap::new()),
+            configured_relays: RwLock::new(Vec::new()),
+            relay_breakers: Mutex::new(HashMap::new()),
         })
     }
 
@@ -844,6 +877,7 @@ impl NetworkService {
             }
         });
 
+        *self.configured_relays.write().await = relays.clone();
         self.queue_catalogue_publish(true);
         let heartbeat = self.clone();
         tokio::spawn(async move {
@@ -858,7 +892,94 @@ impl NetworkService {
                 }
             }
         });
+        let health = self.clone();
+        let health_client = client.clone();
+        tokio::spawn(async move {
+            health
+                .relay_health_loop(generation, health_client)
+                .await;
+        });
         self.status().await
+    }
+
+    async fn relay_health_loop(self: Arc<Self>, generation: u64, client: Client) {
+        loop {
+            tokio::time::sleep(RELAY_HEALTH_INTERVAL).await;
+            if !self.connected.load(Ordering::SeqCst)
+                || self.generation.load(Ordering::SeqCst) != generation
+            {
+                break;
+            }
+            let configured = self.configured_relays.read().await.clone();
+            if configured.is_empty() {
+                continue;
+            }
+            let live = client.relays().await;
+            let now = Instant::now();
+            let mut breakers = self.relay_breakers.lock().await;
+            for url in &configured {
+                let Ok(relay_url) = RelayUrl::parse(url) else {
+                    continue;
+                };
+                let breaker = breakers.entry(url.clone()).or_default();
+                match breaker.state {
+                    BreakerState::Open => {
+                        let opened = breaker.opened_at.unwrap_or(now);
+                        if now.duration_since(opened) < RELAY_BREAKER_COOLDOWN {
+                            continue;
+                        }
+                        breaker.state = BreakerState::HalfOpen;
+                        breaker.failures = 0;
+                        drop(breakers);
+                        match client.add_relay(url).await {
+                            Ok(_) => {
+                                let _ = client.connect_relay(url).await;
+                                eprintln!("🔁 Nostr relay half-open probe: {url}");
+                            }
+                            Err(error) => {
+                                eprintln!(
+                                    "⚠️ Nostr relay half-open add failed for {url}: {error}"
+                                );
+                            }
+                        }
+                        breakers = self.relay_breakers.lock().await;
+                        continue;
+                    }
+                    BreakerState::HalfOpen | BreakerState::Closed => {
+                        let connected = live
+                            .get(&relay_url)
+                            .map(|relay| relay.is_connected())
+                            .unwrap_or(false);
+                        if connected {
+                            if breaker.state == BreakerState::HalfOpen || breaker.failures > 0 {
+                                eprintln!("✅ Nostr relay circuit closed: {url}");
+                            }
+                            breaker.failures = 0;
+                            breaker.state = BreakerState::Closed;
+                            breaker.opened_at = None;
+                            breaker.logged_open = false;
+                            continue;
+                        }
+                        breaker.failures = breaker.failures.saturating_add(1);
+                        if breaker.failures < RELAY_BREAKER_FAILURES {
+                            continue;
+                        }
+                        breaker.state = BreakerState::Open;
+                        breaker.opened_at = Some(now);
+                        if !breaker.logged_open {
+                            eprintln!(
+                                "⚠️ Nostr relay circuit open after {} failed checks: {url}",
+                                breaker.failures
+                            );
+                            breaker.logged_open = true;
+                        }
+                        drop(breakers);
+                        let _ = client.remove_relay(url).await;
+                        breakers = self.relay_breakers.lock().await;
+                    }
+                }
+            }
+        }
     }
 
     pub async fn stop(&self) {
