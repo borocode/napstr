@@ -824,8 +824,8 @@ impl NetworkService {
         *self.last_error.write().await = String::new();
 
         let service = self.clone();
+        let listener_client = client.clone();
         tokio::spawn(async move {
-            let listener_client = client.clone();
             let event_client = listener_client.clone();
             let event_service = service.clone();
             let result = listener_client
