@@ -50,7 +50,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let event_emitter = Arc::new(BroadcasterEmitter::new(broadcast_tx.clone()));
 
     let tor = Arc::new(TorManager::new(data_dir.clone(), resource_dir));
-    let transfers = Arc::new(TransferService::new(db_path.clone(), tor.clone()));
+    let transfers = Arc::new(TransferService::new_persistent(db_path.clone(), tor.clone()));
     let network = NetworkService::new(db_path.clone(), transfers, event_emitter);
 
     // Check shared folder from environment or database
